@@ -1,13 +1,11 @@
 from logging.config import fileConfig
 
 from alembic import context
-
 from app.core.config.settings import settings
 from app.core.database.base import Base
 from app.core.database.engine import engine
 
 # Импорт моделей для регистрации в Base.metadata
-from app.modules.project.models import Project
 
 config = context.config
 

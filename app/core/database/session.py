@@ -2,7 +2,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database.engine import engine
 
-
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,
