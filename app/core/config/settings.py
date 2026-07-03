@@ -15,6 +15,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    app_name: str = Field(
+        default="Bali Leads Platform",
+        alias="APP_NAME",
+    )
+
     database_url: str = Field(
         default="sqlite:///data/bali_leads.db",
         alias="DATABASE_URL",
