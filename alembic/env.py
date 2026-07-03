@@ -1,5 +1,7 @@
 from logging.config import fileConfig
 
+from sqlmodel import false
+
 from alembic import context
 from app.core.config.settings import settings
 from app.core.database.base import Base
@@ -54,3 +56,4 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
+DEBUG = false
