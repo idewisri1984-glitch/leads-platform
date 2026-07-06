@@ -1,3 +1,4 @@
+from app.modules.company.models import Company
 from app.modules.company.repository import CompanyRepository
 from app.modules.company.schemas import CompanyCreate, CompanyRead
 
@@ -42,10 +43,10 @@ class CompanyService:
 
         return [CompanyRead.model_validate(company) for company in companies]
 
-    def update(self, company) -> CompanyRead:
+    def update(self, company: Company) -> CompanyRead:
         company = self.repository.update(company)
 
         return CompanyRead.model_validate(company)
 
-    def delete(self, company) -> None:
+    def delete(self, company: Company) -> None:
         self.repository.delete(company)
