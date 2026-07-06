@@ -5,8 +5,8 @@ from app.modules.company.service import CompanyService
 
 __all__ = [
     "Company",
+    "CompanyRepository",
     "CompanyCreate",
     "CompanyRead",
-    "CompanyRepository",
     "CompanyService",
 ]

@@ -7,3 +7,8 @@ class Base(DeclarativeBase):
     """
 
     pass
+
+
+# Import all ORM models after Base is defined.
+# This ensures SQLAlchemy registers relationships.
+import app.modules  # noqa: E402,F401
