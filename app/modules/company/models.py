@@ -70,3 +70,9 @@ class Company(Base):
         back_populates="company",
         cascade="all, delete-orphan",
     )
+
+    leads = relationship(
+        "Lead",
+        back_populates="company",
+        cascade="all, delete-orphan",
+    )

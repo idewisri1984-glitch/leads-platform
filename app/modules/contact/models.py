@@ -90,3 +90,8 @@ class Contact(Base):
         "Company",
         back_populates="contacts",
     )
+
+    leads = relationship(
+        "Lead",
+        back_populates="contact",
+    )
