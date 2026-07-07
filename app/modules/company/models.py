@@ -64,3 +64,9 @@ class Company(Base):
         "Project",
         back_populates="companies",
     )
+
+    contacts = relationship(
+        "Contact",
+        back_populates="company",
+        cascade="all, delete-orphan",
+    )
