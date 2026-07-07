@@ -25,7 +25,7 @@ def create_project(name: str) -> None:
             )
         )
 
-    typer.secho("✔ Project created", fg=typer.colors.GREEN)
+    typer.secho("OK: Project created", fg=typer.colors.GREEN)
     typer.echo(f"ID: {project.id}")
     typer.echo(f"Name: {project.name}")
 

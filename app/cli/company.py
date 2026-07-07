@@ -34,7 +34,7 @@ def create_company(
             )
         )
 
-    typer.secho("✔ Company created", fg=typer.colors.GREEN)
+    typer.secho("OK: Company created", fg=typer.colors.GREEN)
     typer.echo(f"ID: {company.id}")
     typer.echo(f"Project ID: {company.project_id}")
     typer.echo(f"Name: {company.name}")
@@ -96,4 +96,4 @@ def delete_company(company_id: int) -> None:
 
         service.delete(company)
 
-    typer.secho("✔ Company deleted", fg=typer.colors.GREEN)
+    typer.secho("OK: Company deleted", fg=typer.colors.GREEN)
