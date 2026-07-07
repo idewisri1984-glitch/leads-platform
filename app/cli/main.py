@@ -2,6 +2,7 @@ import typer
 
 from app.cli.company import app as company_app
 from app.cli.contact import app as contact_app
+from app.cli.lead import app as lead_app
 from app.cli.project import app as project_app
 
 app = typer.Typer(
@@ -21,6 +22,11 @@ app.add_typer(
 app.add_typer(
     contact_app,
     name="contact",
+)
+
+app.add_typer(
+    lead_app,
+    name="lead",
 )
 
 if __name__ == "__main__":
