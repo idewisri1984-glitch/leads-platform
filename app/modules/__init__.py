@@ -16,6 +16,8 @@ from app.modules.project.schemas import ProjectCreate, ProjectRead
 from app.modules.project.service import ProjectService
 from app.modules.task.models import Task
 from app.modules.task.repository import TaskRepository
+from app.modules.task.schemas import TaskCreate, TaskRead
+from app.modules.task.service import TaskService
 
 __all__ = [
     "Company",
@@ -39,5 +41,8 @@ __all__ = [
     "ProjectRepository",
     "ProjectService",
     "Task",
+    "TaskCreate",
+    "TaskRead",
     "TaskRepository",
+    "TaskService",
 ]
