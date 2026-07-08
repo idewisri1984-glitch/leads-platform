@@ -55,3 +55,9 @@ class Lead(Base):
         "Contact",
         back_populates="leads",
     )
+
+    tasks = relationship(
+        "Task",
+        back_populates="lead",
+        cascade="all, delete-orphan",
+    )
