@@ -1,4 +1,5 @@
 from app.modules.company_import.csv_parser import parse_company_csv
+from app.modules.company_import.ingestion import CompanyIngestionService
 from app.modules.company_import.normalization import (
     normalize_text_identity,
     normalize_website_hostname,
@@ -21,6 +22,7 @@ __all__ = [
     "CompanyIngestionError",
     "CompanyIngestionItem",
     "CompanyIngestionResult",
+    "CompanyIngestionService",
     "normalize_text_identity",
     "normalize_website_hostname",
     "parse_company_csv",
