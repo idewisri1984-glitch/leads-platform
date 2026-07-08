@@ -56,6 +56,17 @@ def test_port_path_query_and_fragment_are_ignored() -> None:
     assert normalize_website_hostname(website) == "example.com"
 
 
+@pytest.mark.parametrize(
+    ("website", "expected"),
+    [
+        ("example.com:8443/path", "example.com"),
+        ("localhost:8000", "localhost"),
+    ],
+)
+def test_url_without_scheme_with_port_is_accepted(website: str, expected: str) -> None:
+    assert normalize_website_hostname(website) == expected
+
+
 def test_unicode_domain_is_converted_to_idna_ascii() -> None:
     assert normalize_website_hostname("https://münich.example") == "xn--mnich-kva.example"
 

@@ -42,6 +42,16 @@ def parse_company_csv(path: Path) -> CompanyImportResult:
 
         for raw_row in reader:
             row_number = reader.line_num
+
+            if raw_row.get(None):
+                errors.append(
+                    CompanyImportError(
+                        row_number=row_number,
+                        message="Malformed CSV row: unexpected extra values.",
+                    )
+                )
+                continue
+
             normalized_values = [_normalize(value) for value in raw_row.values()]
 
             if not any(normalized_values):

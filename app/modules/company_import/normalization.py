@@ -3,6 +3,8 @@ import unicodedata
 from urllib.parse import urlsplit
 
 _HOSTNAME_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_EXPLICIT_SCHEME_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+_HOST_WITH_PORT_PATTERN = re.compile(r"^[^/:?#]+:\d+(?:[/?#].*)?$")
 
 
 def normalize_text_identity(value: str | None) -> str | None:
@@ -34,14 +36,17 @@ def normalize_website_hostname(value: str | None) -> str | None:
     if not website:
         return None
 
-    parsed_without_default_scheme = urlsplit(website)
+    if _EXPLICIT_SCHEME_PATTERN.match(website):
+        parsed = urlsplit(website)
 
-    if parsed_without_default_scheme.scheme:
-        if parsed_without_default_scheme.scheme.casefold() not in {"http", "https"}:
+        if parsed.scheme.casefold() not in {"http", "https"}:
             raise ValueError("Website scheme must be http or https.")
-
-        parsed = parsed_without_default_scheme
     else:
+        scheme = urlsplit(website).scheme
+
+        if scheme and not _HOST_WITH_PORT_PATTERN.match(website):
+            raise ValueError("Website scheme must be http or https and use ://.")
+
         parsed = urlsplit(f"//{website}")
 
     if parsed.username is not None or parsed.password is not None:

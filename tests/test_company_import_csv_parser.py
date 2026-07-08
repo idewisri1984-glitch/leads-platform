@@ -114,6 +114,17 @@ def test_extra_columns_are_ignored(tmp_path: Path) -> None:
     assert not hasattr(result.rows[0], "unknown")
 
 
+def test_extra_positional_value_returns_row_error(tmp_path: Path) -> None:
+    path = write_csv(tmp_path, "name,website\nAcme,example.com,unexpected\n")
+
+    result = parse_company_csv(path)
+
+    assert result.rows == []
+    assert len(result.errors) == 1
+    assert result.errors[0].row_number == 2
+    assert result.errors[0].message == "Malformed CSV row: unexpected extra values."
+
+
 def test_utf8_company_names(tmp_path: Path) -> None:
     path = write_csv(tmp_path, "name,country\n株式会社みらい,日本\nCafé Étoile,France\n")
 
