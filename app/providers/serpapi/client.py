@@ -64,8 +64,8 @@ class SerpApiClient:
                 params=params,
                 timeout=self._timeout_seconds,
             )
-        except httpx.HTTPError as error:
-            raise SerpApiRequestError("SerpAPI request failed.") from error
+        except httpx.HTTPError:
+            raise SerpApiRequestError("SerpAPI request failed.") from None
 
         if response.status_code == 429:
             raise SerpApiRateLimitError("SerpAPI rate limit exceeded.")

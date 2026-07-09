@@ -220,6 +220,26 @@ def test_timeout_or_network_error_raises_controlled_request_error() -> None:
         )
 
     assert API_KEY not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_timeout_error_does_not_chain_unsafe_httpx_exception() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("timeout with test-serpapi-key", request=request)
+
+    client = make_client(handler)
+
+    with pytest.raises(SerpApiRequestError, match="request failed") as exc_info:
+        client.search_companies(
+            query="companies",
+            country=None,
+            city=None,
+            industry=None,
+            limit=10,
+        )
+
+    assert API_KEY not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
 
 
 def test_malformed_json_raises_controlled_response_error() -> None:
