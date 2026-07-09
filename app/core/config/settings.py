@@ -25,6 +25,21 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
 
+    serpapi_api_key: str | None = Field(
+        default=None,
+        alias="SERPAPI_API_KEY",
+    )
+
+    serpapi_base_url: str = Field(
+        default="https://serpapi.com/search.json",
+        alias="SERPAPI_BASE_URL",
+    )
+
+    serpapi_timeout_seconds: float = Field(
+        default=10.0,
+        alias="SERPAPI_TIMEOUT_SECONDS",
+    )
+
     debug: bool = Field(
         default=False,
         alias="DEBUG",
