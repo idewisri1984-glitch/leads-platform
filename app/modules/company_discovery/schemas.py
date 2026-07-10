@@ -52,3 +52,28 @@ class CompanyDiscoveryResult(BaseModel):
             raise ValueError("total_results must equal len(items) + len(errors).")
 
         return self
+
+
+class CompanyDiscoveryPersistenceResult(BaseModel):
+    """
+    Discovery persistence output after valid discovered items are passed to ingestion.
+
+    The discovered invariant is discovered == imported + skipped_duplicates + failed.
+    """
+
+    provider: str = "serpapi"
+    query: str
+    discovered: int
+    imported: int
+    skipped_duplicates: int
+    failed: int
+    created_company_ids: list[int]
+    errors: list[CompanyIngestionError]
+    rolled_back: bool
+
+    @model_validator(mode="after")
+    def validate_discovered_count(self) -> Self:
+        if self.discovered != self.imported + self.skipped_duplicates + self.failed:
+            raise ValueError("discovered must equal imported + skipped_duplicates + failed.")
+
+        return self
