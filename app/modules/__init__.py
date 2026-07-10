@@ -14,6 +14,7 @@ from app.modules.project.models import Project
 from app.modules.project.repository import ProjectRepository
 from app.modules.project.schemas import ProjectCreate, ProjectRead
 from app.modules.project.service import ProjectService
+from app.modules.search_profile.models import SearchProfile
 from app.modules.task.models import Task
 from app.modules.task.repository import TaskRepository
 from app.modules.task.schemas import TaskCreate, TaskRead
@@ -40,6 +41,7 @@ __all__ = [
     "ProjectRead",
     "ProjectRepository",
     "ProjectService",
+    "SearchProfile",
     "Task",
     "TaskCreate",
     "TaskRead",

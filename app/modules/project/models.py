@@ -28,3 +28,9 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+
+    search_profiles = relationship(
+        "SearchProfile",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
