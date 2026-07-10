@@ -16,6 +16,12 @@ from app.modules.project.schemas import ProjectCreate, ProjectRead
 from app.modules.project.service import ProjectService
 from app.modules.search_profile.models import SearchProfile
 from app.modules.search_profile.repository import SearchProfileRepository
+from app.modules.search_profile.schemas import (
+    SearchProfileCreate,
+    SearchProfileRead,
+    SearchProfileUpdate,
+)
+from app.modules.search_profile.service import SearchProfileService
 from app.modules.task.models import Task
 from app.modules.task.repository import TaskRepository
 from app.modules.task.schemas import TaskCreate, TaskRead
@@ -43,7 +49,11 @@ __all__ = [
     "ProjectRepository",
     "ProjectService",
     "SearchProfile",
+    "SearchProfileCreate",
+    "SearchProfileRead",
     "SearchProfileRepository",
+    "SearchProfileService",
+    "SearchProfileUpdate",
     "Task",
     "TaskCreate",
     "TaskRead",
