@@ -84,6 +84,14 @@ def discover_serpapi(
         typer.echo(f"Created company IDs: {_format_ids(persistence_result.created_company_ids)}")
         typer.echo(f"Rolled back: {persistence_result.rolled_back}")
         _print_errors("Errors", persistence_result.errors)
+
+        if persistence_result.rolled_back:
+            typer.secho(
+                "Persistence failed; transaction was rolled back.",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(1)
+
         return
 
     typer.echo(f"Provider: {result.provider}")

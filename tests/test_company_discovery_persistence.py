@@ -6,7 +6,11 @@ from app.core.database.session import SessionLocal
 from app.modules.company.repository import CompanyRepository
 from app.modules.company_discovery import CompanyDiscoveryRequest, CompanyDiscoveryService
 from app.modules.company_import.ingestion import CompanyIngestionService
-from app.modules.company_import.schemas import CompanyIngestionItem, CompanyIngestionResult
+from app.modules.company_import.schemas import (
+    CompanyIngestionError,
+    CompanyIngestionItem,
+    CompanyIngestionResult,
+)
 from app.modules.project.repository import ProjectRepository
 from app.providers.serpapi import SerpApiClient, SerpApiCompanyResult, SerpApiSearchResponse
 from app.providers.serpapi.exceptions import (
@@ -486,3 +490,112 @@ def test_valid_items_are_passed_to_company_ingestion_service_without_pre_dedupli
     assert result.discovered == 2
     assert [item.name for item in received_items] == ["First", "Second"]
     assert [item.website for item in received_items] == ["same.example", "same.example"]
+
+
+def test_adapter_errors_are_preserved_with_persistence_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = make_service(
+        FakeSerpApiClient(
+            make_response(
+                [
+                    SerpApiCompanyResult(
+                        position=1,
+                        title=" ",
+                        link="blank.example",
+                        snippet=None,
+                        source=None,
+                    ),
+                    SerpApiCompanyResult(
+                        position=2,
+                        title="Duplicate",
+                        link="duplicate.example",
+                        snippet=None,
+                        source=None,
+                    ),
+                    SerpApiCompanyResult(
+                        position=3,
+                        title="New",
+                        link="new.example",
+                        snippet=None,
+                        source=None,
+                    ),
+                ]
+            )
+        )
+    )
+
+    def fake_ingest(
+        self: CompanyIngestionService,
+        project_id: int,
+        items: list[CompanyIngestionItem],
+    ) -> CompanyIngestionResult:
+        return CompanyIngestionResult(
+            total_rows=len(items),
+            imported=0,
+            skipped_duplicates=1,
+            failed=1,
+            created_company_ids=[],
+            duplicates=[],
+            errors=[
+                CompanyIngestionError(
+                    source_row_number=None,
+                    code="persistence_error",
+                    message="Company ingestion was rolled back due to a persistence error.",
+                )
+            ],
+            rolled_back=True,
+        )
+
+    monkeypatch.setattr(CompanyIngestionService, "ingest", fake_ingest)
+
+    with SessionLocal() as session:
+        result = service.discover_and_ingest_from_serpapi(
+            session=session,
+            project_id=1,
+            request=make_request(),
+        )
+
+    assert result.discovered == 3
+    assert result.imported == 0
+    assert result.skipped_duplicates == 1
+    assert result.failed == 2
+    assert result.created_company_ids == []
+    assert result.rolled_back is True
+    assert [error.code for error in result.errors] == [
+        "invalid_discovery_result",
+        "persistence_error",
+    ]
+    assert result.discovered == result.imported + result.skipped_duplicates + result.failed
+
+
+def test_empty_provider_results_in_persistence_mode_does_not_call_ingestion_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = make_service(FakeSerpApiClient(make_response([], query="empty query")))
+
+    def unexpected_ingest(
+        self: CompanyIngestionService,
+        project_id: int,
+        items: list[CompanyIngestionItem],
+    ) -> None:
+        raise AssertionError("Ingestion service must not be called without discovery items.")
+
+    monkeypatch.setattr(CompanyIngestionService, "ingest", unexpected_ingest)
+
+    with SessionLocal() as session:
+        result = service.discover_and_ingest_from_serpapi(
+            session=session,
+            project_id=1,
+            request=make_request(),
+        )
+
+    assert result.query == "empty query"
+    assert result.discovered == 0
+    assert result.imported == 0
+    assert result.skipped_duplicates == 0
+    assert result.failed == 0
+    assert result.created_company_ids == []
+    assert result.errors == []
+    assert result.rolled_back is False
+    assert result.discovered == result.imported + result.skipped_duplicates + result.failed
