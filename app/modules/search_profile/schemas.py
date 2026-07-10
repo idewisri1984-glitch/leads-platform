@@ -191,3 +191,52 @@ class SearchProfileUpdate(BaseModel):
 
     def supplied_values(self) -> dict[str, Any]:
         return self.model_dump(exclude_unset=True)
+
+
+class SearchQuery(BaseModel):
+    """
+    Provider-independent generated search query.
+    """
+
+    text: str
+    profile_id: int
+    profile_name: str
+    language: str | None = None
+    country: str | None = None
+    city: str | None = None
+    source_template: str
+    limit: int
+
+
+class SearchProfileRunOptions(BaseModel):
+    """
+    Query generation options for a profile run preview.
+    """
+
+    max_queries: int | None = Field(default=None, ge=1, le=100)
+    result_limit_per_query: int | None = Field(default=None, ge=1, le=100)
+    total_result_ceiling: int | None = Field(default=None, ge=1, le=1000)
+
+
+class SearchQueryPreview(BaseModel):
+    """
+    Preview of generated search queries and provider-agnostic request counts.
+    """
+
+    profile_id: int
+    profile_name: str
+    query_count: int
+    estimated_provider_requests: int
+    result_limit_per_query: int
+    total_result_ceiling: int
+    queries: list[SearchQuery]
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if self.query_count != len(self.queries):
+            raise ValueError("query_count must equal len(queries).")
+
+        if self.estimated_provider_requests != len(self.queries):
+            raise ValueError("estimated_provider_requests must equal len(queries).")
+
+        return self
