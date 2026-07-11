@@ -2,6 +2,18 @@ from app.modules.company.models import Company
 from app.modules.company.repository import CompanyRepository
 from app.modules.company.schemas import CompanyCreate, CompanyRead
 from app.modules.company.service import CompanyService
+from app.modules.company_discovery.provider_interfaces import (
+    DiscoveryProvider,
+    DiscoveryProviderConfigurationError,
+    DiscoveryProviderError,
+    DiscoveryProviderRateLimitError,
+    DiscoveryProviderRequestError,
+    DiscoveryProviderResponseError,
+)
+from app.modules.company_discovery.schemas import (
+    DiscoveryProviderResponse,
+    DiscoveryProviderResult,
+)
 from app.modules.contact.models import Contact
 from app.modules.contact.repository import ContactRepository
 from app.modules.contact.schemas import ContactCreate, ContactRead
@@ -40,6 +52,14 @@ __all__ = [
     "CompanyRead",
     "CompanyRepository",
     "CompanyService",
+    "DiscoveryProvider",
+    "DiscoveryProviderConfigurationError",
+    "DiscoveryProviderError",
+    "DiscoveryProviderRateLimitError",
+    "DiscoveryProviderRequestError",
+    "DiscoveryProviderResponse",
+    "DiscoveryProviderResponseError",
+    "DiscoveryProviderResult",
     "Contact",
     "ContactCreate",
     "ContactRead",

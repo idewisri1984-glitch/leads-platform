@@ -5,6 +5,65 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.modules.company_import.schemas import CompanyIngestionError, CompanyIngestionItem
 
 
+class DiscoveryProviderResult(BaseModel):
+    """
+    Provider-independent result returned by a discovery provider.
+    """
+
+    title: str
+    link: str | None = None
+    snippet: str | None = None
+    source: str | None = None
+    position: int | None = Field(default=None, ge=1)
+    provider_reference: str | None = None
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def normalize_title(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("Discovery provider result title is required.")
+
+        return normalized
+
+    @field_validator("link", "snippet", "source", "provider_reference", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+        return normalized or None
+
+
+class DiscoveryProviderResponse(BaseModel):
+    """
+    Provider-independent response for one discovery query.
+    """
+
+    provider: str
+    query: str
+    results: list[DiscoveryProviderResult] = Field(default_factory=list)
+    total_results: int | None = Field(default=None, ge=0)
+
+    @field_validator("provider", "query", mode="before")
+    @classmethod
+    def normalize_required_strings(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("Discovery provider and query are required.")
+
+        return normalized
+
+
 class CompanyDiscoveryRequest(BaseModel):
     """
     Source discovery input accepted by provider-backed company discovery services.

@@ -1,7 +1,17 @@
+from app.modules.company_discovery.provider_interfaces import (
+    DiscoveryProvider,
+    DiscoveryProviderConfigurationError,
+    DiscoveryProviderError,
+    DiscoveryProviderRateLimitError,
+    DiscoveryProviderRequestError,
+    DiscoveryProviderResponseError,
+)
 from app.modules.company_discovery.schemas import (
     CompanyDiscoveryPersistenceResult,
     CompanyDiscoveryRequest,
     CompanyDiscoveryResult,
+    DiscoveryProviderResponse,
+    DiscoveryProviderResult,
 )
 from app.modules.company_discovery.serpapi_adapter import (
     CompanyDiscoveryAdapterError,
@@ -15,5 +25,13 @@ __all__ = [
     "CompanyDiscoveryRequest",
     "CompanyDiscoveryResult",
     "CompanyDiscoveryService",
+    "DiscoveryProvider",
+    "DiscoveryProviderConfigurationError",
+    "DiscoveryProviderError",
+    "DiscoveryProviderRateLimitError",
+    "DiscoveryProviderRequestError",
+    "DiscoveryProviderResponse",
+    "DiscoveryProviderResponseError",
+    "DiscoveryProviderResult",
     "serpapi_result_to_ingestion_item",
 ]
