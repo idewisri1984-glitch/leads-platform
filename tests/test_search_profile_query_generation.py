@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+
 import pytest
 from pydantic import ValidationError
 
@@ -8,6 +10,28 @@ from app.modules.search_profile import (
     SearchProfileRunOptions,
     SearchQueryPreview,
 )
+
+
+class GuardedVirtualList(list[str]):
+    def __init__(self, prefix: str, size: int, max_yields: int) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.size = size
+        self.max_yields = max_yields
+        self.yield_count = 0
+
+    def __bool__(self) -> bool:
+        return self.size > 0
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __iter__(self) -> Iterator[str]:
+        for index in range(self.size):
+            self.yield_count += 1
+            if self.yield_count > self.max_yields:
+                raise AssertionError("Geography iterable was consumed eagerly.")
+            yield f"{self.prefix}{index}"
 
 
 def make_profile(
@@ -166,6 +190,61 @@ def test_cities_and_countries_deterministic_ordering() -> None:
         "distributors Abu Dhabi UAE",
         "distributors Abu Dhabi Saudi Arabia",
     ]
+
+
+def test_large_geography_product_is_consumed_lazily() -> None:
+    profile = make_profile(
+        target_customer_types=["buyers"],
+        query_templates=["{target_customer_type} {city} {country}"],
+        max_queries_per_run=1,
+    )
+    cities = GuardedVirtualList("city", size=10_000, max_yields=1)
+    countries = GuardedVirtualList("country", size=10_000, max_yields=1)
+    profile.cities = cities
+    profile.countries = countries
+
+    preview = generate(profile)
+
+    assert [query.text for query in preview.queries] == ["buyers city0 country0"]
+    assert cities.yield_count == 1
+    assert countries.yield_count == 1
+
+
+def test_geography_iterator_is_fresh_for_each_audience_value() -> None:
+    profile = make_profile(
+        target_customer_types=["buyers", "sellers"],
+        cities=["Sydney", "Melbourne"],
+        countries=["Australia"],
+        query_templates=["{target_customer_type} {city} {country}"],
+        max_queries_per_run=4,
+    )
+
+    assert [query.text for query in generate(profile).queries] == [
+        "buyers Sydney Australia",
+        "buyers Melbourne Australia",
+        "sellers Sydney Australia",
+        "sellers Melbourne Australia",
+    ]
+
+
+def test_total_result_ceiling_stops_lazy_geography_iteration() -> None:
+    profile = make_profile(
+        target_customer_types=["buyers"],
+        cities=["Sydney"],
+        countries=["Australia", "Germany", "USA"],
+        query_templates=["{target_customer_type} {city} {country}"],
+        result_limit=10,
+        max_queries_per_run=10,
+        total_result_ceiling=15,
+    )
+
+    preview = generate(profile)
+
+    assert [query.text for query in preview.queries] == [
+        "buyers Sydney Australia",
+        "buyers Sydney Germany",
+    ]
+    assert [query.limit for query in preview.queries] == [10, 5]
 
 
 def test_customer_types_have_priority_before_industries_and_keywords() -> None:

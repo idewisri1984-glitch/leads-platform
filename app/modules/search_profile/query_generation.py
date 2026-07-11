@@ -1,5 +1,5 @@
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 from app.modules.search_profile.schemas import (
     SearchProfileRead,
@@ -71,7 +71,6 @@ class SearchProfileQueryGenerator:
         seen_queries: set[str] = set()
         remaining_result_budget = effective_total_result_ceiling
         templates = profile.query_templates or DEFAULT_QUERY_TEMPLATES
-        geography_targets = self._geography_targets(profile)
         negative_tokens = self._negative_tokens(profile.negative_keywords)
 
         for template in templates:
@@ -81,7 +80,7 @@ class SearchProfileQueryGenerator:
             language_values = profile.languages if "language" in placeholders else [None]
 
             for audience_value in audience_values:
-                for city, country in geography_targets:
+                for city, country in self._geography_targets(profile):
                     for language in language_values:
                         rendered = self._render_template(
                             template=template,
@@ -191,17 +190,24 @@ class SearchProfileQueryGenerator:
 
         return []
 
-    def _geography_targets(self, profile: SearchProfileRead) -> list[GeographyTarget]:
+    def _geography_targets(self, profile: SearchProfileRead) -> Iterator[GeographyTarget]:
         if profile.cities and profile.countries:
-            return [(city, country) for city in profile.cities for country in profile.countries]
+            for city in profile.cities:
+                for country in profile.countries:
+                    yield city, country
+            return
 
         if profile.cities:
-            return [(city, None) for city in profile.cities]
+            for city in profile.cities:
+                yield city, None
+            return
 
         if profile.countries:
-            return [(None, country) for country in profile.countries]
+            for country in profile.countries:
+                yield None, country
+            return
 
-        return [(None, None)]
+        yield None, None
 
     def _negative_tokens(self, negative_keywords: Iterable[str]) -> list[str]:
         tokens: list[str] = []
