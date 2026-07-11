@@ -5,6 +5,7 @@ from app.cli.company_discovery import app as company_discovery_app
 from app.cli.contact import app as contact_app
 from app.cli.lead import app as lead_app
 from app.cli.project import app as project_app
+from app.cli.search_profile import app as search_profile_app
 from app.cli.task import app as task_app
 
 app = typer.Typer(
@@ -39,6 +40,11 @@ app.add_typer(
 app.add_typer(
     task_app,
     name="task",
+)
+
+app.add_typer(
+    search_profile_app,
+    name="search-profile",
 )
 
 if __name__ == "__main__":

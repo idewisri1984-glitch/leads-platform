@@ -14,6 +14,21 @@ from app.modules.project.models import Project
 from app.modules.project.repository import ProjectRepository
 from app.modules.project.schemas import ProjectCreate, ProjectRead
 from app.modules.project.service import ProjectService
+from app.modules.search_profile.models import SearchProfile
+from app.modules.search_profile.query_generation import (
+    SearchProfileQueryGenerationError,
+    SearchProfileQueryGenerator,
+)
+from app.modules.search_profile.repository import SearchProfileRepository
+from app.modules.search_profile.schemas import (
+    SearchProfileCreate,
+    SearchProfileRead,
+    SearchProfileRunOptions,
+    SearchProfileUpdate,
+    SearchQuery,
+    SearchQueryPreview,
+)
+from app.modules.search_profile.service import SearchProfileService
 from app.modules.task.models import Task
 from app.modules.task.repository import TaskRepository
 from app.modules.task.schemas import TaskCreate, TaskRead
@@ -40,6 +55,17 @@ __all__ = [
     "ProjectRead",
     "ProjectRepository",
     "ProjectService",
+    "SearchProfile",
+    "SearchProfileCreate",
+    "SearchProfileQueryGenerationError",
+    "SearchProfileQueryGenerator",
+    "SearchProfileRead",
+    "SearchProfileRepository",
+    "SearchProfileRunOptions",
+    "SearchProfileService",
+    "SearchProfileUpdate",
+    "SearchQuery",
+    "SearchQueryPreview",
     "Task",
     "TaskCreate",
     "TaskRead",
