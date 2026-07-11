@@ -69,6 +69,7 @@ class SearchProfileQueryGenerator:
 
         queries: list[SearchQuery] = []
         seen_queries: set[str] = set()
+        remaining_result_budget = effective_total_result_ceiling
         templates = profile.query_templates or DEFAULT_QUERY_TEMPLATES
         geography_targets = self._geography_targets(profile)
         negative_tokens = self._negative_tokens(profile.negative_keywords)
@@ -101,6 +102,15 @@ class SearchProfileQueryGenerator:
                         if dedupe_key in seen_queries:
                             continue
 
+                        if remaining_result_budget <= 0:
+                            return self._preview(
+                                profile=profile,
+                                queries=queries,
+                                result_limit=effective_result_limit,
+                                total_result_ceiling=effective_total_result_ceiling,
+                            )
+
+                        query_limit = min(effective_result_limit, remaining_result_budget)
                         seen_queries.add(dedupe_key)
                         queries.append(
                             SearchQuery(
@@ -111,11 +121,12 @@ class SearchProfileQueryGenerator:
                                 country=country,
                                 city=city,
                                 source_template=template,
-                                limit=effective_result_limit,
+                                limit=query_limit,
                             )
                         )
+                        remaining_result_budget -= query_limit
 
-                        if len(queries) >= effective_max_queries:
+                        if len(queries) >= effective_max_queries or remaining_result_budget <= 0:
                             return self._preview(
                                 profile=profile,
                                 queries=queries,

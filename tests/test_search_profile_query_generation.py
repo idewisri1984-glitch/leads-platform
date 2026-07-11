@@ -223,13 +223,68 @@ def test_result_limit_override_may_lower_but_not_raise_profile_value() -> None:
 
 
 def test_total_result_ceiling_override_may_lower_but_not_raise_profile_value() -> None:
-    profile = make_profile(total_result_ceiling=200)
+    profile = make_profile(
+        target_customer_types=[str(index) for index in range(30)],
+        query_templates=["{target_customer_type}"],
+        max_queries_per_run=30,
+        result_limit=10,
+        total_result_ceiling=200,
+    )
 
     lowered = generate(profile, SearchProfileRunOptions(total_result_ceiling=50))
     raised = generate(profile, SearchProfileRunOptions(total_result_ceiling=500))
 
     assert lowered.total_result_ceiling == 50
+    assert sum(query.limit for query in lowered.queries) == 50
     assert raised.total_result_ceiling == 200
+    assert sum(query.limit for query in raised.queries) == 200
+
+
+def test_total_result_ceiling_reduces_final_query_limit() -> None:
+    profile = make_profile(
+        target_customer_types=["one", "two", "three"],
+        query_templates=["{target_customer_type}"],
+        result_limit=10,
+        max_queries_per_run=10,
+        total_result_ceiling=15,
+    )
+
+    preview = generate(profile)
+
+    assert [query.text for query in preview.queries] == ["one", "two"]
+    assert [query.limit for query in preview.queries] == [10, 5]
+    assert sum(query.limit for query in preview.queries) <= preview.total_result_ceiling
+
+
+def test_ceiling_smaller_than_result_limit_produces_one_reduced_query() -> None:
+    profile = make_profile(
+        target_customer_types=["one", "two"],
+        query_templates=["{target_customer_type}"],
+        result_limit=10,
+        max_queries_per_run=10,
+        total_result_ceiling=5,
+    )
+
+    preview = generate(profile)
+
+    assert [query.text for query in preview.queries] == ["one"]
+    assert [query.limit for query in preview.queries] == [5]
+    assert preview.result_limit_per_query == 10
+
+
+def test_max_queries_remains_more_restrictive_than_result_ceiling() -> None:
+    profile = make_profile(
+        target_customer_types=["one", "two", "three"],
+        query_templates=["{target_customer_type}"],
+        result_limit=10,
+        max_queries_per_run=2,
+        total_result_ceiling=100,
+    )
+
+    preview = generate(profile)
+
+    assert [query.text for query in preview.queries] == ["one", "two"]
+    assert [query.limit for query in preview.queries] == [10, 10]
 
 
 def test_run_option_limits_are_validated() -> None:
@@ -390,12 +445,15 @@ def test_deterministic_output_across_repeated_calls() -> None:
         target_customer_types=["offices", "hotels"],
         countries=["Australia"],
         cities=["Sydney", "Melbourne"],
+        result_limit=7,
+        total_result_ceiling=18,
     )
 
     first = generate(profile)
     second = generate(profile)
 
     assert first == second
+    assert [query.limit for query in first.queries] == [7, 7, 4]
 
 
 def test_input_profile_lists_are_not_mutated() -> None:
@@ -403,6 +461,8 @@ def test_input_profile_lists_are_not_mutated() -> None:
         target_customer_types=["Hotels"],
         negative_keywords=["jobs", "jobs"],
         query_templates=[],
+        result_limit=10,
+        total_result_ceiling=5,
     )
     original = profile.model_dump()
 
