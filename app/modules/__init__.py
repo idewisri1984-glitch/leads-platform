@@ -10,6 +10,10 @@ from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProviderRequestError,
     DiscoveryProviderResponseError,
 )
+from app.modules.company_discovery.result_adapter import (
+    DiscoveryResultAdapterError,
+    provider_result_to_ingestion_item,
+)
 from app.modules.company_discovery.schemas import (
     DiscoveryProviderResponse,
     DiscoveryProviderResult,
@@ -61,6 +65,7 @@ __all__ = [
     "DiscoveryProviderResponse",
     "DiscoveryProviderResponseError",
     "DiscoveryProviderResult",
+    "DiscoveryResultAdapterError",
     "Contact",
     "ContactCreate",
     "ContactRead",
@@ -76,6 +81,7 @@ __all__ = [
     "ProjectRead",
     "ProjectRepository",
     "ProjectService",
+    "provider_result_to_ingestion_item",
     "SearchProfile",
     "SearchProfileCreate",
     "SearchProfileQueryGenerationError",
