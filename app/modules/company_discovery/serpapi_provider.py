@@ -1,3 +1,5 @@
+from pydantic import ValidationError
+
 from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProviderConfigurationError,
     DiscoveryProviderError,
@@ -60,19 +62,24 @@ class SerpApiDiscoveryProvider:
 
         response_query = response.query.strip() or query.text
 
-        return DiscoveryProviderResponse(
-            provider=self.provider_name,
-            query=response_query,
-            results=[
-                DiscoveryProviderResult(
-                    title=result.title,
-                    link=result.link,
-                    snippet=result.snippet,
-                    source=result.source,
-                    position=result.position,
-                    provider_reference=None,
-                )
-                for result in response.results
-            ],
-            total_results=None,
-        )
+        try:
+            return DiscoveryProviderResponse(
+                provider=self.provider_name,
+                query=response_query,
+                results=[
+                    DiscoveryProviderResult(
+                        title=result.title,
+                        link=result.link,
+                        snippet=result.snippet,
+                        source=result.source,
+                        position=result.position,
+                        provider_reference=None,
+                    )
+                    for result in response.results
+                ],
+                total_results=None,
+            )
+        except ValidationError:
+            raise DiscoveryProviderResponseError(
+                "Discovery provider response was invalid."
+            ) from None

@@ -3,6 +3,7 @@ import socket
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 import app.modules.company_discovery.serpapi_provider as serpapi_provider_module
 from app.modules.company_discovery import (
@@ -185,6 +186,36 @@ def test_duplicate_vendor_results_are_preserved() -> None:
 
     assert len(response.results) == 2
     assert response.results[0] == response.results[1]
+
+
+@pytest.mark.parametrize("position", [0, -1])
+def test_generic_mapping_validation_errors_are_controlled(position: int) -> None:
+    sensitive_payload = f"raw payload containing {_FAKE_API_KEY}"
+    malformed_result = SerpApiCompanyResult(
+        title="Malformed Company",
+        link=None,
+        snippet=sensitive_payload,
+        source=None,
+        position=position,
+    )
+    provider = make_provider(
+        StubSerpApiClient(
+            response=SerpApiSearchResponse(
+                query="malformed result",
+                results=[malformed_result],
+            )
+        )
+    )
+
+    with pytest.raises(DiscoveryProviderResponseError) as error:
+        provider.search(make_query())
+
+    assert not isinstance(error.value, ValidationError)
+    assert str(error.value) == "Discovery provider response was invalid."
+    assert _FAKE_API_KEY not in str(error.value)
+    assert sensitive_payload not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__ is True
 
 
 @pytest.mark.parametrize(
