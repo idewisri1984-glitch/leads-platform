@@ -2,6 +2,10 @@ from app.modules.company.models import Company
 from app.modules.company.repository import CompanyRepository
 from app.modules.company.schemas import CompanyCreate, CompanyRead
 from app.modules.company.service import CompanyService
+from app.modules.company_discovery.profile_execution import (
+    SearchProfileDiscoveryExecutionError,
+    SearchProfileDiscoveryService,
+)
 from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProvider,
     DiscoveryProviderConfigurationError,
@@ -17,6 +21,10 @@ from app.modules.company_discovery.result_adapter import (
 from app.modules.company_discovery.schemas import (
     DiscoveryProviderResponse,
     DiscoveryProviderResult,
+    SearchProfileDiscoveryAdapterError,
+    SearchProfileDiscoveryDryRunResult,
+    SearchProfileDiscoveryProviderError,
+    SearchProfileDiscoveryQueryResult,
 )
 from app.modules.company_discovery.serpapi_provider import SerpApiDiscoveryProvider
 from app.modules.contact.models import Contact
@@ -66,6 +74,12 @@ __all__ = [
     "DiscoveryProviderResponseError",
     "DiscoveryProviderResult",
     "DiscoveryResultAdapterError",
+    "SearchProfileDiscoveryAdapterError",
+    "SearchProfileDiscoveryDryRunResult",
+    "SearchProfileDiscoveryExecutionError",
+    "SearchProfileDiscoveryProviderError",
+    "SearchProfileDiscoveryQueryResult",
+    "SearchProfileDiscoveryService",
     "Contact",
     "ContactCreate",
     "ContactRead",

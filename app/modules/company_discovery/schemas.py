@@ -1,8 +1,23 @@
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.modules.company_import.schemas import CompanyIngestionError, CompanyIngestionItem
+from app.modules.search_profile.schemas import SearchQuery
+
+ProviderErrorCode = Literal[
+    "configuration_error",
+    "rate_limit_error",
+    "request_error",
+    "response_error",
+    "provider_error",
+]
+
+StopReason = Literal[
+    "configuration_error",
+    "rate_limit_error",
+    "provider_error",
+]
 
 
 class DiscoveryProviderResult(BaseModel):
@@ -62,6 +77,163 @@ class DiscoveryProviderResponse(BaseModel):
             raise ValueError("Discovery provider and query are required.")
 
         return normalized
+
+
+class SearchProfileDiscoveryProviderError(BaseModel):
+    """
+    Safe controlled provider failure for one generated search query.
+    """
+
+    code: ProviderErrorCode
+    message: str
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def normalize_message(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("Provider error message is required.")
+
+        return normalized
+
+
+class SearchProfileDiscoveryAdapterError(BaseModel):
+    """
+    Safe adaptation failure for one provider result.
+    """
+
+    position: int | None = Field(default=None, ge=1)
+    message: str
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def normalize_message(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("Adapter error message is required.")
+
+        return normalized
+
+
+class SearchProfileDiscoveryQueryResult(BaseModel):
+    """
+    Dry-run outcome for one generated search query.
+    """
+
+    query: SearchQuery
+    provider: str
+    provider_result_count: int = Field(ge=0)
+    adapted_item_count: int = Field(ge=0)
+    adapter_error_count: int = Field(ge=0)
+    provider_error: SearchProfileDiscoveryProviderError | None = None
+    items: list[CompanyIngestionItem] = Field(default_factory=list)
+    adapter_errors: list[SearchProfileDiscoveryAdapterError] = Field(default_factory=list)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def normalize_provider(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("Discovery provider name is required.")
+
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if self.adapted_item_count != len(self.items):
+            raise ValueError("adapted_item_count must equal len(items).")
+
+        if self.adapter_error_count != len(self.adapter_errors):
+            raise ValueError("adapter_error_count must equal len(adapter_errors).")
+
+        return self
+
+
+class SearchProfileDiscoveryDryRunResult(BaseModel):
+    """
+    Provider-independent dry-run report for one search profile.
+    """
+
+    profile_id: int
+    profile_name: str
+    provider: str
+    query_count: int = Field(ge=0)
+    estimated_provider_requests: int = Field(ge=0)
+    executed_queries: int = Field(ge=0)
+    total_provider_results: int = Field(ge=0)
+    total_adapted_items: int = Field(ge=0)
+    total_adapter_errors: int = Field(ge=0)
+    total_provider_errors: int = Field(ge=0)
+    total_result_ceiling: int = Field(ge=0)
+    stopped_early: bool
+    stop_reason: StopReason | None = None
+    query_results: list[SearchProfileDiscoveryQueryResult] = Field(default_factory=list)
+
+    @field_validator("profile_name", "provider", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("Profile and provider names are required.")
+
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if self.executed_queries != len(self.query_results):
+            raise ValueError("executed_queries must equal len(query_results).")
+
+        if self.total_provider_results != sum(
+            result.provider_result_count for result in self.query_results
+        ):
+            raise ValueError("total_provider_results is inconsistent with query_results.")
+
+        if self.total_adapted_items != sum(
+            result.adapted_item_count for result in self.query_results
+        ):
+            raise ValueError("total_adapted_items is inconsistent with query_results.")
+
+        if self.total_adapter_errors != sum(
+            result.adapter_error_count for result in self.query_results
+        ):
+            raise ValueError("total_adapter_errors is inconsistent with query_results.")
+
+        provider_error_count = sum(
+            result.provider_error is not None for result in self.query_results
+        )
+
+        if self.total_provider_errors != provider_error_count:
+            raise ValueError("total_provider_errors is inconsistent with query_results.")
+
+        if self.query_count < self.executed_queries:
+            raise ValueError("query_count must be greater than or equal to executed_queries.")
+
+        if self.estimated_provider_requests != self.query_count:
+            raise ValueError("estimated_provider_requests must equal query_count.")
+
+        if self.stopped_early and self.stop_reason is None:
+            raise ValueError("stop_reason is required when stopped_early is true.")
+
+        if not self.stopped_early and self.stop_reason is not None:
+            raise ValueError("stop_reason must be absent when stopped_early is false.")
+
+        return self
 
 
 class CompanyDiscoveryRequest(BaseModel):
