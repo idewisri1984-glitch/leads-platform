@@ -10,6 +10,9 @@ from app.modules.company_discovery import (
     CompanyDiscoveryService,
     SearchProfileDiscoveryDryRunResult,
     SearchProfileDiscoveryExecutionError,
+    SearchProfileDiscoveryPersistenceError,
+    SearchProfileDiscoveryPersistenceService,
+    SearchProfileDiscoveryPersistResult,
     SearchProfileDiscoveryService,
     SerpApiDiscoveryProvider,
 )
@@ -34,6 +37,10 @@ def run_search_profile(
         bool,
         typer.Option("--dry-run", help="Execute without persisting companies."),
     ] = False,
+    persist: Annotated[
+        bool,
+        typer.Option("--persist", help="Persist discovered companies through ingestion."),
+    ] = False,
     max_queries: Annotated[
         int | None,
         typer.Option(help="Lower the maximum query count."),
@@ -47,9 +54,12 @@ def run_search_profile(
         typer.Option(help="Lower the total result ceiling."),
     ] = None,
 ) -> None:
-    """Execute an existing search profile through SerpAPI without persistence."""
-    if not dry_run:
-        typer.secho("--dry-run is required for search profile execution.", fg=typer.colors.RED)
+    """Execute an existing search profile through SerpAPI."""
+    if dry_run == persist:
+        typer.secho(
+            "Choose exactly one mode: --dry-run or --persist.",
+            fg=typer.colors.RED,
+        )
         raise typer.Exit(1)
 
     if provider.strip().casefold() != "serpapi":
@@ -85,18 +95,45 @@ def run_search_profile(
         timeout_seconds=settings.serpapi_timeout_seconds,
     )
     discovery_provider = SerpApiDiscoveryProvider(client)
-    service = SearchProfileDiscoveryService(SearchProfileQueryGenerator())
+    discovery_service = SearchProfileDiscoveryService(SearchProfileQueryGenerator())
 
     try:
-        report = service.run_dry(profile, discovery_provider, options)
+        if dry_run:
+            report = discovery_service.run_dry(profile, discovery_provider, options)
+        else:
+            persistence_service = SearchProfileDiscoveryPersistenceService(discovery_service)
+
+            with SessionLocal() as persistence_session:
+                persistence_report = persistence_service.run_persist(
+                    session=persistence_session,
+                    profile=profile,
+                    provider=discovery_provider,
+                    options=options,
+                )
     except SearchProfileDiscoveryExecutionError as error:
         typer.secho(f"Search profile execution error: {error}", fg=typer.colors.RED)
         raise typer.Exit(1) from error
     except SearchProfileQueryGenerationError as error:
         typer.secho(f"Search profile query error: {error}", fg=typer.colors.RED)
         raise typer.Exit(1) from error
+    except SearchProfileDiscoveryPersistenceError as error:
+        typer.secho(f"Search profile persistence error: {error}", fg=typer.colors.RED)
+        raise typer.Exit(1) from error
 
-    _print_profile_dry_run_report(report)
+    if dry_run:
+        _print_profile_dry_run_report(report)
+        return
+
+    _print_profile_persist_report(persistence_report)
+
+    if (
+        persistence_report.ingestion_result is not None
+        and persistence_report.ingestion_result.rolled_back
+    ):
+        raise typer.Exit(1)
+
+    if persistence_report.stopped_early:
+        raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)
@@ -255,6 +292,61 @@ def _print_profile_dry_run_report(report: SearchProfileDiscoveryDryRunResult) ->
     typer.echo(f"Stop Reason: {report.stop_reason or ''}")
     typer.echo("Companies persisted: 0")
 
+    _print_profile_query_results(report)
+
+
+def _print_profile_persist_report(report: SearchProfileDiscoveryPersistResult) -> None:
+    ingestion_result = report.ingestion_result
+    imported = ingestion_result.imported if ingestion_result is not None else 0
+    skipped_duplicates = ingestion_result.skipped_duplicates if ingestion_result is not None else 0
+    failed = ingestion_result.failed if ingestion_result is not None else 0
+    rolled_back = ingestion_result.rolled_back if ingestion_result is not None else False
+    created_company_ids = (
+        ingestion_result.created_company_ids if ingestion_result is not None else []
+    )
+
+    typer.echo("Dry run: False")
+    typer.echo("Persistence requested: True")
+    typer.echo(f"Profile ID: {report.profile_id}")
+    typer.echo(f"Profile Name: {report.profile_name}")
+    typer.echo(f"Provider: {report.provider}")
+    typer.echo(f"Query Count: {report.query_count}")
+    typer.echo(f"Estimated Provider Requests: {report.estimated_provider_requests}")
+    typer.echo(f"Executed Queries: {report.executed_queries}")
+    typer.echo(f"Total Provider Results: {report.total_provider_results}")
+    typer.echo(f"Total Adapted Items: {report.total_adapted_items}")
+    typer.echo(f"Total Adapter Errors: {report.total_adapter_errors}")
+    typer.echo(f"Total Provider Errors: {report.total_provider_errors}")
+    typer.echo(f"Stopped Early: {report.stopped_early}")
+    typer.echo(f"Stop Reason: {report.stop_reason or ''}")
+    typer.echo(f"Items submitted to ingestion: {report.total_items_submitted_to_ingestion}")
+    typer.echo(f"Ingestion attempted: {report.ingestion_attempted}")
+    typer.echo(f"Imported: {imported}")
+    typer.echo(f"Skipped duplicates: {skipped_duplicates}")
+    typer.echo(f"Failed: {failed}")
+    typer.echo(f"Rolled back: {rolled_back}")
+    typer.echo(f"Created company IDs: {created_company_ids}")
+    typer.echo(f"Companies persisted: {imported}")
+
+    if ingestion_result is not None:
+        _print_errors("Ingestion errors", ingestion_result.errors)
+
+        if ingestion_result.duplicates:
+            typer.echo()
+            typer.echo("Ingestion duplicates")
+
+            for duplicate in ingestion_result.duplicates:
+                typer.echo(
+                    f"- Source row: {duplicate.source_row_number or ''}  "
+                    f"Existing company ID: {duplicate.existing_company_id}  "
+                    f"Matched by: {duplicate.matched_by}  "
+                    f"Matched value: {duplicate.matched_value}"
+                )
+
+    _print_profile_query_results(report)
+
+
+def _print_profile_query_results(report: SearchProfileDiscoveryDryRunResult) -> None:
     for number, query_result in enumerate(report.query_results, start=1):
         typer.echo(f"\nQuery {number}")
         typer.echo(f"Text: {query_result.query.text}")
