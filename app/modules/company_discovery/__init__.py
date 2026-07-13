@@ -2,6 +2,10 @@ from app.modules.company_discovery.profile_execution import (
     SearchProfileDiscoveryExecutionError,
     SearchProfileDiscoveryService,
 )
+from app.modules.company_discovery.profile_persistence import (
+    SearchProfileDiscoveryPersistenceError,
+    SearchProfileDiscoveryPersistenceService,
+)
 from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProvider,
     DiscoveryProviderConfigurationError,
@@ -22,6 +26,7 @@ from app.modules.company_discovery.schemas import (
     DiscoveryProviderResult,
     SearchProfileDiscoveryAdapterError,
     SearchProfileDiscoveryDryRunResult,
+    SearchProfileDiscoveryPersistResult,
     SearchProfileDiscoveryProviderError,
     SearchProfileDiscoveryQueryResult,
 )
@@ -50,6 +55,9 @@ __all__ = [
     "SearchProfileDiscoveryAdapterError",
     "SearchProfileDiscoveryDryRunResult",
     "SearchProfileDiscoveryExecutionError",
+    "SearchProfileDiscoveryPersistenceError",
+    "SearchProfileDiscoveryPersistenceService",
+    "SearchProfileDiscoveryPersistResult",
     "SearchProfileDiscoveryProviderError",
     "SearchProfileDiscoveryQueryResult",
     "SearchProfileDiscoveryService",

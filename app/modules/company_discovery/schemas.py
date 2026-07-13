@@ -2,7 +2,11 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.modules.company_import.schemas import CompanyIngestionError, CompanyIngestionItem
+from app.modules.company_import.schemas import (
+    CompanyIngestionError,
+    CompanyIngestionItem,
+    CompanyIngestionResult,
+)
 from app.modules.search_profile.schemas import SearchQuery
 
 ProviderErrorCode = Literal[
@@ -232,6 +236,40 @@ class SearchProfileDiscoveryDryRunResult(BaseModel):
 
         if not self.stopped_early and self.stop_reason is not None:
             raise ValueError("stop_reason must be absent when stopped_early is false.")
+
+        return self
+
+
+class SearchProfileDiscoveryPersistResult(SearchProfileDiscoveryDryRunResult):
+    """
+    Search profile discovery outcome with optional ingestion results.
+    """
+
+    ingestion_attempted: bool
+    total_items_submitted_to_ingestion: int = Field(ge=0)
+    ingestion_result: CompanyIngestionResult | None = None
+
+    @model_validator(mode="after")
+    def validate_ingestion(self) -> Self:
+        if self.ingestion_attempted:
+            if self.ingestion_result is None:
+                raise ValueError("ingestion_result is required when ingestion was attempted.")
+
+            if self.total_items_submitted_to_ingestion != self.ingestion_result.total_rows:
+                raise ValueError(
+                    "total_items_submitted_to_ingestion must equal ingestion_result.total_rows."
+                )
+        elif self.ingestion_result is not None:
+            raise ValueError("ingestion_result must be absent when ingestion was not attempted.")
+        elif self.total_items_submitted_to_ingestion != 0:
+            raise ValueError(
+                "total_items_submitted_to_ingestion must be zero when ingestion was not attempted."
+            )
+
+        if self.total_items_submitted_to_ingestion > self.total_adapted_items:
+            raise ValueError(
+                "total_items_submitted_to_ingestion cannot exceed total_adapted_items."
+            )
 
         return self
 
