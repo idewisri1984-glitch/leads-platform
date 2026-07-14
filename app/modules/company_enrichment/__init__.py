@@ -26,4 +26,6 @@ __all__ = [
     "EnrichmentProvider",
     "EnrichmentProviderError",
     "EnrichmentStatus",
+    "FakeEnrichmentProvider",
 ]
+from app.modules.company_enrichment.fake_provider import FakeEnrichmentProvider

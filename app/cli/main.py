@@ -2,6 +2,7 @@ import typer
 
 from app.cli.company import app as company_app
 from app.cli.company_discovery import app as company_discovery_app
+from app.cli.company_enrichment import app as company_enrichment_app
 from app.cli.contact import app as contact_app
 from app.cli.lead import app as lead_app
 from app.cli.project import app as project_app
@@ -25,6 +26,11 @@ app.add_typer(
 app.add_typer(
     company_discovery_app,
     name="company-discovery",
+)
+
+app.add_typer(
+    company_enrichment_app,
+    name="company-enrichment",
 )
 
 app.add_typer(
