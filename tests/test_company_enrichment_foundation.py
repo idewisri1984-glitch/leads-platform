@@ -112,7 +112,12 @@ def test_enrichment_status_is_restricted_by_database(session: Session) -> None:
 
 def test_run_schema_rejects_unknown_enrichment_status() -> None:
     with pytest.raises(ValidationError):
-        CompanyEnrichmentRunItem(company_id=1, provider="fake", status="UNKNOWN")
+        CompanyEnrichmentRunItem(
+            company_id=1,
+            company_name="Company",
+            provider="fake",
+            status="UNKNOWN",
+        )
 
 
 def test_company_delete_cascades_enrichment(session: Session) -> None:

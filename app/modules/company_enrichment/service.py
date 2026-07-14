@@ -102,6 +102,7 @@ class CompanyEnrichmentService:
         if dry_run:
             return CompanyEnrichmentRunItem(
                 company_id=company.id,
+                company_name=company.name,
                 provider=provider_result.provider,
                 status=status,
                 created=created,
@@ -129,6 +130,7 @@ class CompanyEnrichmentService:
         self.repository.session.commit()
         return CompanyEnrichmentRunItem(
             company_id=company.id,
+            company_name=company.name,
             provider=provider_result.provider,
             status=status,
             created=created,
@@ -189,6 +191,7 @@ class CompanyEnrichmentService:
             self.repository.session.commit()
         return CompanyEnrichmentRunItem(
             company_id=company.id,
+            company_name=company.name,
             provider=provider_name,
             status=EnrichmentStatus.FAILED,
             created=created,

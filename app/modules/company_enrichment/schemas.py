@@ -55,6 +55,7 @@ class CompanyEnrichmentRead(BaseModel):
 
 class CompanyEnrichmentRunItem(BaseModel):
     company_id: int
+    company_name: str
     provider: str
     status: EnrichmentStatus
     created: bool = False
