@@ -32,6 +32,7 @@ from app.modules.company_discovery.schemas import (
     SearchProfileDiscoveryQueryResult,
 )
 from app.modules.company_discovery.serpapi_provider import SerpApiDiscoveryProvider
+from app.modules.company_enrichment.models import CompanyEnrichment
 from app.modules.contact.models import Contact
 from app.modules.contact.repository import ContactRepository
 from app.modules.contact.schemas import ContactCreate, ContactRead
@@ -70,6 +71,7 @@ __all__ = [
     "CompanyRead",
     "CompanyRepository",
     "CompanyService",
+    "CompanyEnrichment",
     "DiscoveryProvider",
     "DiscoveryProviderConfigurationError",
     "DiscoveryProviderError",
