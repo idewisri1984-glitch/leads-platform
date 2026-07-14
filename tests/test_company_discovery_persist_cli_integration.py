@@ -244,17 +244,33 @@ def test_rollback_does_not_leave_partial_companies(
     )
     install_provider(monkeypatch, provider)
     original_flush = Session.flush
+    company_flush_count = 0
+    first_flush_reached_database = False
 
     def fail_company_flush(session: Session, objects: Any = None) -> None:
+        nonlocal company_flush_count, first_flush_reached_database
+
         if any(isinstance(item, Company) for item in session.new):
-            raise SQLAlchemyError("forced integration-test persistence failure")
+            company_flush_count += 1
+
+            if company_flush_count == 2:
+                raise SQLAlchemyError("synthetic second company flush failure")
+
         original_flush(session, objects)
+
+        if company_flush_count == 1:
+            flushed_company_count = session.connection().execute(
+                select(func.count()).select_from(Company)
+            )
+            first_flush_reached_database = flushed_company_count.scalar_one() == 1
 
     monkeypatch.setattr(Session, "flush", fail_company_flush)
 
     result = invoke_profile(profile_id)
 
     assert result.exit_code == 1
+    assert company_flush_count == 2
+    assert first_flush_reached_database is True
     assert "Rolled back: True" in result.output
     assert "Companies persisted: 0" in result.output
     assert companies_for_project(project_id) == []
