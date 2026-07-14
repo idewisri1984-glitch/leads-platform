@@ -33,7 +33,7 @@ _ENRICHMENT_FIELDS = (
     "source_url",
     "notes",
 )
-_USEFUL_FIELDS = _ENRICHMENT_FIELDS[:-1]
+_USEFUL_FIELDS = ("website", *_ENRICHMENT_FIELDS[:-1])
 _NORMALIZERS: dict[str, Callable[[str | None], str | None]] = {
     "website": normalize_public_url,
     "email": normalize_email,
@@ -77,11 +77,11 @@ class CompanyEnrichmentService:
         useful = any(values.get(field) is not None for field in _USEFUL_FIELDS)
         status: EnrichmentStatus
         if useful and errors:
-            status = "PARTIAL"
+            status = EnrichmentStatus.PARTIAL
         elif useful:
-            status = "SUCCEEDED"
+            status = EnrichmentStatus.SUCCEEDED
         else:
-            status = "NOT_FOUND"
+            status = EnrichmentStatus.NOT_FOUND
 
         changed_fields: list[str] = []
         if (
@@ -161,10 +161,10 @@ class CompanyEnrichmentService:
             created=sum(item.created for item in items),
             updated=sum(item.updated for item in items),
             unchanged=sum(item.unchanged for item in items),
-            succeeded=sum(item.status == "SUCCEEDED" for item in items),
-            partial=sum(item.status == "PARTIAL" for item in items),
-            not_found=sum(item.status == "NOT_FOUND" for item in items),
-            failed=sum(item.status == "FAILED" for item in items),
+            succeeded=sum(item.status == EnrichmentStatus.SUCCEEDED for item in items),
+            partial=sum(item.status == EnrichmentStatus.PARTIAL for item in items),
+            not_found=sum(item.status == EnrichmentStatus.NOT_FOUND for item in items),
+            failed=sum(item.status == EnrichmentStatus.FAILED for item in items),
             dry_run=dry_run,
             items=items,
         )
@@ -182,7 +182,7 @@ class CompanyEnrichmentService:
             enrichment, created = self.repository.get_or_create_for_company(company.id)
             self.repository.update(
                 enrichment,
-                enrichment_status="FAILED",
+                enrichment_status=EnrichmentStatus.FAILED,
                 website_checked_at=datetime.now(UTC),
                 last_error=safe_error,
             )
@@ -190,7 +190,7 @@ class CompanyEnrichmentService:
         return CompanyEnrichmentRunItem(
             company_id=company.id,
             provider=provider_name,
-            status="FAILED",
+            status=EnrichmentStatus.FAILED,
             created=created,
             updated=not created,
             errors=[safe_error],

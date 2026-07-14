@@ -2,6 +2,7 @@ import re
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$")
+_HOSTNAME_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _INSTAGRAM_BLOCKED_PATHS = {
     "accounts",
     "explore",
@@ -34,7 +35,12 @@ def normalize_public_url(value: str | None) -> str | None:
         hostname = hostname.rstrip(".").encode("idna").decode("ascii").casefold()
     except UnicodeError as error:
         raise ValueError("URL hostname is invalid.") from error
-    if not hostname or any(not label for label in hostname.split(".")):
+    labels = hostname.split(".")
+    if (
+        not hostname
+        or len(hostname) > 253
+        or any(_HOSTNAME_LABEL_PATTERN.fullmatch(label) is None for label in labels)
+    ):
         raise ValueError("URL hostname is invalid.")
     host = f"[{hostname}]" if ":" in hostname else hostname
     if port is not None:

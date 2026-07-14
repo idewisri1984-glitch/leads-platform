@@ -2,14 +2,14 @@ from collections import deque
 from collections.abc import Generator
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database.session import SessionLocal
 from app.modules.company.models import Company
-from app.modules.company_enrichment.models import CompanyEnrichment
+from app.modules.company_enrichment.models import CompanyEnrichment, EnrichmentStatus
 from app.modules.company_enrichment.normalization import (
     normalize_email,
     normalize_instagram_url,
@@ -21,6 +21,7 @@ from app.modules.company_enrichment.provider_interfaces import EnrichmentProvide
 from app.modules.company_enrichment.repository import CompanyEnrichmentRepository
 from app.modules.company_enrichment.schemas import (
     CompanyEnrichmentProviderResult,
+    CompanyEnrichmentRunItem,
     CompanyEnrichmentTarget,
 )
 from app.modules.company_enrichment.service import CompanyEnrichmentService
@@ -90,6 +91,28 @@ def test_company_id_is_unique(session: Session) -> None:
     session.add_all([CompanyEnrichment(company_id=item.id), CompanyEnrichment(company_id=item.id)])
     with pytest.raises(IntegrityError):
         session.commit()
+
+
+def test_enrichment_status_is_restricted_by_database(session: Session) -> None:
+    item = company(session)
+    valid = CompanyEnrichment(
+        company_id=item.id,
+        enrichment_status=EnrichmentStatus.SUCCEEDED,
+    )
+    session.add(valid)
+    session.commit()
+    valid.enrichment_status = EnrichmentStatus.PARTIAL
+    session.commit()
+    assert valid.enrichment_status == EnrichmentStatus.PARTIAL
+
+    valid.enrichment_status = "UNKNOWN"  # type: ignore[assignment]
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_run_schema_rejects_unknown_enrichment_status() -> None:
+    with pytest.raises(ValidationError):
+        CompanyEnrichmentRunItem(company_id=1, provider="fake", status="UNKNOWN")
 
 
 def test_company_delete_cascades_enrichment(session: Session) -> None:
@@ -175,6 +198,28 @@ def test_company_website_is_filled_only_when_null(session: Session) -> None:
     assert item.website == "https://example.com"
 
 
+def test_website_only_result_is_successful(session: Session) -> None:
+    item = company(session)
+    provider = FakeProvider([result(website="https://Example.COM/")])
+    run = service(session).enrich_company(item, provider, dry_run=False)
+    assert item.website == "https://example.com"
+    assert run.status == EnrichmentStatus.SUCCEEDED
+    assert run.changed_fields == ["website"]
+
+
+def test_website_with_provider_errors_is_partial_and_safe(session: Session) -> None:
+    item = company(session)
+    provider = FakeProvider(
+        [result(website="https://example.com", errors=["API_KEY=unsafe raw detail"])]
+    )
+    run = service(session).enrich_company(item, provider, dry_run=False)
+    assert item.website == "https://example.com"
+    assert run.status == EnrichmentStatus.PARTIAL
+    assert run.changed_fields == ["website"]
+    assert run.errors == ["Provider reported an enrichment error."]
+    assert "unsafe raw detail" not in repr(run)
+
+
 @pytest.mark.parametrize(
     ("provider_result", "expected"),
     [
@@ -244,6 +289,22 @@ def test_normalize_public_url_rejects_unsafe_values(raw: str) -> None:
         normalize_public_url(raw)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://exa mple.com",
+        "https://bad_.example",
+        "https://-bad.example",
+        "https://bad-.example",
+        f"https://{'a' * 64}.example",
+        f"https://{'a' * 63}.{'b' * 63}.{'c' * 63}.{'d' * 61}.example",
+    ],
+)
+def test_normalize_public_url_rejects_malformed_hostnames(raw: str) -> None:
+    with pytest.raises(ValueError, match="hostname is invalid"):
+        normalize_public_url(raw)
+
+
 def test_social_url_normalization() -> None:
     assert (
         normalize_instagram_url("https://www.instagram.com/Example/")
@@ -261,6 +322,9 @@ def test_social_url_normalization() -> None:
         "https://instagram.com/reel/abc",
         "https://instagram.com/stories/user",
         "https://instagram.com/login",
+        "https://instagram.com/share",
+        "https://instagram.com/explore",
+        "https://instagram.com/accounts",
     ],
 )
 def test_instagram_rejects_non_profile_urls(raw: str) -> None:

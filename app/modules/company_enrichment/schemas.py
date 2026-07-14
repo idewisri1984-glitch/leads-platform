@@ -1,9 +1,8 @@
 from datetime import datetime
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-EnrichmentStatus = Literal["PENDING", "SUCCEEDED", "PARTIAL", "NOT_FOUND", "FAILED"]
+from app.modules.company_enrichment.models import EnrichmentStatus as EnrichmentStatus
 
 
 class CompanyEnrichmentTarget(BaseModel):

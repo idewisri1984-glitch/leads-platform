@@ -40,6 +40,10 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["company_id"], ["companies.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("company_id"),
+        sa.CheckConstraint(
+            "enrichment_status IN ('PENDING', 'SUCCEEDED', 'PARTIAL', 'NOT_FOUND', 'FAILED')",
+            name="ck_company_enrichments_enrichment_status",
+        ),
     )
     op.create_index(
         op.f("ix_company_enrichments_company_id"),
