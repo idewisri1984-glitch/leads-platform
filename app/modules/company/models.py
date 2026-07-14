@@ -76,3 +76,10 @@ class Company(Base):
         back_populates="company",
         cascade="all, delete-orphan",
     )
+
+    enrichment = relationship(
+        "CompanyEnrichment",
+        back_populates="company",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
