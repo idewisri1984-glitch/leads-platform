@@ -360,16 +360,10 @@ def test_selection_dry_run_changes_no_existing_metadata(session: Session) -> Non
     assert enrichment.last_error == "Existing safe error."
 
 
-def test_selection_persist_protects_manual_values_fills_empty_and_sanitizes_errors(
-    session: Session,
-) -> None:
+def test_selection_persist_protects_all_manual_non_null_fields(session: Session) -> None:
     project = create_project(session)
     item = create_company(session, project, "selected")
-    manual = {
-        **USEFUL_VALUES,
-        "about_page_url": None,
-        "notes": "Manual notes",
-    }
+    manual = {**USEFUL_VALUES, "notes": "Manual notes"}
     enrichment = add_enrichment(session, item, **manual)
     session.commit()
     provider = FakeProvider(
@@ -382,6 +376,39 @@ def test_selection_persist_protects_manual_values_fills_empty_and_sanitizes_erro
                 contact_page_url="https://new.example/contact",
                 about_page_url="https://new.example/about",
                 source_url="https://new.example",
+                notes="Provider notes",
+            )
+        ]
+    )
+
+    service(session).enrich_project_companies(
+        project.id,
+        provider,
+        limit=1,
+        dry_run=False,
+        selection_options=CompanyEnrichmentSelectionOptions(company_id=item.id),
+    )
+    session.refresh(enrichment)
+
+    for field, value in USEFUL_VALUES.items():
+        assert getattr(enrichment, field) == value
+    assert enrichment.notes == "Manual notes"
+
+
+def test_selection_persist_fills_empty_fields_and_sanitizes_errors(session: Session) -> None:
+    project = create_project(session)
+    item = create_company(session, project, "selected")
+    enrichment = add_enrichment(
+        session,
+        item,
+        about_page_url=None,
+        notes="Manual notes",
+    )
+    session.commit()
+    provider = FakeProvider(
+        [
+            provider_result(
+                about_page_url="https://new.example/about",
                 notes="Provider notes",
                 errors=["API_KEY=secret raw payload"],
             )
@@ -397,11 +424,8 @@ def test_selection_persist_protects_manual_values_fills_empty_and_sanitizes_erro
     )
     session.refresh(enrichment)
 
-    for field, value in USEFUL_VALUES.items():
-        if field != "about_page_url":
-            assert getattr(enrichment, field) == value
-    assert enrichment.notes == "Manual notes"
     assert enrichment.about_page_url == "https://new.example/about"
+    assert enrichment.notes == "Manual notes"
     assert enrichment.website_checked_at is not None
     assert enrichment.last_error == "Provider reported an enrichment error."
     assert run.items[0].errors == ["Provider reported an enrichment error."]
