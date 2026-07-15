@@ -35,6 +35,20 @@ class TrackingFakeProvider:
         )
 
 
+class TrackingWebsiteProvider:
+    provider_name = "website"
+    targets: list[CompanyEnrichmentTarget] = []
+
+    def enrich(self, target: CompanyEnrichmentTarget) -> CompanyEnrichmentProviderResult:
+        self.targets.append(target)
+        return CompanyEnrichmentProviderResult(
+            provider=self.provider_name,
+            source_url=target.website,
+            email="website@example.com",
+            notes="Static website enrichment parsed.",
+        )
+
+
 def create_project(*, company_websites: list[str | None]) -> tuple[int, list[int]]:
     with SessionLocal() as session:
         project = Project(name="CLI Project")
@@ -112,10 +126,17 @@ def test_exactly_one_mode_is_required_and_invalid_mode_does_not_write(
 
 def test_unsupported_provider_exits_safely_without_writes() -> None:
     project_id, _ = create_project(company_websites=[None])
-    result = invoke(project_id, mode="--persist", provider="website")
+    result = invoke(project_id, mode="--persist", provider="unknown")
     assert result.exit_code == 1
-    assert "Stage F3 supports only fake" in result.output
+    assert "Choose one of: fake, website" in result.output
     assert enrichment_count() == 0
+
+
+def test_help_reflects_supported_website_provider() -> None:
+    project_id, _ = create_project(company_websites=[])
+    result = invoke(project_id, mode="--dry-run", provider="unknown")
+    assert result.exit_code == 1
+    assert "fake, website" in result.output
 
 
 @pytest.mark.parametrize(
@@ -166,6 +187,23 @@ def test_dry_run_writes_nothing_and_reports_safe_counts(
     assert [target.company_id for target in TrackingFakeProvider.targets] == company_ids
 
 
+def test_website_dry_run_selects_provider_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, company_ids = create_project(company_websites=["https://one.example"])
+    TrackingWebsiteProvider.targets = []
+    monkeypatch.setattr(cli, "WebsiteEnrichmentProvider", TrackingWebsiteProvider)
+
+    result = invoke(project_id, mode="--dry-run", provider="website")
+
+    assert result.exit_code == 0, result.output
+    assert enrichment_count() == 0
+    assert "Provider: website" in result.output
+    assert "Dry run: True" in result.output
+    assert "Persistence requested: False" in result.output
+    assert [target.company_id for target in TrackingWebsiteProvider.targets] == company_ids
+
+
 def test_persist_creates_rows_through_real_service() -> None:
     project_id, company_ids = create_project(company_websites=["https://one.example", None])
     result = invoke(project_id, mode="--persist")
@@ -180,6 +218,26 @@ def test_persist_creates_rows_through_real_service() -> None:
             session.scalars(select(CompanyEnrichment).order_by(CompanyEnrichment.company_id))
         )
         assert [row.company_id for row in rows] == company_ids
+
+
+def test_website_persist_selects_provider_and_writes_through_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, company_ids = create_project(company_websites=["https://one.example"])
+    TrackingWebsiteProvider.targets = []
+    monkeypatch.setattr(cli, "WebsiteEnrichmentProvider", TrackingWebsiteProvider)
+
+    result = invoke(project_id, mode="--persist", provider="website")
+
+    assert result.exit_code == 0, result.output
+    assert "Provider: website" in result.output
+    assert "Dry run: False" in result.output
+    assert "Persistence requested: True" in result.output
+    assert [target.company_id for target in TrackingWebsiteProvider.targets] == company_ids
+    with SessionLocal() as session:
+        rows = list(session.scalars(select(CompanyEnrichment)))
+        assert [row.company_id for row in rows] == company_ids
+        assert rows[0].email == "website@example.com"
 
 
 def test_project_selection_and_limit_are_respected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,6 +324,47 @@ def test_unexpected_provider_error_is_sanitized(monkeypatch: pytest.MonkeyPatch)
         assert unsafe not in result.output
 
 
+def test_unexpected_website_provider_error_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, _ = create_project(company_websites=["https://one.example"])
+
+    class FailingWebsiteProvider:
+        provider_name = "website"
+
+        def enrich(self, target: CompanyEnrichmentTarget) -> CompanyEnrichmentProviderResult:
+            raise RuntimeError("API_KEY=secret <html> raw payload traceback")
+
+    monkeypatch.setattr(cli, "WebsiteEnrichmentProvider", FailingWebsiteProvider)
+    result = invoke(project_id, mode="--dry-run", provider="website")
+    assert result.exit_code == 1
+    assert "Company enrichment failed safely." in result.output
+    for unsafe in ["Traceback", "API_KEY", "secret", "<html>", "raw payload"]:
+        assert unsafe not in result.output
+
+
+def test_website_provider_result_errors_are_safely_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, _ = create_project(company_websites=["https://one.example"])
+
+    class SafeErrorWebsiteProvider:
+        provider_name = "website"
+
+        def enrich(self, target: CompanyEnrichmentTarget) -> CompanyEnrichmentProviderResult:
+            return CompanyEnrichmentProviderResult(
+                provider=self.provider_name,
+                source_url=target.website,
+                errors=["Website request failed."],
+            )
+
+    monkeypatch.setattr(cli, "WebsiteEnrichmentProvider", SafeErrorWebsiteProvider)
+    result = invoke(project_id, mode="--dry-run", provider="website")
+    assert result.exit_code == 0, result.output
+    assert "Error: Provider reported an enrichment error." in result.output
+    assert "Website request failed." not in result.output
+
+
 def test_cli_keeps_service_and_persistence_boundaries() -> None:
     source = Path(cli.__file__).read_text(encoding="utf-8")
     for forbidden in [
@@ -283,7 +382,29 @@ def test_cli_keeps_service_and_persistence_boundaries() -> None:
         "playwright",
         "instagram",
         "linkedin",
+        "socket",
+        "getaddrinfo",
     ]:
         assert forbidden not in source
     assert "CompanyEnrichmentService" in source
     assert "CompanyEnrichmentRepository" in source
+
+
+def test_website_provider_is_constructed_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
+    constructed = False
+
+    class TrackingConstructor:
+        provider_name = "website"
+
+        def __init__(self) -> None:
+            nonlocal constructed
+            constructed = True
+
+        def enrich(self, target: CompanyEnrichmentTarget) -> CompanyEnrichmentProviderResult:
+            return CompanyEnrichmentProviderResult(provider=self.provider_name)
+
+    monkeypatch.setattr(cli, "WebsiteEnrichmentProvider", TrackingConstructor)
+    assert not constructed
+    provider_instance = cli._get_enrichment_provider("website")
+    assert constructed
+    assert provider_instance.provider_name == "website"

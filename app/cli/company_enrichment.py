@@ -7,7 +7,9 @@ from app.modules.company_enrichment import (
     CompanyEnrichmentRepository,
     CompanyEnrichmentRunResult,
     CompanyEnrichmentService,
+    EnrichmentProvider,
     FakeEnrichmentProvider,
+    WebsiteEnrichmentProvider,
 )
 
 app = typer.Typer(help="Company enrichment commands.")
@@ -32,7 +34,7 @@ def run_company_enrichment(
         typer.Option("--persist", help="Persist enrichment data through the service."),
     ] = False,
 ) -> None:
-    """Run deterministic fake-provider enrichment for saved companies."""
+    """Run provider-based enrichment for saved companies."""
     if dry_run == persist:
         typer.secho(
             "Choose exactly one mode: --dry-run or --persist.",
@@ -48,14 +50,14 @@ def run_company_enrichment(
         typer.secho("Limit must be between 1 and 100.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
-    if provider.strip().casefold() != "fake":
+    try:
+        enrichment_provider = _get_enrichment_provider(provider)
+    except ValueError:
         typer.secho(
-            "Unsupported enrichment provider. Stage F3 supports only fake.",
+            "Unsupported enrichment provider. Choose one of: fake, website.",
             fg=typer.colors.RED,
         )
-        raise typer.Exit(1)
-
-    enrichment_provider = FakeEnrichmentProvider()
+        raise typer.Exit(1) from None
 
     try:
         with SessionLocal() as session:
@@ -71,6 +73,15 @@ def run_company_enrichment(
         raise typer.Exit(1) from None
 
     _print_report(report, project_id=project_id, limit=limit, persist=persist)
+
+
+def _get_enrichment_provider(provider_name: str) -> EnrichmentProvider:
+    normalized_name = provider_name.strip().casefold()
+    if normalized_name == "fake":
+        return FakeEnrichmentProvider()
+    if normalized_name == "website":
+        return WebsiteEnrichmentProvider()
+    raise ValueError("Unsupported enrichment provider.")
 
 
 def _print_report(
