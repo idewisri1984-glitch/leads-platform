@@ -16,6 +16,7 @@ from app.modules.company_enrichment.service import CompanyEnrichmentService
 from app.modules.company_enrichment.website_extraction import (
     extract_company_enrichment_from_html,
 )
+from app.modules.company_enrichment.website_provider import WebsiteEnrichmentProvider
 
 __all__ = [
     "CompanyEnrichment",
@@ -30,6 +31,7 @@ __all__ = [
     "EnrichmentProviderError",
     "EnrichmentStatus",
     "FakeEnrichmentProvider",
+    "WebsiteEnrichmentProvider",
     "extract_company_enrichment_from_html",
 ]
 from app.modules.company_enrichment.fake_provider import FakeEnrichmentProvider
