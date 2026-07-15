@@ -9,7 +9,11 @@ from app.modules.company_enrichment.schemas import (
     CompanyEnrichmentProviderResult,
     CompanyEnrichmentTarget,
 )
-from app.modules.company_enrichment.website_provider import WebsiteEnrichmentProvider
+from app.modules.company_enrichment.website_provider import (
+    WebsiteEnrichmentProvider,
+    _FetchResponse,
+    _ResponseTooLarge,
+)
 
 PUBLIC_IP = "93.184.216.34"
 
@@ -24,9 +28,33 @@ def provider(
     resolver: Callable[[str], Sequence[str]] | None = None,
     **kwargs: object,
 ) -> WebsiteEnrichmentProvider:
-    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    class MockFetcher:
+        def fetch(
+            self,
+            *,
+            url: str,
+            hostname: str,
+            verified_ip: str,
+            timeout: float,
+            max_response_bytes: int,
+        ) -> _FetchResponse:
+            del hostname, verified_ip, timeout
+            request = httpx.Request("GET", url)
+            try:
+                response = handler(request)
+            except httpx.HTTPError as exc:
+                raise OSError from exc
+            body = response.read()
+            if len(body) > max_response_bytes:
+                raise _ResponseTooLarge
+            return _FetchResponse(
+                response.status_code,
+                {key.casefold(): value for key, value in response.headers.items()},
+                body,
+            )
+
     return WebsiteEnrichmentProvider(
-        client=client,
+        fetcher=MockFetcher(),
         resolver=resolver or (lambda _hostname: [PUBLIC_IP]),
         **kwargs,  # type: ignore[arg-type]
     )
@@ -179,6 +207,89 @@ def test_public_dns_answer_is_accepted() -> None:
 
 
 @pytest.mark.parametrize(
+    "address",
+    [
+        "100.64.0.1",
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "fc00::1",
+        "::1",
+        "fe80::1",
+    ],
+)
+def test_non_global_dns_addresses_are_rejected(address: str) -> None:
+    result = provider(
+        lambda _request: pytest.fail("request not expected"),
+        resolver=lambda _hostname: [address],
+    ).enrich(target())
+    assert result.errors == ["Website host is not public."]
+
+
+@pytest.mark.parametrize("address", [PUBLIC_IP, "2606:2800:220:1:248:1893:25c8:1946"])
+def test_global_dns_addresses_are_accepted(address: str) -> None:
+    result = provider(
+        lambda request: html_response(request, "global@example.com"),
+        resolver=lambda _hostname: [address],
+    ).enrich(target())
+    assert result.email == "global@example.com"
+
+
+def test_fetcher_receives_verified_ip_and_original_hostname() -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    class RecordingFetcher:
+        def fetch(self, **kwargs: object) -> _FetchResponse:
+            calls.append((str(kwargs["url"]), str(kwargs["hostname"]), str(kwargs["verified_ip"])))
+            return _FetchResponse(200, {"content-type": "text/html"}, b"<html></html>")
+
+    website_provider = WebsiteEnrichmentProvider(
+        fetcher=RecordingFetcher(),
+        resolver=lambda _hostname: [PUBLIC_IP],
+    )
+    website_provider.enrich(target())
+    assert calls == [("https://example.com", "example.com", PUBLIC_IP)]
+
+
+def test_redirect_target_is_resolved_and_pinned_separately() -> None:
+    resolutions: list[str] = []
+    calls: list[tuple[str, str]] = []
+
+    def resolver(hostname: str) -> Sequence[str]:
+        resolutions.append(hostname)
+        return {"example.com": [PUBLIC_IP], "www.example.com": ["8.8.8.8"]}[hostname]
+
+    class RedirectFetcher:
+        def fetch(self, **kwargs: object) -> _FetchResponse:
+            url = str(kwargs["url"])
+            calls.append((url, str(kwargs["verified_ip"])))
+            if url == "https://example.com":
+                return _FetchResponse(302, {"location": "https://www.example.com/home"}, b"")
+            return _FetchResponse(200, {"content-type": "text/html"}, b"<html></html>")
+
+    WebsiteEnrichmentProvider(
+        fetcher=RedirectFetcher(),
+        resolver=resolver,
+    ).enrich(target())
+    assert resolutions == ["example.com", "www.example.com"]
+    assert calls == [
+        ("https://example.com", PUBLIC_IP),
+        ("https://www.example.com/home", "8.8.8.8"),
+    ]
+
+
+def test_unsafe_redirect_target_never_reaches_fetcher() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(302, headers={"location": "http://127.0.0.1"}, request=request)
+
+    provider(handler).enrich(target())
+    assert requested == ["https://example.com"]
+
+
+@pytest.mark.parametrize(
     "location",
     ["http://127.0.0.1/private", "https://user:pass@example.com/private"],
 )
@@ -325,6 +436,26 @@ def test_offsite_redirect_from_same_site_subpage_is_not_fetched() -> None:
     result = provider(handler).enrich(target())
     assert requested == ["https://example.com", "https://example.com/contact"]
     assert "Website redirect was unsafe." in result.errors
+
+
+def test_redirect_final_url_is_not_fetched_again_as_page_candidate() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.path == "/contact":
+            return httpx.Response(302, headers={"location": "/about"}, request=request)
+        if request.url.path == "/about":
+            return html_response(request, "about@example.com")
+        return html_response(request, '<a href="/contact">Contact</a><a href="/about">About</a>')
+
+    result = provider(handler).enrich(target())
+    assert requested == [
+        "https://example.com",
+        "https://example.com/contact",
+        "https://example.com/about",
+    ]
+    assert result.email == "about@example.com"
 
 
 def test_parser_errors_and_safe_notes_are_preserved() -> None:
