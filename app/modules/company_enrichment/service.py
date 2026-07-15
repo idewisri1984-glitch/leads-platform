@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.modules.company.models import Company
 from app.modules.company_enrichment.models import CompanyEnrichment
@@ -19,6 +19,7 @@ from app.modules.company_enrichment.schemas import (
     CompanyEnrichmentProviderResult,
     CompanyEnrichmentRunItem,
     CompanyEnrichmentRunResult,
+    CompanyEnrichmentSelectionOptions,
     CompanyEnrichmentTarget,
     EnrichmentStatus,
 )
@@ -147,18 +148,34 @@ class CompanyEnrichmentService:
         limit: int,
         dry_run: bool,
         overwrite: bool = False,
+        selection_options: CompanyEnrichmentSelectionOptions | None = None,
+        now: datetime | None = None,
     ) -> CompanyEnrichmentRunResult:
-        if limit <= 0:
-            raise ValueError("limit must be greater than zero.")
-        companies = self.repository.list_companies_for_project(project_id, limit)
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100.")
+        options = selection_options or CompanyEnrichmentSelectionOptions()
+        checked_before = None
+        if options.skip_recent_days is not None:
+            reference_time = now or datetime.now(UTC)
+            if reference_time.tzinfo is None:
+                raise ValueError("now must be timezone-aware.")
+            checked_before = reference_time - timedelta(days=options.skip_recent_days)
+        selection = self.repository.select_companies_for_enrichment(
+            project_id,
+            limit,
+            options=options,
+            checked_before=checked_before,
+        )
         items = [
             self.enrich_company(company, provider, dry_run=dry_run, overwrite=overwrite)
-            for company in companies
+            for company in selection.companies
         ]
         return CompanyEnrichmentRunResult(
             project_id=project_id,
             provider=provider.provider_name,
+            matched=selection.matched_count,
             selected=len(items),
+            skipped_by_filters=selection.skipped_by_filters_count,
             attempted=len(items),
             created=sum(item.created for item in items),
             updated=sum(item.updated for item in items),

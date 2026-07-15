@@ -9,6 +9,7 @@ from app.modules.company_enrichment.schemas import (
     CompanyEnrichmentRead,
     CompanyEnrichmentRunItem,
     CompanyEnrichmentRunResult,
+    CompanyEnrichmentSelectionOptions,
     CompanyEnrichmentTarget,
     EnrichmentStatus,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "CompanyEnrichmentRepository",
     "CompanyEnrichmentRunItem",
     "CompanyEnrichmentRunResult",
+    "CompanyEnrichmentSelectionOptions",
     "CompanyEnrichmentService",
     "CompanyEnrichmentTarget",
     "EnrichmentProvider",
