@@ -13,6 +13,13 @@ class CompanyEnrichmentTarget(BaseModel):
     city: str | None = None
 
 
+class CompanyEnrichmentSelectionOptions(BaseModel):
+    only_missing: bool = False
+    skip_recent_days: int | None = Field(default=None, ge=1, le=3650)
+    status: EnrichmentStatus | None = None
+    company_id: int | None = Field(default=None, gt=0)
+
+
 class CompanyEnrichmentProviderResult(BaseModel):
     provider: str
     website: str | None = None
@@ -68,7 +75,9 @@ class CompanyEnrichmentRunItem(BaseModel):
 class CompanyEnrichmentRunResult(BaseModel):
     project_id: int
     provider: str
+    matched: int = Field(ge=0)
     selected: int = Field(ge=0)
+    skipped_by_filters: int = Field(ge=0)
     attempted: int = Field(ge=0)
     created: int = Field(ge=0)
     updated: int = Field(ge=0)
@@ -82,6 +91,8 @@ class CompanyEnrichmentRunResult(BaseModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> "CompanyEnrichmentRunResult":
+        if self.selected > self.matched:
+            raise ValueError("Selected count cannot exceed matched count.")
         if self.selected != len(self.items) or self.attempted != len(self.items):
             raise ValueError("Selected and attempted counts must match items.")
         if self.created + self.updated + self.unchanged != self.attempted:
