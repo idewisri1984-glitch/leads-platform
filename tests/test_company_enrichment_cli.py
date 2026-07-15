@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +10,13 @@ import app.cli.company_enrichment as cli
 from app.cli.main import app as main_app
 from app.core.database.session import SessionLocal
 from app.modules.company.models import Company
-from app.modules.company_enrichment.models import CompanyEnrichment
+from app.modules.company_enrichment.models import CompanyEnrichment, EnrichmentStatus
 from app.modules.company_enrichment.schemas import (
     CompanyEnrichmentProviderResult,
+    CompanyEnrichmentSelectionOptions,
     CompanyEnrichmentTarget,
 )
+from app.modules.company_enrichment.service import CompanyEnrichmentService
 from app.modules.project.models import Project
 
 runner = CliRunner()
@@ -72,7 +75,8 @@ def invoke(
     *,
     mode: str | None,
     provider: str = "fake",
-    limit: int = 20,
+    limit: int | None = 20,
+    extra_args: tuple[str, ...] = (),
 ) -> Any:
     arguments = [
         "run",
@@ -80,9 +84,10 @@ def invoke(
         str(project_id),
         "--provider",
         provider,
-        "--limit",
-        str(limit),
     ]
+    if limit is not None:
+        arguments.extend(["--limit", str(limit)])
+    arguments.extend(extra_args)
     if mode is not None:
         arguments.append(mode)
     return runner.invoke(cli.app, arguments)
@@ -194,13 +199,14 @@ def test_website_dry_run_selects_provider_without_writes(
     TrackingWebsiteProvider.targets = []
     monkeypatch.setattr(cli, "WebsiteEnrichmentProvider", TrackingWebsiteProvider)
 
-    result = invoke(project_id, mode="--dry-run", provider="website")
+    result = invoke(project_id, mode="--dry-run", provider="website", limit=1)
 
     assert result.exit_code == 0, result.output
     assert enrichment_count() == 0
     assert "Provider: website" in result.output
     assert "Dry run: True" in result.output
     assert "Persistence requested: False" in result.output
+    assert "Limit: 1" in result.output
     assert [target.company_id for target in TrackingWebsiteProvider.targets] == company_ids
 
 
@@ -408,3 +414,238 @@ def test_website_provider_is_constructed_lazily(monkeypatch: pytest.MonkeyPatch)
     provider_instance = cli._get_enrichment_provider("website")
     assert constructed
     assert provider_instance.provider_name == "website"
+
+
+def test_fake_without_limit_defaults_to_twenty() -> None:
+    project_id, _ = create_project(company_websites=[])
+    result = invoke(project_id, mode="--dry-run", limit=None)
+    assert result.exit_code == 0, result.output
+    assert "Limit: 20" in result.output
+
+
+def test_website_without_limit_exits_before_provider_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, _ = create_project(company_websites=["https://one.example"])
+
+    def forbidden_provider() -> None:
+        raise AssertionError("Website provider must not be constructed without --limit.")
+
+    monkeypatch.setattr(cli, "WebsiteEnrichmentProvider", forbidden_provider)
+    result = invoke(project_id, mode="--dry-run", provider="website", limit=None)
+    assert result.exit_code == 1
+    assert "--limit is required when using --provider website." in result.output
+    assert enrichment_count() == 0
+
+
+@pytest.mark.parametrize("days", [0, 3651])
+def test_invalid_skip_recent_days_exits_safely(days: int) -> None:
+    project_id, _ = create_project(company_websites=[])
+    result = invoke(
+        project_id,
+        mode="--dry-run",
+        extra_args=("--skip-recent-days", str(days)),
+    )
+    assert result.exit_code == 1
+    assert "Invalid company enrichment selection options." in result.output
+
+
+def test_invalid_status_exits_safely() -> None:
+    project_id, _ = create_project(company_websites=[])
+    result = invoke(
+        project_id,
+        mode="--dry-run",
+        extra_args=("--status", "UNKNOWN"),
+    )
+    assert result.exit_code == 1
+    assert "Invalid company enrichment selection options." in result.output
+
+
+def test_invalid_company_id_exits_safely() -> None:
+    project_id, _ = create_project(company_websites=[])
+    result = invoke(
+        project_id,
+        mode="--dry-run",
+        extra_args=("--company-id", "0"),
+    )
+    assert result.exit_code == 1
+    assert "Invalid company enrichment selection options." in result.output
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (("--only-missing",), CompanyEnrichmentSelectionOptions(only_missing=True)),
+        (
+            ("--skip-recent-days", "30"),
+            CompanyEnrichmentSelectionOptions(skip_recent_days=30),
+        ),
+        (
+            ("--status", "FAILED"),
+            CompanyEnrichmentSelectionOptions(status=EnrichmentStatus.FAILED),
+        ),
+        (("--company-id", "123"), CompanyEnrichmentSelectionOptions(company_id=123)),
+    ],
+)
+def test_each_selection_flag_is_passed_to_service(
+    arguments: tuple[str, ...],
+    expected: CompanyEnrichmentSelectionOptions,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, _ = create_project(company_websites=[])
+    captured: list[CompanyEnrichmentSelectionOptions] = []
+    original = CompanyEnrichmentService.enrich_project_companies
+
+    def tracking_enrich(self: CompanyEnrichmentService, *args: Any, **kwargs: Any) -> Any:
+        captured.append(kwargs["selection_options"])
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CompanyEnrichmentService, "enrich_project_companies", tracking_enrich)
+    result = invoke(project_id, mode="--dry-run", extra_args=arguments)
+
+    assert result.exit_code == 0, result.output
+    assert captured == [expected]
+
+
+def test_combined_selection_flags_are_passed_to_service_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, company_ids = create_project(company_websites=["https://one.example"])
+    captured: list[CompanyEnrichmentSelectionOptions] = []
+    original = CompanyEnrichmentService.enrich_project_companies
+
+    def tracking_enrich(self: CompanyEnrichmentService, *args: Any, **kwargs: Any) -> Any:
+        captured.append(kwargs["selection_options"])
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CompanyEnrichmentService, "enrich_project_companies", tracking_enrich)
+    result = invoke(
+        project_id,
+        mode="--dry-run",
+        extra_args=(
+            "--only-missing",
+            "--skip-recent-days",
+            "30",
+            "--status",
+            "pending",
+            "--company-id",
+            str(company_ids[0]),
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == [
+        CompanyEnrichmentSelectionOptions(
+            only_missing=True,
+            skip_recent_days=30,
+            status=EnrichmentStatus.PENDING,
+            company_id=company_ids[0],
+        )
+    ]
+    for expected in [
+        "Only missing: True",
+        "Skip recent days: 30",
+        "Status filter: PENDING",
+        f"Company ID filter: {company_ids[0]}",
+        "Matched: 0",
+        "Skipped by filters: 1",
+    ]:
+        assert expected in result.output
+
+
+def test_only_missing_dry_run_calls_provider_only_for_selected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, company_ids = create_project(
+        company_websites=["https://missing.example", "https://complete.example"]
+    )
+    with SessionLocal() as session:
+        session.add(
+            CompanyEnrichment(
+                company_id=company_ids[1],
+                email="complete@example.com",
+                phone="+1 212 555 0199",
+                instagram_url="https://instagram.com/complete",
+                linkedin_url="https://linkedin.com/company/complete",
+                contact_page_url="https://complete.example/contact",
+                about_page_url="https://complete.example/about",
+                source_url="https://complete.example",
+            )
+        )
+        session.commit()
+    TrackingFakeProvider.targets = []
+    monkeypatch.setattr(cli, "FakeEnrichmentProvider", TrackingFakeProvider)
+
+    result = invoke(
+        project_id,
+        mode="--dry-run",
+        extra_args=("--only-missing",),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [target.company_id for target in TrackingFakeProvider.targets] == [company_ids[0]]
+    assert enrichment_count() == 1
+
+
+def test_skip_recent_days_can_select_zero_without_calling_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, company_ids = create_project(company_websites=["https://recent.example"])
+    with SessionLocal() as session:
+        session.add(
+            CompanyEnrichment(
+                company_id=company_ids[0],
+                website_checked_at=datetime.now(UTC) - timedelta(days=1),
+            )
+        )
+        session.commit()
+    TrackingFakeProvider.targets = []
+    monkeypatch.setattr(cli, "FakeEnrichmentProvider", TrackingFakeProvider)
+
+    result = invoke(
+        project_id,
+        mode="--dry-run",
+        extra_args=("--skip-recent-days", "30"),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Selected: 0" in result.output
+    assert "Attempted: 0" in result.output
+    assert TrackingFakeProvider.targets == []
+
+
+def test_wrong_project_company_id_selects_zero() -> None:
+    project_id, _ = create_project(company_websites=[])
+    _, other_company_ids = create_project(company_websites=["https://other.example"])
+    result = invoke(
+        project_id,
+        mode="--dry-run",
+        extra_args=("--company-id", str(other_company_ids[0])),
+    )
+    assert result.exit_code == 0, result.output
+    assert "Selected: 0" in result.output
+    assert "Attempted: 0" in result.output
+
+
+def test_selection_flags_preserve_dry_run_and_persist_boundaries() -> None:
+    dry_project_id, _ = create_project(company_websites=["https://dry.example"])
+    dry_result = invoke(
+        dry_project_id,
+        mode="--dry-run",
+        extra_args=("--only-missing",),
+    )
+    assert dry_result.exit_code == 0, dry_result.output
+    assert enrichment_count() == 0
+
+    persist_project_id, company_ids = create_project(company_websites=["https://persist.example"])
+    persist_result = invoke(
+        persist_project_id,
+        mode="--persist",
+        extra_args=("--only-missing", "--company-id", str(company_ids[0])),
+    )
+    assert persist_result.exit_code == 0, persist_result.output
+    with SessionLocal() as session:
+        row = session.scalar(
+            select(CompanyEnrichment).where(CompanyEnrichment.company_id == company_ids[0])
+        )
+        assert row is not None
