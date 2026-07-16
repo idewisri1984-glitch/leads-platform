@@ -15,6 +15,9 @@ from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreat
 
 MAX_HTML_LENGTH = 250_000
 MAX_DOM_NODES = 50_000
+MAX_TOTAL_WORK_UNITS = 250_000
+MAX_CARD_SUBTREE_NODES = 300
+MAX_ANCESTOR_DEPTH = 256
 _ParserBase: Any = getattr(_html_parser, "HTML" + "Parser")
 
 _EMAIL = re.compile(r"(?<![\w.+-])([\w.+-]+@[\w-]+(?:\.[\w-]+)+)", re.ASCII)
@@ -24,7 +27,6 @@ _CONTEXT_WORDS = {
     "leadership",
     "staff",
     "people",
-    "about",
     "management",
     "executives",
     "employees",
@@ -71,20 +73,35 @@ class _Node:
     parent: "_Node | None" = None
     children: list["_Node"] = field(default_factory=list)
     text_parts: list[str] = field(default_factory=list)
+    depth: int = 0
 
-    def text(self) -> str:
+    def text(self, budget: "_WorkBudget") -> str:
         parts: list[str] = []
         stack = [self]
         processed = 0
-        while stack and processed < MAX_DOM_NODES:
+        while stack and processed < MAX_CARD_SUBTREE_NODES:
+            if not budget.consume():
+                return ""
             current = stack.pop()
             processed += 1
             parts.extend(current.text_parts)
             stack.extend(reversed(current.children))
+        if stack:
+            budget.exhausted = True
+            return ""
         return clean_discovered_text(" ".join(parts)) or ""
 
     def marker_text(self) -> str:
-        return f"{self.attrs.get('class', '')} {self.attrs.get('id', '')}".casefold()
+        structural_values = [
+            self.attrs.get("class", ""),
+            self.attrs.get("id", ""),
+            self.attrs.get("role", ""),
+            self.attrs.get("aria-label", ""),
+        ]
+        structural_values.extend(
+            value for name, value in self.attrs.items() if name.startswith("data-")
+        )
+        return " ".join(structural_values).casefold()
 
 
 class _StaticContactHTMLCollector(_ParserBase):  # type: ignore[misc]
@@ -97,9 +114,11 @@ class _StaticContactHTMLCollector(_ParserBase):  # type: ignore[misc]
         self.json_ld_parts: list[str] = []
         self.json_ld_documents: list[str] = []
         self.node_count = 0
-        self.node_limit_reached = False
+        self.exhausted = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.exhausted:
+            return
         attributes = {name.casefold(): value or "" for name, value in attrs}
         lowered = tag.casefold()
         if lowered == "script" and attributes.get("type", "").casefold().split(";")[0].strip() == (
@@ -118,9 +137,13 @@ class _StaticContactHTMLCollector(_ParserBase):  # type: ignore[misc]
             self.ignored_depth += 1
             return
         if self.node_count >= MAX_DOM_NODES:
-            self.node_limit_reached = True
+            self.exhausted = True
             return
-        node = _Node(lowered, attributes, self.stack[-1])
+        depth = self.stack[-1].depth + 1
+        if depth > MAX_ANCESTOR_DEPTH:
+            self.exhausted = True
+            return
+        node = _Node(lowered, attributes, self.stack[-1], depth=depth)
         self.node_count += 1
         self.stack[-1].children.append(node)
         if lowered not in {
@@ -140,11 +163,15 @@ class _StaticContactHTMLCollector(_ParserBase):  # type: ignore[misc]
             self.stack.append(node)
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.exhausted:
+            return
         self.handle_starttag(tag, attrs)
         if self.stack[-1].tag == tag.casefold():
             self.stack.pop()
 
     def handle_endtag(self, tag: str) -> None:
+        if self.exhausted:
+            return
         lowered = tag.casefold()
         if self.json_ld_depth:
             self.json_ld_depth -= 1
@@ -160,10 +187,55 @@ class _StaticContactHTMLCollector(_ParserBase):  # type: ignore[misc]
                 break
 
     def handle_data(self, data: str) -> None:
+        if self.exhausted:
+            return
         if self.json_ld_depth:
             self.json_ld_parts.append(data)
         elif not self.ignored_depth and data.strip():
             self.stack[-1].text_parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if not self.exhausted:
+            super().handle_entityref(name)
+
+    def handle_charref(self, name: str) -> None:
+        if not self.exhausted:
+            super().handle_charref(name)
+
+    def handle_comment(self, data: str) -> None:
+        return
+
+
+@dataclass
+class _WorkBudget:
+    remaining: int = field(default_factory=lambda: MAX_TOTAL_WORK_UNITS)
+    exhausted: bool = False
+
+    def consume(self, units: int = 1) -> bool:
+        if self.exhausted or units < 0 or self.remaining < units:
+            self.exhausted = True
+            return False
+        self.remaining -= units
+        return True
+
+
+@dataclass(frozen=True)
+class _Context:
+    positive_distance: int | None
+    blocked_distance: int | None
+    weak_textual_hint: bool
+
+    @property
+    def allows_candidate(self) -> bool:
+        if self.blocked_distance is None:
+            return True
+        return self.positive_distance is not None and self.positive_distance < self.blocked_distance
+
+    @property
+    def has_positive_context(self) -> bool:
+        return self.positive_distance is not None or (
+            self.blocked_distance is None and self.weak_textual_hint
+        )
 
 
 @dataclass(frozen=True)
@@ -191,7 +263,15 @@ def parse_contact_discovery_candidates_from_html(
     try:
         collector.feed(html[:MAX_HTML_LENGTH])
         collector.close()
-        extracted = [*_extract_html_people(collector.root), *_extract_json_ld_people(collector)]
+        if collector.exhausted:
+            return []
+        budget = _WorkBudget()
+        extracted = [
+            *_extract_html_people(collector.root, budget),
+            *_extract_json_ld_people(collector, budget),
+        ]
+        if budget.exhausted:
+            return []
         candidates: dict[str, ContactDiscoveryCandidateCreate] = {}
         for person in extracted:
             candidate = _to_candidate(company_id, source_url, source_type, person)
@@ -208,38 +288,52 @@ def parse_contact_discovery_candidates_from_html(
                 candidates[key] = candidate
             else:
                 candidates[key] = _merge_candidates(previous, candidate)
+        if budget.exhausted:
+            return []
         return list(candidates.values())
     except (RecursionError, ValueError, TypeError):
         return []
 
 
-def _walk(node: _Node) -> list[_Node]:
+def _walk(node: _Node, budget: _WorkBudget, *, limit: int = MAX_DOM_NODES) -> list[_Node]:
     result: list[_Node] = []
     stack = list(reversed(node.children))
-    while stack and len(result) < MAX_DOM_NODES:
+    while stack and len(result) < limit:
+        if not budget.consume():
+            return []
         current = stack.pop()
         result.append(current)
         stack.extend(reversed(current.children))
+    if stack:
+        budget.exhausted = True
+        return []
     return result
 
 
-def _extract_html_people(root: _Node) -> list[_ExtractedPerson]:
+def _extract_html_people(root: _Node, budget: _WorkBudget) -> list[_ExtractedPerson]:
     people: list[_ExtractedPerson] = []
-    for node in _walk(root):
+    nodes = _walk(root, budget)
+    if budget.exhausted:
+        return []
+    for node in nodes:
         marker = node.marker_text()
         explicit_card = any(word in marker for word in _BLOCK_MARKERS)
         structured = node.tag in {"tr", "dl"}
         if not (explicit_card or structured):
             continue
-        in_context = _has_people_context(node)
-        if _has_blocked_context(node) and not in_context:
+        context = _resolve_context(node, budget)
+        if budget.exhausted:
+            return []
+        if not context.allows_candidate:
             continue
         if any(
             ancestor is not node and any(word in ancestor.marker_text() for word in _BLOCK_MARKERS)
-            for ancestor in _ancestors(node)
+            for ancestor in _ancestors(node, budget)
         ):
             continue
-        person = _person_from_node(node, in_context=in_context)
+        if budget.exhausted:
+            return []
+        person = _person_from_node(node, in_context=context.has_positive_context, budget=budget)
         if person is None:
             continue
         if structured and not explicit_card and not _has_strong_structured_signal(person):
@@ -247,23 +341,35 @@ def _extract_html_people(root: _Node) -> list[_ExtractedPerson]:
         people.append(person)
 
     # A compact heading followed by a role is a common static team pattern.
-    for node in _walk(root):
-        if node.tag not in _NAME_TAGS or not _has_people_context(node):
+    for node in nodes:
+        if node.tag not in _NAME_TAGS:
+            continue
+        context = _resolve_context(node, budget)
+        if budget.exhausted:
+            return []
+        if not context.allows_candidate or not context.has_positive_context:
             continue
         next_node = _next_sibling(node)
         if next_node is None or next_node.tag not in {"p", "span", "small", "div"}:
             continue
-        name, title = node.text(), next_node.text()
+        name, title = node.text(budget), next_node.text(budget)
+        if budget.exhausted:
+            return []
         if _looks_like_name(name) and _looks_like_title(title):
             people.append(_ExtractedPerson(name, title, None, None, in_context=True))
     return people
 
 
-def _person_from_node(node: _Node, *, in_context: bool) -> _ExtractedPerson | None:
-    text = node.text()
+def _person_from_node(
+    node: _Node, *, in_context: bool, budget: _WorkBudget
+) -> _ExtractedPerson | None:
+    text = node.text(budget)
     if not text or len(text) > 1_500:
         return None
-    links = [child for child in _walk(node) if child.tag == "a"]
+    descendants = _walk(node, budget, limit=MAX_CARD_SUBTREE_NODES)
+    if budget.exhausted:
+        return None
+    links = [child for child in descendants if child.tag == "a"]
     email = _first_valid_email(
         [
             link.attrs.get("href", "")[7:].split("?", 1)[0]
@@ -280,9 +386,9 @@ def _person_from_node(node: _Node, *, in_context: bool) -> _ExtractedPerson | No
         ]
         + _PHONE.findall(text)
     )
-    name = _first_text(node, _NAME_TAGS, _looks_like_name)
-    title = _first_marked_text(node, _TITLE_MARKERS, _looks_like_title)
-    values = _short_text_values(node)
+    name = _first_text(descendants, _NAME_TAGS, _looks_like_name, budget)
+    title = _first_marked_text(descendants, _TITLE_MARKERS, _looks_like_title, budget)
+    values = _short_text_values(node, budget)
     if name is None:
         name = next((value for value in values if _looks_like_name(value)), None)
     if title is None:
@@ -294,14 +400,16 @@ def _person_from_node(node: _Node, *, in_context: bool) -> _ExtractedPerson | No
     return _ExtractedPerson(name, title, email, phone, in_context=in_context)
 
 
-def _extract_json_ld_people(collector: _StaticContactHTMLCollector) -> list[_ExtractedPerson]:
+def _extract_json_ld_people(
+    collector: _StaticContactHTMLCollector, budget: _WorkBudget
+) -> list[_ExtractedPerson]:
     people: list[_ExtractedPerson] = []
     for document in collector.json_ld_documents:
         try:
             payload = json.loads(document)
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
-        for item in _json_objects(payload):
+        for item in _json_objects(payload, budget):
             item_type = item.get("@type")
             types = item_type if isinstance(item_type, list) else [item_type]
             if not any(isinstance(value, str) and value.casefold() == "person" for value in types):
@@ -315,18 +423,19 @@ def _extract_json_ld_people(collector: _StaticContactHTMLCollector) -> list[_Ext
     return people
 
 
-def _json_objects(value: Any) -> list[dict[str, Any]]:
-    if isinstance(value, dict):
-        result = [value]
-        for nested in value.values():
-            result.extend(_json_objects(nested))
-        return result
-    if isinstance(value, list):
-        result = []
-        for nested in value:
-            result.extend(_json_objects(nested))
-        return result
-    return []
+def _json_objects(value: Any, budget: _WorkBudget) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    stack = [value]
+    while stack:
+        if not budget.consume():
+            return []
+        current = stack.pop()
+        if isinstance(current, dict):
+            result.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return result
 
 
 def _json_text(value: Any) -> str | None:
@@ -389,34 +498,62 @@ def _merge_candidates(
     return ContactDiscoveryCandidateCreate.model_validate(values)
 
 
-def _ancestors(node: _Node) -> list[_Node]:
-    result = []
+def _ancestors(node: _Node, budget: _WorkBudget) -> list[_Node]:
+    result: list[_Node] = []
     current: _Node | None = node
-    while current is not None:
+    while current is not None and len(result) <= MAX_ANCESTOR_DEPTH:
+        if not budget.consume():
+            return []
         result.append(current)
         current = current.parent
+    if current is not None:
+        budget.exhausted = True
+        return []
     return result
 
 
-def _has_people_context(node: _Node) -> bool:
-    for ancestor in _ancestors(node):
+def _resolve_context(node: _Node, budget: _WorkBudget) -> _Context:
+    positive_distance: int | None = None
+    blocked_distance: int | None = None
+    ancestors = _ancestors(node, budget)
+    if budget.exhausted:
+        return _Context(None, None, False)
+    for distance, ancestor in enumerate(ancestors):
         marker = ancestor.marker_text()
-        if any(word in marker for word in _CONTEXT_WORDS):
-            return True
-        for child in ancestor.children[:3]:
-            if child.tag in {"h1", "h2", "h3"} and any(
-                word in child.text().casefold() for word in _CONTEXT_WORDS
-            ):
+        if positive_distance is None and any(word in marker for word in _CONTEXT_WORDS):
+            positive_distance = distance
+        if blocked_distance is None and (
+            ancestor.tag in _BLOCKED_TAGS or any(word in marker for word in _BLOCKED_MARKERS)
+        ):
+            blocked_distance = distance
+        if positive_distance is not None and blocked_distance is not None:
+            break
+    weak_hint = blocked_distance is None and _has_local_textual_context(node, budget)
+    return _Context(positive_distance, blocked_distance, weak_hint)
+
+
+def _has_local_textual_context(node: _Node, budget: _WorkBudget) -> bool:
+    parent = node.parent
+    if parent is None:
+        return False
+    for sibling in parent.children:
+        if sibling is node:
+            break
+        if not budget.consume():
+            return False
+        if sibling.tag in {"h1", "h2", "h3"}:
+            heading = sibling.text(budget).casefold()
+            if heading in {
+                "team",
+                "our team",
+                "leadership",
+                "staff",
+                "our people",
+                "management",
+                "executives",
+            }:
                 return True
     return False
-
-
-def _has_blocked_context(node: _Node) -> bool:
-    return any(
-        ancestor.tag in _BLOCKED_TAGS
-        or any(marker in ancestor.marker_text() for marker in _BLOCKED_MARKERS)
-        for ancestor in _ancestors(node)
-    )
 
 
 def _has_strong_structured_signal(person: _ExtractedPerson) -> bool:
@@ -442,26 +579,40 @@ def _next_sibling(node: _Node) -> _Node | None:
     return siblings[index + 1] if index + 1 < len(siblings) else None
 
 
-def _first_text(node: _Node, tags: set[str], predicate: Any) -> str | None:
-    for child in _walk(node):
-        value = child.text()
-        if child.tag in tags and predicate(value):
+def _first_text(
+    nodes: list[_Node], tags: set[str], predicate: Any, budget: _WorkBudget
+) -> str | None:
+    for child in nodes:
+        if not budget.consume():
+            return None
+        if child.tag not in tags:
+            continue
+        value = child.text(budget)
+        if predicate(value):
             return value
     return None
 
 
-def _first_marked_text(node: _Node, markers: set[str], predicate: Any) -> str | None:
-    for child in _walk(node):
-        value = child.text()
-        if any(marker in child.marker_text() for marker in markers) and predicate(value):
+def _first_marked_text(
+    nodes: list[_Node], markers: set[str], predicate: Any, budget: _WorkBudget
+) -> str | None:
+    for child in nodes:
+        if not budget.consume():
+            return None
+        if not any(marker in child.marker_text() for marker in markers):
+            continue
+        value = child.text(budget)
+        if predicate(value):
             return value
     return None
 
 
-def _short_text_values(node: _Node) -> list[str]:
+def _short_text_values(node: _Node, budget: _WorkBudget) -> list[str]:
     values = []
     for child in node.children:
-        value = child.text()
+        if not budget.consume():
+            return []
+        value = child.text(budget)
         if value and len(value) <= 100:
             values.append(value)
     return values

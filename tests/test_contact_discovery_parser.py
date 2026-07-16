@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from app.modules.contact_discovery import website_contact_parser
 from app.modules.contact_discovery.models import ContactDiscoverySourceType
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.contact_discovery.website_contact_parser import (
@@ -218,6 +219,45 @@ def test_explicit_staff_context_overrides_nearby_blocked_markup_deterministicall
     assert [(item.name, item.title) for item in candidates] == [("Ada Lovelace", "Architect")]
 
 
+def test_distant_team_context_does_not_override_closer_article() -> None:
+    assert (
+        parse(
+            '<main class="team"><article><div class="person"><h3>Article Writer</h3>'
+            '<p class="role">Editor</p></div></article></main>'
+        )
+        == []
+    )
+
+
+def test_article_heading_team_prose_does_not_override_blocked_context() -> None:
+    assert (
+        parse(
+            '<article><h2>Our team won an award</h2><div class="person">'
+            '<h3>Article Writer</h3><p class="role">Editor</p></div></article>'
+        )
+        == []
+    )
+
+
+def test_blocked_context_wins_at_equal_distance() -> None:
+    assert (
+        parse(
+            '<div class="person team author"><h3>Article Writer</h3>'
+            '<p class="role">Editor</p></div>'
+        )
+        == []
+    )
+
+
+def test_unrelated_team_prose_does_not_create_structural_context() -> None:
+    candidates = parse(
+        '<p>Our team and people enjoy this product.</p><div class="person">'
+        '<h3>Ada Lovelace</h3><p class="role">Architect</p></div>'
+    )
+    assert len(candidates) == 1
+    assert candidates[0].confidence == 35
+
+
 def test_parses_schema_org_person_json_ld_without_executing_script() -> None:
     candidates = parse(
         '<script type="application/ld+json">'
@@ -311,6 +351,77 @@ def test_dom_node_limit_stops_processing_late_candidates_safely() -> None:
     candidates = parse(html)
     assert candidates == []
     assert "Traceback" not in repr(candidates)
+
+
+def test_node_limit_exhaustion_discards_open_card_and_late_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(website_contact_parser, "MAX_DOM_NODES", 8)
+    html = (
+        '<div class="person"><h3>Ada Lovelace</h3><p class="role">Founder</p>'
+        + "<br>" * 8
+        + "late@example.com</div>"
+    )
+    assert parse(html) == []
+
+
+def test_all_collector_callbacks_ignore_content_after_exhaustion() -> None:
+    collector = website_contact_parser._StaticContactHTMLCollector()
+    collector.exhausted = True
+    collector.handle_starttag("div", [("class", "person")])
+    collector.handle_startendtag("br", [])
+    collector.handle_endtag("div")
+    collector.handle_data("late@example.com")
+    collector.handle_entityref("commat")
+    collector.handle_charref("64")
+    collector.handle_comment("late payload")
+    assert collector.node_count == 0
+    assert collector.root.children == []
+    assert collector.root.text_parts == []
+
+
+def test_total_work_budget_exhaustion_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(website_contact_parser, "MAX_TOTAL_WORK_UNITS", 5)
+    assert parse('<div class="person"><h3>Ada Lovelace</h3><p class="role">Founder</p></div>') == []
+
+
+def test_card_subtree_limit_exhaustion_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(website_contact_parser, "MAX_CARD_SUBTREE_NODES", 2)
+    assert (
+        parse(
+            '<div class="person"><span></span><h3>Ada Lovelace</h3>'
+            '<p class="role">Founder</p></div>'
+        )
+        == []
+    )
+
+
+def test_ancestor_depth_limit_exhaustion_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(website_contact_parser, "MAX_ANCESTOR_DEPTH", 3)
+    html = (
+        "<div>" * 4
+        + ('<div class="person"><h3>Ada Lovelace</h3><p class="role">Founder</p></div>')
+        + "</div>" * 4
+    )
+    assert parse(html) == []
+
+
+def test_nested_explicit_cards_are_bounded_by_deterministic_work_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(website_contact_parser, "MAX_TOTAL_WORK_UNITS", 100)
+    html = (
+        '<div class="person">' * 80
+        + ('<h3>Ada Lovelace</h3><p class="role">Founder</p>')
+        + "</div>" * 80
+    )
+    assert parse(html) == []
 
 
 def test_script_style_noscript_and_raw_payload_are_ignored() -> None:
