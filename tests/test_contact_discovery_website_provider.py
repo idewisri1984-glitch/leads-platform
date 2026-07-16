@@ -196,6 +196,68 @@ def test_fragment_trailing_slash_and_homepage_duplicates_are_not_refetched() -> 
     assert fetcher.calls == [(HOME, None), (team, "example.com")]
 
 
+def test_https_default_port_forms_deduplicate_to_one_secondary_fetch() -> None:
+    html = '<a href="/team">Team</a><a href="https://example.com:443/team">Team</a>'
+    team = f"{HOME}/team"
+    provider, fetcher = provider_for({HOME: fetched(HOME, html), team: fetched(team)})
+    result = provider.discover(company_id=1, website_url=HOME)
+    assert result.selected_urls == 1
+    assert result.attempted_pages == 2
+    assert fetcher.calls == [(HOME, None), (team, "example.com")]
+
+
+def test_http_default_port_forms_deduplicate_to_one_secondary_fetch() -> None:
+    homepage = "http://example.com"
+    team = f"{homepage}/team"
+    html = '<a href="http://example.com/team">Team</a><a href="http://example.com:80/team">Team</a>'
+    provider, fetcher = provider_for({homepage: fetched(homepage, html), team: fetched(team)})
+    result = provider.discover(company_id=1, website_url=homepage)
+    assert result.selected_urls == 1
+    assert result.attempted_pages == 2
+    assert fetcher.calls == [(homepage, None), (team, "example.com")]
+
+
+@pytest.mark.parametrize(
+    ("homepage", "links"),
+    [
+        (
+            HOME,
+            '<a href="https://example.com:443/">Team</a>'
+            '<a href="https://example.com:443">Team</a><a href="/">Team</a>',
+        ),
+        (
+            "https://example.com:443",
+            '<a href="https://example.com/">Team</a><a href="https://example.com">Team</a>',
+        ),
+    ],
+)
+def test_homepage_default_port_forms_are_never_refetched(homepage: str, links: str) -> None:
+    provider, fetcher = provider_for({homepage: fetched(homepage, links)})
+    result = provider.discover(company_id=1, website_url=homepage)
+    assert result.selected_urls == 0
+    assert result.attempted_pages == 1
+    assert fetcher.calls == [(homepage, None)]
+
+
+def test_non_default_port_link_remains_a_different_site_and_is_rejected() -> None:
+    html = '<a href="/team">Team</a><a href="https://example.com:8443/team">Team</a>'
+    team = f"{HOME}/team"
+    provider, fetcher = provider_for({HOME: fetched(HOME, html), team: fetched(team)})
+    result = provider.discover(company_id=1, website_url=HOME)
+    assert result.selected_urls == 1
+    assert fetcher.calls == [(HOME, None), (team, "example.com")]
+
+
+def test_ipv6_website_is_rejected_by_existing_url_policy_without_fetch() -> None:
+    url = "https://[2606:4700:4700::1111]/"
+    fetcher = FakeFetcher(lambda _url, _allowed: pytest.fail("fetch not expected"))
+    result = WebsiteContactDiscoveryProvider(fetcher=fetcher).discover(
+        company_id=1, website_url=url
+    )
+    assert result.errors == ("invalid_website_url",)
+    assert fetcher.calls == []
+
+
 def test_selection_priority_and_same_priority_document_order() -> None:
     html = (
         '<a href="/about">About</a><a href="/team-two">Team</a>'
@@ -280,6 +342,22 @@ def test_secondary_redirect_to_different_port_is_rejected_before_parsing() -> No
     assert [candidate.name for candidate in result.candidates] == ["Ada Lovelace"]
 
 
+def test_secondary_redirect_to_another_host_is_rejected_before_parsing() -> None:
+    team = f"{HOME}/team"
+    pages = {
+        HOME: fetched(HOME, person_card() + '<a href="/team">Team</a>'),
+        team: fetched("https://attacker.example/team", person_card("Injected Person")),
+    }
+    provider, _ = provider_for(pages)
+    result = provider.discover(company_id=1, website_url=HOME)
+    assert result.errors == ("secondary_page_fetch_failed",)
+    assert result.attempted_pages == 2
+    assert result.successful_pages == 1
+    assert [candidate.name for candidate in result.candidates] == ["Ada Lovelace"]
+    assert "attacker" not in repr(result)
+    assert "Injected Person" not in repr(result)
+
+
 def test_parser_exception_is_sanitized_and_other_pages_remain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -312,6 +390,21 @@ def test_parser_base_exception_is_not_swallowed(monkeypatch: pytest.MonkeyPatch)
     provider, _ = provider_for({HOME: fetched(HOME, person_card())})
     with pytest.raises(KeyboardInterrupt):
         provider.discover(company_id=1, website_url=HOME)
+
+
+def test_successful_pages_counts_same_site_fetch_even_when_parser_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def parser(**_kwargs: Any) -> list[ContactDiscoveryCandidateCreate]:
+        raise RuntimeError("secret parser detail")
+
+    monkeypatch.setattr(website_provider, "parse_contact_discovery_candidates_from_html", parser)
+    provider, _ = provider_for({HOME: fetched(HOME, person_card())})
+    result = provider.discover(company_id=1, website_url=HOME)
+    assert result.attempted_pages == 1
+    assert result.successful_pages == 1
+    assert result.errors == ("page_parse_failed",)
+    assert "secret" not in repr(result)
 
 
 def test_same_email_across_pages_merges_conservatively() -> None:

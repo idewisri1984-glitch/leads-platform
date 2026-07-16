@@ -368,9 +368,20 @@ def _site_identity(url: str) -> tuple[str, int]:
 
 
 def _url_identity(url: str) -> str:
-    parsed = urlsplit(url)
+    normalized = normalize_public_web_url(url)
+    if normalized is None:
+        raise ValueError("Page URL is required for identity.")
+    parsed = urlsplit(normalized)
+    scheme = parsed.scheme.casefold()
+    hostname = parsed.hostname or ""
+    port = parsed.port
+    if port == (443 if scheme == "https" else 80):
+        port = None
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        authority = f"{authority}:{port}"
     path = parsed.path.rstrip("/") or "/"
-    return urlunsplit((parsed.scheme.casefold(), parsed.netloc.casefold(), path, "", ""))
+    return urlunsplit((scheme, authority, path, "", ""))
 
 
 def _is_social_host(hostname: str) -> bool:
