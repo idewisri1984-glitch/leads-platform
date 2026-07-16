@@ -108,6 +108,32 @@ def test_homepage_is_fetched_parsed_and_normalized() -> None:
     assert result.about_page_url == "https://example.com/about-us"
 
 
+def test_unknown_response_charset_returns_sanitized_provider_error() -> None:
+    charset = "attacker-controlled-invalid-codec"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": f"text/html; charset={charset}",
+                "set-cookie": "session=credential",
+            },
+            content=b"raw-body API_KEY=secret traceback",
+            request=request,
+        )
+
+    result = provider(handler).enrich(target())
+    rendered = repr(result)
+
+    assert result.errors == ["Website request failed."]
+    assert result.email is None
+    assert charset not in rendered
+    assert "unknown encoding" not in rendered
+    assert "raw-body" not in rendered
+    assert "credential" not in rendered
+    assert "traceback" not in rendered.casefold()
+
+
 def test_contact_and_about_pages_fill_missing_fields() -> None:
     requested: list[str] = []
 
