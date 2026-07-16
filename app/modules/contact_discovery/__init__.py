@@ -18,6 +18,10 @@ from app.modules.contact_discovery.website_contact_parser import (
     MAX_HTML_LENGTH,
     parse_contact_discovery_candidates_from_html,
 )
+from app.modules.contact_discovery.website_provider import (
+    WebsiteContactDiscoveryProvider,
+    WebsiteContactDiscoveryProviderResult,
+)
 
 __all__ = [
     "CompanyContactDiscoveryState",
@@ -33,5 +37,7 @@ __all__ = [
     "ContactDiscoveryStateUpdate",
     "ContactDiscoveryStatus",
     "MAX_HTML_LENGTH",
+    "WebsiteContactDiscoveryProvider",
+    "WebsiteContactDiscoveryProviderResult",
     "parse_contact_discovery_candidates_from_html",
 ]
