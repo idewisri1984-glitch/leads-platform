@@ -14,6 +14,10 @@ from app.modules.contact_discovery.schemas import (
     ContactDiscoveryStateCreate,
     ContactDiscoveryStateUpdate,
 )
+from app.modules.contact_discovery.website_contact_parser import (
+    MAX_HTML_LENGTH,
+    parse_contact_discovery_candidates_from_html,
+)
 
 __all__ = [
     "CompanyContactDiscoveryState",
@@ -28,4 +32,6 @@ __all__ = [
     "ContactDiscoveryStateCreate",
     "ContactDiscoveryStateUpdate",
     "ContactDiscoveryStatus",
+    "MAX_HTML_LENGTH",
+    "parse_contact_discovery_candidates_from_html",
 ]
