@@ -333,6 +333,21 @@ def test_oversized_html_is_capped_and_late_content_is_not_processed() -> None:
     assert parse(html) == []
 
 
+def test_oversized_html_rejects_early_valid_candidate_without_partial_result() -> None:
+    card = '<div class="person"><h3>Ada Lovelace</h3><p class="role">Founder</p></div>'
+    html = card + (" " * MAX_HTML_LENGTH)
+    assert len(html) > MAX_HTML_LENGTH
+    assert parse(html) == []
+
+
+def test_html_at_exact_character_limit_is_accepted() -> None:
+    card = '<div class="person"><h3>Ada Lovelace</h3><p class="role">Founder</p></div>'
+    html = card + (" " * (MAX_HTML_LENGTH - len(card)))
+    assert len(html) == MAX_HTML_LENGTH
+    candidates = parse(html)
+    assert [(item.name, item.title) for item in candidates] == [("Ada Lovelace", "Founder")]
+
+
 @pytest.mark.parametrize("depth", [1_500, 5_000])
 def test_deeply_nested_html_is_controlled_without_recursion_error(depth: int) -> None:
     marker = "DEEP_RAW_MARKER"

@@ -259,9 +259,11 @@ def parse_contact_discovery_candidates_from_html(
     if company_id <= 0:
         raise ValueError("Company ID must be greater than zero.")
     normalize_source_for_deduplication(source_url)
+    if len(html) > MAX_HTML_LENGTH:
+        return []
     collector = _StaticContactHTMLCollector()
     try:
-        collector.feed(html[:MAX_HTML_LENGTH])
+        collector.feed(html)
         collector.close()
         if collector.exhausted:
             return []
