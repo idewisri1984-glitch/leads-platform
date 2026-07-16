@@ -42,6 +42,7 @@ class PublicWebFetchErrorCode(StrEnum):
     REQUEST_FAILED = "request_failed"
     RESPONSE_TOO_LARGE = "response_too_large"
     RESPONSE_NOT_HTML = "response_not_html"
+    RESPONSE_DECODE_FAILED = "response_decode_failed"
 
 
 @dataclass(frozen=True)
@@ -196,9 +197,13 @@ class BoundedPublicWebFetcher:
             if not content_type and not looks_like_html(response.body):
                 return self._error(current_url, PublicWebFetchErrorCode.RESPONSE_NOT_HTML)
             charset = response_charset(response.headers.get("content-type", ""))
+            try:
+                text = response.body.decode(charset, errors="replace")
+            except LookupError:
+                return self._error(current_url, PublicWebFetchErrorCode.RESPONSE_DECODE_FAILED)
             return PublicWebFetchResult(
                 final_url=current_url,
-                text=response.body.decode(charset, errors="replace"),
+                text=text,
                 content_type=content_type or None,
             )
 

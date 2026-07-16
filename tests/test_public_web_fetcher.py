@@ -281,6 +281,32 @@ def test_safe_response_decoding_is_deterministic(
     assert instance.fetch("https://example.com").text == expected
 
 
+def test_unknown_charset_returns_sanitized_decode_error() -> None:
+    charset = "attacker-controlled-invalid-codec"
+    instance, _ = fetcher(
+        lambda **_kwargs: response(
+            body=b"raw-body API_KEY=secret traceback",
+            headers={
+                "content-type": f"text/html; charset={charset}",
+                "set-cookie": "session=credential",
+            },
+        )
+    )
+
+    result = instance.fetch("https://example.com")
+    rendered = repr(result)
+
+    assert result.error_code == PublicWebFetchErrorCode.RESPONSE_DECODE_FAILED
+    assert result.text is None
+    assert charset not in rendered
+    assert "unknown encoding" not in rendered
+    assert "raw-body" not in rendered
+    assert "set-cookie" not in rendered
+    assert "credential" not in rendered
+    assert "traceback" not in rendered.casefold()
+    assert "LookupError" not in rendered
+
+
 def test_non_html_response_is_rejected() -> None:
     instance, _ = fetcher(
         lambda **_kwargs: response(body=b"secret", headers={"content-type": "application/pdf"})

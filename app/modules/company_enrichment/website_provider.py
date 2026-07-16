@@ -39,6 +39,7 @@ _FETCH_ERROR_MESSAGES = {
     PublicWebFetchErrorCode.REQUEST_FAILED: "Website request failed.",
     PublicWebFetchErrorCode.RESPONSE_TOO_LARGE: "Website response was too large.",
     PublicWebFetchErrorCode.RESPONSE_NOT_HTML: "Website response was not HTML.",
+    PublicWebFetchErrorCode.RESPONSE_DECODE_FAILED: "Website request failed.",
 }
 
 
