@@ -5,6 +5,7 @@ import pytest
 from app.modules.contact_discovery.models import ContactDiscoverySourceType
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.contact_discovery.website_contact_parser import (
+    MAX_DOM_NODES,
     MAX_HTML_LENGTH,
     parse_contact_discovery_candidates_from_html,
 )
@@ -95,6 +96,35 @@ def test_extracts_table_row() -> None:
     assert candidates[0].email == "ada@example.com"
 
 
+def test_unrelated_company_and_product_tables_are_skipped() -> None:
+    assert parse("<table><tr><td>Acme Corporation</td><td>Annual Revenue</td></tr></table>") == []
+    assert parse("<table><tr><td>Premium Widget</td><td>Stainless Steel</td></tr></table>") == []
+
+
+def test_unrelated_definition_list_is_skipped() -> None:
+    assert parse("<dl><dt>Annual Revenue</dt><dd>Ten Million Dollars</dd></dl>") == []
+
+
+def test_team_context_table_still_extracts_candidate() -> None:
+    candidates = parse(
+        '<section id="team"><table><tr><td>Ada Lovelace</td>'
+        "<td>Architect</td></tr></table></section>"
+    )
+    assert [(item.name, item.title) for item in candidates] == [("Ada Lovelace", "Architect")]
+
+
+def test_table_with_name_and_leadership_title_extracts_without_context() -> None:
+    candidates = parse("<table><tr><td>Ada Lovelace</td><td>Founder</td></tr></table>")
+    assert [(item.name, item.title) for item in candidates] == [("Ada Lovelace", "Founder")]
+
+
+def test_table_with_named_person_and_email_extracts_without_context() -> None:
+    candidates = parse("<table><tr><td>Ada Lovelace</td><td>ada@example.com</td></tr></table>")
+    assert len(candidates) == 1
+    assert candidates[0].name == "Ada Lovelace"
+    assert candidates[0].email == "ada@example.com"
+
+
 def test_extracts_definition_list() -> None:
     candidates = parse(
         '<dl class="staff"><dt><strong>Ada Lovelace</strong></dt>'
@@ -163,6 +193,31 @@ def test_skips_article_author_testimonial_and_customer_names() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "html",
+    [
+        '<article><div class="person"><h3>Article Writer</h3>'
+        '<p class="role">Editor</p></div></article>',
+        '<div class="author byline"><div class="person"><h3>Article Writer</h3>'
+        '<p class="role">Editor</p></div></div>',
+        '<blockquote><div class="person"><h3>Quoted Customer</h3>'
+        '<p class="role">Founder</p></div></blockquote>',
+        '<div class="testimonial review"><div class="person"><h3>Happy Customer</h3>'
+        '<p class="role">Founder</p></div></div>',
+    ],
+)
+def test_person_card_inside_blocked_ancestor_is_skipped(html: str) -> None:
+    assert parse(html) == []
+
+
+def test_explicit_staff_context_overrides_nearby_blocked_markup_deterministically() -> None:
+    candidates = parse(
+        '<article><section class="staff"><div class="person"><h3>Ada Lovelace</h3>'
+        '<p class="role">Architect</p></div></section></article>'
+    )
+    assert [(item.name, item.title) for item in candidates] == [("Ada Lovelace", "Architect")]
+
+
 def test_parses_schema_org_person_json_ld_without_executing_script() -> None:
     candidates = parse(
         '<script type="application/ld+json">'
@@ -189,6 +244,9 @@ def test_duplicate_email_candidates_are_deduplicated_and_merged() -> None:
     )
     assert len(candidates) == 1
     assert candidates[0].phone == "+12125550100"
+    assert candidates[0].name == "Ada Lovelace"
+    assert candidates[0].title == "Founder"
+    assert candidates[0].confidence == 95
 
 
 def test_duplicate_name_title_source_candidates_are_deduplicated() -> None:
@@ -233,6 +291,26 @@ def test_oversized_html_is_capped_and_late_content_is_not_processed() -> None:
         '<div class="person"><h3>Late Person</h3><p class="role">Founder</p></div>'
     )
     assert parse(html) == []
+
+
+@pytest.mark.parametrize("depth", [1_500, 5_000])
+def test_deeply_nested_html_is_controlled_without_recursion_error(depth: int) -> None:
+    marker = "DEEP_RAW_MARKER"
+    html = "<div>" * depth + marker + "</div>" * depth
+    candidates = parse(html)
+    assert candidates == []
+    assert all(type(item) is ContactDiscoveryCandidateCreate for item in candidates)
+    assert marker not in repr(candidates)
+    assert "Traceback" not in repr(candidates)
+
+
+def test_dom_node_limit_stops_processing_late_candidates_safely() -> None:
+    html = "<br>" * MAX_DOM_NODES + (
+        '<div class="person"><h3>Late Person</h3><p class="role">Founder</p></div>'
+    )
+    candidates = parse(html)
+    assert candidates == []
+    assert "Traceback" not in repr(candidates)
 
 
 def test_script_style_noscript_and_raw_payload_are_ignored() -> None:

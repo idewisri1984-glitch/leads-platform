@@ -14,11 +14,22 @@ from app.modules.contact_discovery.normalization import (
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 
 MAX_HTML_LENGTH = 250_000
+MAX_DOM_NODES = 50_000
 _ParserBase: Any = getattr(_html_parser, "HTML" + "Parser")
 
 _EMAIL = re.compile(r"(?<![\w.+-])([\w.+-]+@[\w-]+(?:\.[\w-]+)+)", re.ASCII)
 _PHONE = re.compile(r"(?<!\w)(\+?\d[\d ()\-.]{6,}\d)(?!\w)")
-_CONTEXT_WORDS = {"team", "leadership", "staff", "people", "about", "management"}
+_CONTEXT_WORDS = {
+    "team",
+    "leadership",
+    "staff",
+    "people",
+    "about",
+    "management",
+    "executives",
+    "employees",
+    "members",
+}
 _LEADERSHIP_WORDS = {
     "founder",
     "owner",
@@ -35,7 +46,20 @@ _LEADERSHIP_WORDS = {
 }
 _GENERIC_EMAIL_LOCAL_PARTS = {"admin", "contact", "hello", "info", "office", "sales", "support"}
 _BLOCK_MARKERS = {"person", "profile", "member", "staff", "leader", "employee", "bio"}
-_IGNORED_MARKERS = {"article", "author", "testimonial", "review", "customer", "client"}
+_BLOCKED_MARKERS = {
+    "article",
+    "author",
+    "byline",
+    "post",
+    "blog",
+    "news",
+    "testimonial",
+    "review",
+    "customer",
+    "client",
+    "quote",
+}
+_BLOCKED_TAGS = {"article", "blockquote"}
 _NAME_TAGS = {"h2", "h3", "h4", "h5", "strong", "b"}
 _TITLE_MARKERS = {"title", "role", "position", "job", "occupation"}
 
@@ -49,9 +73,14 @@ class _Node:
     text_parts: list[str] = field(default_factory=list)
 
     def text(self) -> str:
-        parts = [*self.text_parts]
-        for child in self.children:
-            parts.append(child.text())
+        parts: list[str] = []
+        stack = [self]
+        processed = 0
+        while stack and processed < MAX_DOM_NODES:
+            current = stack.pop()
+            processed += 1
+            parts.extend(current.text_parts)
+            stack.extend(reversed(current.children))
         return clean_discovered_text(" ".join(parts)) or ""
 
     def marker_text(self) -> str:
@@ -67,6 +96,8 @@ class _StaticContactHTMLCollector(_ParserBase):  # type: ignore[misc]
         self.json_ld_depth = 0
         self.json_ld_parts: list[str] = []
         self.json_ld_documents: list[str] = []
+        self.node_count = 0
+        self.node_limit_reached = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {name.casefold(): value or "" for name, value in attrs}
@@ -86,7 +117,11 @@ class _StaticContactHTMLCollector(_ParserBase):  # type: ignore[misc]
         if self.ignored_depth:
             self.ignored_depth += 1
             return
+        if self.node_count >= MAX_DOM_NODES:
+            self.node_limit_reached = True
+            return
         node = _Node(lowered, attributes, self.stack[-1])
+        self.node_count += 1
         self.stack[-1].children.append(node)
         if lowered not in {
             "area",
@@ -156,34 +191,35 @@ def parse_contact_discovery_candidates_from_html(
     try:
         collector.feed(html[:MAX_HTML_LENGTH])
         collector.close()
-    except (ValueError, TypeError):
+        extracted = [*_extract_html_people(collector.root), *_extract_json_ld_people(collector)]
+        candidates: dict[str, ContactDiscoveryCandidateCreate] = {}
+        for person in extracted:
+            candidate = _to_candidate(company_id, source_url, source_type, person)
+            if candidate is None:
+                continue
+            key = build_contact_candidate_deduplication_key(
+                email=candidate.email,
+                name=candidate.name,
+                title=candidate.title,
+                source_url=candidate.source_url,
+            )
+            previous = candidates.get(key)
+            if previous is None:
+                candidates[key] = candidate
+            else:
+                candidates[key] = _merge_candidates(previous, candidate)
+        return list(candidates.values())
+    except (RecursionError, ValueError, TypeError):
         return []
-
-    extracted = [*_extract_html_people(collector.root), *_extract_json_ld_people(collector)]
-    candidates: dict[str, ContactDiscoveryCandidateCreate] = {}
-    for person in extracted:
-        candidate = _to_candidate(company_id, source_url, source_type, person)
-        if candidate is None:
-            continue
-        key = build_contact_candidate_deduplication_key(
-            email=candidate.email,
-            name=candidate.name,
-            title=candidate.title,
-            source_url=candidate.source_url,
-        )
-        previous = candidates.get(key)
-        if previous is None:
-            candidates[key] = candidate
-        else:
-            candidates[key] = _merge_candidates(previous, candidate)
-    return list(candidates.values())
 
 
 def _walk(node: _Node) -> list[_Node]:
     result: list[_Node] = []
-    for child in node.children:
-        result.append(child)
-        result.extend(_walk(child))
+    stack = list(reversed(node.children))
+    while stack and len(result) < MAX_DOM_NODES:
+        current = stack.pop()
+        result.append(current)
+        stack.extend(reversed(current.children))
     return result
 
 
@@ -191,20 +227,24 @@ def _extract_html_people(root: _Node) -> list[_ExtractedPerson]:
     people: list[_ExtractedPerson] = []
     for node in _walk(root):
         marker = node.marker_text()
-        if any(word in marker for word in _IGNORED_MARKERS):
-            continue
         explicit_card = any(word in marker for word in _BLOCK_MARKERS)
         structured = node.tag in {"tr", "dl"}
         if not (explicit_card or structured):
+            continue
+        in_context = _has_people_context(node)
+        if _has_blocked_context(node) and not in_context:
             continue
         if any(
             ancestor is not node and any(word in ancestor.marker_text() for word in _BLOCK_MARKERS)
             for ancestor in _ancestors(node)
         ):
             continue
-        person = _person_from_node(node, in_context=_has_people_context(node))
-        if person is not None:
-            people.append(person)
+        person = _person_from_node(node, in_context=in_context)
+        if person is None:
+            continue
+        if structured and not explicit_card and not _has_strong_structured_signal(person):
+            continue
+        people.append(person)
 
     # A compact heading followed by a role is a common static team pattern.
     for node in _walk(root):
@@ -311,6 +351,8 @@ def _to_candidate(
         confidence += 35
     if email:
         confidence += 30
+    if name and email:
+        confidence += 5
     if phone:
         confidence += 15
     if person.in_context:
@@ -367,6 +409,29 @@ def _has_people_context(node: _Node) -> bool:
             ):
                 return True
     return False
+
+
+def _has_blocked_context(node: _Node) -> bool:
+    return any(
+        ancestor.tag in _BLOCKED_TAGS
+        or any(marker in ancestor.marker_text() for marker in _BLOCKED_MARKERS)
+        for ancestor in _ancestors(node)
+    )
+
+
+def _has_strong_structured_signal(person: _ExtractedPerson) -> bool:
+    if person.in_context:
+        return True
+    if person.name and person.email:
+        local_part = person.email.split("@", 1)[0]
+        if local_part not in _GENERIC_EMAIL_LOCAL_PARTS:
+            return True
+    return bool(person.name and person.title and _has_leadership_keyword(person.title))
+
+
+def _has_leadership_keyword(title: str) -> bool:
+    lowered = title.casefold()
+    return any(word in lowered for word in _LEADERSHIP_WORDS)
 
 
 def _next_sibling(node: _Node) -> _Node | None:
