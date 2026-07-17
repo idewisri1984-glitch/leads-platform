@@ -201,6 +201,27 @@ def test_provider_exception_is_sanitized_and_does_not_catch_base_exception(
         )
 
 
+def test_system_exit_propagates_without_repository_mutation(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    company = create_company(session)
+    repository = ContactDiscoveryRepository(session)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("SystemExit must propagate before persistence.")
+
+    monkeypatch.setattr(repository, "upsert_candidate", forbidden)
+    monkeypatch.setattr(repository, "update_state", forbidden)
+    with pytest.raises(SystemExit):
+        ContactDiscoveryService(repository, FakeProvider(error=SystemExit(2))).run(
+            company_id=company.id,
+            website_url="https://example.com",
+            dry_run=False,
+        )
+    assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 0
+    assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
+
+
 @pytest.mark.parametrize(
     "invalid",
     [
@@ -218,6 +239,49 @@ def test_invalid_counters_fail_without_candidates(
     assert result.status == ContactDiscoveryStatus.FAILED
     assert result.errors == ("provider_invalid_result",)
     assert result.candidates == ()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        WebsiteContactDiscoveryProviderResult(attempted_pages=True, successful_pages=1),
+        WebsiteContactDiscoveryProviderResult(attempted_pages=1, successful_pages=True),
+        WebsiteContactDiscoveryProviderResult(
+            attempted_pages=1,
+            successful_pages=1,
+            selected_urls=True,
+        ),
+    ],
+)
+def test_boolean_provider_counters_fail_before_candidate_upsert(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid: WebsiteContactDiscoveryProviderResult,
+) -> None:
+    company = create_company(session)
+    repository = ContactDiscoveryRepository(session)
+    upsert_calls = 0
+
+    def forbidden_upsert(*_args: object, **_kwargs: object) -> None:
+        nonlocal upsert_calls
+        upsert_calls += 1
+        raise AssertionError("Malformed counters must not upsert candidates.")
+
+    monkeypatch.setattr(repository, "upsert_candidate", forbidden_upsert)
+    result = ContactDiscoveryService(repository, FakeProvider(invalid)).run(
+        company_id=company.id,
+        website_url="https://example.com",
+        dry_run=False,
+    )
+    state = repository.get_state_by_company_id(company.id)
+    assert result.status == ContactDiscoveryStatus.FAILED
+    assert result.errors == ("provider_invalid_result",)
+    assert result.candidates == ()
+    assert result.candidate_upserts == 0
+    assert upsert_calls == 0
+    assert state is not None
+    assert state.discovery_status == ContactDiscoveryStatus.FAILED
+    assert state.last_error == "provider_invalid_result"
 
 
 def test_mismatched_candidate_invalidates_entire_result(session: Session) -> None:
@@ -456,6 +520,116 @@ def test_blank_website_does_not_call_provider_and_returns_fixed_failure(session:
     assert provider.calls == []
     assert result.status == ContactDiscoveryStatus.FAILED
     assert result.errors == ("provider_invalid_result",)
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("invalid_company_id", [True, False, 1.5, 0, -1])
+def test_invalid_company_id_is_rejected_before_provider_repository_or_session_mutation(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+    invalid_company_id: object,
+) -> None:
+    company = create_company(session)
+    repository = ContactDiscoveryRepository(session)
+    existing = repository.upsert_candidate(
+        company.id,
+        candidate(company.id, email="existing@example.com", confidence=70),
+    )
+    state = repository.update_state(
+        company.id,
+        provider="existing-provider",
+        discovery_status=ContactDiscoveryStatus.PARTIAL,
+        checked_at=datetime(2025, 4, 5, tzinfo=UTC),
+        last_error="page_parse_failed",
+    )
+    session.commit()
+    existing_row = repository.get_candidate(existing.candidate.id)
+    assert existing_row is not None
+    session.refresh(state)
+    state_snapshot = (
+        state.provider,
+        state.discovery_status,
+        state.checked_at,
+        state.last_error,
+        state.updated_at,
+    )
+    candidate_snapshot = (
+        existing_row.name,
+        existing_row.confidence,
+        existing_row.discovery_status,
+        existing_row.updated_at,
+    )
+    provider = FakeProvider(provider_result(candidate(company.id)))
+    calls = {"upsert": 0, "state": 0, "add": 0, "flush": 0, "commit": 0}
+
+    def forbidden_upsert(*_args: object, **_kwargs: object) -> None:
+        calls["upsert"] += 1
+        raise AssertionError("Invalid company ID must not reach candidate persistence.")
+
+    def forbidden_state(*_args: object, **_kwargs: object) -> None:
+        calls["state"] += 1
+        raise AssertionError("Invalid company ID must not reach state persistence.")
+
+    def forbidden_add(*_args: object, **_kwargs: object) -> None:
+        calls["add"] += 1
+        raise AssertionError("Invalid company ID must not call session.add().")
+
+    def forbidden_flush(*_args: object, **_kwargs: object) -> None:
+        calls["flush"] += 1
+        raise AssertionError("Invalid company ID must not call session.flush().")
+
+    def forbidden_commit(*_args: object, **_kwargs: object) -> None:
+        calls["commit"] += 1
+        raise AssertionError("Service must not call session.commit().")
+
+    monkeypatch.setattr(repository, "upsert_candidate", forbidden_upsert)
+    monkeypatch.setattr(repository, "update_state", forbidden_state)
+    monkeypatch.setattr(session, "add", forbidden_add)
+    monkeypatch.setattr(session, "flush", forbidden_flush)
+    monkeypatch.setattr(session, "commit", forbidden_commit)
+    with pytest.raises(ValueError, match=r"^Company ID must be a positive integer\.$"):
+        ContactDiscoveryService(repository, provider).run(
+            company_id=invalid_company_id,  # type: ignore[arg-type]
+            website_url="https://example.com",
+            dry_run=dry_run,
+        )
+    assert provider.calls == []
+    assert calls == {"upsert": 0, "state": 0, "add": 0, "flush": 0, "commit": 0}
+
+    monkeypatch.undo()
+    session.commit()
+    session.refresh(state)
+    session.refresh(existing_row)
+    assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 1
+    assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 1
+    assert (
+        state.provider,
+        state.discovery_status,
+        state.checked_at,
+        state.last_error,
+        state.updated_at,
+    ) == state_snapshot
+    assert (
+        existing_row.name,
+        existing_row.confidence,
+        existing_row.discovery_status,
+        existing_row.updated_at,
+    ) == candidate_snapshot
+
+
+def test_positive_integer_company_id_calls_provider_once(session: Session) -> None:
+    company = create_company(session)
+    assert company.id == 1
+    provider = FakeProvider(provider_result(candidate(company.id)))
+    result = service(session, provider).run(
+        company_id=1,
+        website_url="https://example.com",
+        dry_run=True,
+    )
+    assert provider.calls == [(1, "https://example.com")]
+    assert result.status == ContactDiscoveryStatus.SUCCEEDED
+    assert result.company_id == 1
 
 
 def test_dry_run_calls_provider_once_returns_candidates_and_writes_nothing(

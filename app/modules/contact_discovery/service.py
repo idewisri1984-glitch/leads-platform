@@ -78,8 +78,8 @@ class ContactDiscoveryService:
         website_url: str,
         dry_run: bool,
     ) -> ContactDiscoveryRunResult:
-        if company_id <= 0:
-            raise ValueError("Company ID must be greater than zero.")
+        if isinstance(company_id, bool) or not isinstance(company_id, int) or company_id <= 0:
+            raise ValueError("Company ID must be a positive integer.")
 
         if not website_url.strip():
             validated = self._failed_result(_PROVIDER_INVALID_RESULT)
