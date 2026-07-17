@@ -14,6 +14,11 @@ from app.modules.contact_discovery.schemas import (
     ContactDiscoveryStateCreate,
     ContactDiscoveryStateUpdate,
 )
+from app.modules.contact_discovery.service import (
+    ContactDiscoveryProvider,
+    ContactDiscoveryRunResult,
+    ContactDiscoveryService,
+)
 from app.modules.contact_discovery.website_contact_parser import (
     MAX_HTML_LENGTH,
     parse_contact_discovery_candidates_from_html,
@@ -32,6 +37,9 @@ __all__ = [
     "ContactDiscoveryCandidateUpdate",
     "ContactDiscoveryCandidateUpsertResult",
     "ContactDiscoveryRepository",
+    "ContactDiscoveryProvider",
+    "ContactDiscoveryRunResult",
+    "ContactDiscoveryService",
     "ContactDiscoverySourceType",
     "ContactDiscoveryStateCreate",
     "ContactDiscoveryStateUpdate",
