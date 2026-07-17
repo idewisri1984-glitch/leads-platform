@@ -4,6 +4,10 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from app.modules.contact_discovery.models import ContactDiscoveryStatus
+from app.modules.contact_discovery.normalization import (
+    build_contact_candidate_deduplication_key,
+    normalize_source_for_deduplication,
+)
 from app.modules.contact_discovery.repository import ContactDiscoveryRepository
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
@@ -154,6 +158,17 @@ class ContactDiscoveryService:
             except (TypeError, ValueError):
                 return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)
             if validated_candidate.company_id != company_id:
+                return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)
+            try:
+                if validated_candidate.source_url is not None:
+                    normalize_source_for_deduplication(validated_candidate.source_url)
+                build_contact_candidate_deduplication_key(
+                    email=validated_candidate.email,
+                    name=validated_candidate.name,
+                    title=validated_candidate.title,
+                    source_url=validated_candidate.source_url,
+                )
+            except ValueError:
                 return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)
             candidates.append(validated_candidate)
 

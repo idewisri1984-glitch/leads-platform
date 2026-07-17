@@ -235,6 +235,196 @@ def test_mismatched_candidate_invalidates_entire_result(session: Session) -> Non
     assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
 
 
+@pytest.mark.parametrize("invalid_first", [False, True])
+def test_invalid_identity_invalidates_complete_result_before_any_persist_upsert(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_first: bool,
+) -> None:
+    company = create_company(session)
+    repository = ContactDiscoveryRepository(session)
+    existing = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name="Existing",
+            email="existing@example.com",
+            phone="123",
+            confidence=75,
+        ),
+    )
+    session.commit()
+    existing_row = repository.get_candidate(existing.candidate.id)
+    assert existing_row is not None
+    existing_updated_at = existing_row.updated_at
+
+    valid = candidate(company.id, email="valid@example.com")
+    invalid = candidate(company.id, email=None, source_url=None)
+    candidates = (invalid, valid) if invalid_first else (valid, invalid)
+    upsert_calls = 0
+    original_upsert = repository.upsert_candidate
+
+    def record_upsert(company_id: int, value: ContactDiscoveryCandidateCreate) -> object:
+        nonlocal upsert_calls
+        upsert_calls += 1
+        return original_upsert(company_id, value)
+
+    monkeypatch.setattr(repository, "upsert_candidate", record_upsert)
+    result = ContactDiscoveryService(repository, FakeProvider(provider_result(*candidates))).run(
+        company_id=company.id,
+        website_url="https://example.com",
+        dry_run=False,
+    )
+    session.commit()
+
+    state = repository.get_state_by_company_id(company.id)
+    rows = repository.list_candidates_for_company(company.id)
+    session.refresh(existing_row)
+    assert result.status == ContactDiscoveryStatus.FAILED
+    assert result.errors == ("provider_invalid_result",)
+    assert result.candidates == ()
+    assert result.candidate_upserts == 0
+    assert result.state_persisted is True
+    assert upsert_calls == 0
+    assert state is not None
+    assert state.discovery_status == ContactDiscoveryStatus.FAILED
+    assert state.last_error == "provider_invalid_result"
+    assert [row.email for row in rows] == ["existing@example.com"]
+    assert existing_row.name == "Existing"
+    assert existing_row.phone == "123"
+    assert existing_row.confidence == 75
+    assert existing_row.updated_at == existing_updated_at
+
+
+def test_invalid_identity_dry_run_remains_mutation_free_after_outer_commit(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    company = create_company(session)
+    repository = ContactDiscoveryRepository(session)
+    existing = repository.upsert_candidate(
+        company.id, candidate(company.id, email="existing@example.com", confidence=70)
+    )
+    state = repository.update_state(
+        company.id,
+        provider="existing-provider",
+        discovery_status=ContactDiscoveryStatus.SUCCEEDED,
+        checked_at=datetime(2025, 2, 3, tzinfo=UTC),
+        last_error=None,
+    )
+    session.commit()
+    existing_row = repository.get_candidate(existing.candidate.id)
+    assert existing_row is not None
+    session.refresh(state)
+    state_snapshot = (
+        state.provider,
+        state.discovery_status,
+        state.checked_at,
+        state.last_error,
+        state.updated_at,
+    )
+    candidate_snapshot = (
+        existing_row.name,
+        existing_row.confidence,
+        existing_row.updated_at,
+    )
+
+    def forbidden_upsert(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Invalid dry-run result must not upsert candidates.")
+
+    def forbidden_state(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Dry-run must not update state.")
+
+    monkeypatch.setattr(repository, "upsert_candidate", forbidden_upsert)
+    monkeypatch.setattr(repository, "update_state", forbidden_state)
+    result = ContactDiscoveryService(
+        repository,
+        FakeProvider(
+            provider_result(
+                candidate(company.id, email="valid@example.com"),
+                candidate(company.id, email=None, source_url=None),
+            )
+        ),
+    ).run(company_id=company.id, website_url="https://example.com", dry_run=True)
+    session.commit()
+    session.refresh(state)
+    session.refresh(existing_row)
+
+    assert result.status == ContactDiscoveryStatus.FAILED
+    assert result.errors == ("provider_invalid_result",)
+    assert result.candidates == ()
+    assert result.candidate_upserts == 0
+    assert result.state_persisted is False
+    assert (
+        state.provider,
+        state.discovery_status,
+        state.checked_at,
+        state.last_error,
+        state.updated_at,
+    ) == state_snapshot
+    assert (
+        existing_row.name,
+        existing_row.confidence,
+        existing_row.updated_at,
+    ) == candidate_snapshot
+
+
+@pytest.mark.parametrize(
+    "invalid_candidate",
+    [
+        ContactDiscoveryCandidateCreate(
+            company_id=1,
+            name="Name Only",
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+        ),
+        ContactDiscoveryCandidateCreate(
+            company_id=1,
+            name="Unsafe Source",
+            title="Director",
+            source_url="javascript:alert(1)",
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+        ),
+    ],
+)
+def test_repository_incompatible_candidate_identity_is_sanitized(
+    session: Session, invalid_candidate: ContactDiscoveryCandidateCreate
+) -> None:
+    company = create_company(session)
+    value = invalid_candidate.model_copy(update={"company_id": company.id})
+    result = run(session, company, provider_result(value))
+    assert result.status == ContactDiscoveryStatus.FAILED
+    assert result.errors == ("provider_invalid_result",)
+    assert result.candidates == ()
+    assert "insufficient" not in repr(result).casefold()
+    assert "javascript" not in repr(result).casefold()
+
+
+@pytest.mark.parametrize(
+    "valid_candidate",
+    [
+        ContactDiscoveryCandidateCreate(
+            company_id=1,
+            email="valid@example.com",
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+        ),
+        ContactDiscoveryCandidateCreate(
+            company_id=1,
+            name="Fallback Person",
+            title="Director",
+            source_url="https://example.com/team?ref=nav#people",
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+        ),
+    ],
+)
+def test_repository_compatible_email_and_fallback_identities_are_accepted(
+    session: Session, valid_candidate: ContactDiscoveryCandidateCreate
+) -> None:
+    company = create_company(session)
+    value = valid_candidate.model_copy(update={"company_id": company.id})
+    result = run(session, company, provider_result(value))
+    assert result.status == ContactDiscoveryStatus.SUCCEEDED
+    assert result.candidates == (value,)
+
+
 def test_unknown_errors_are_sanitized_deduplicated_in_first_seen_order(session: Session) -> None:
     company = create_company(session)
     raw = "https://secret.example body header cookie charset traceback"
@@ -516,6 +706,61 @@ def test_database_failure_propagates_and_caller_rollback_removes_partial_work(
     session.rollback()
     assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
     assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 0
+
+
+def test_second_upsert_failure_propagates_and_rollback_removes_first_flush(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    company = create_company(session)
+    repository = ContactDiscoveryRepository(session)
+    state = repository.update_state(
+        company.id,
+        provider="existing-provider",
+        discovery_status=ContactDiscoveryStatus.NOT_FOUND,
+        checked_at=datetime(2025, 3, 4, tzinfo=UTC),
+        last_error=None,
+    )
+    session.commit()
+    session.refresh(state)
+    state_snapshot = (
+        state.provider,
+        state.discovery_status,
+        state.checked_at,
+        state.last_error,
+    )
+    original_upsert = repository.upsert_candidate
+    calls = 0
+
+    def fail_second_upsert(company_id: int, value: ContactDiscoveryCandidateCreate) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("controlled database failure")
+        return original_upsert(company_id, value)
+
+    monkeypatch.setattr(repository, "upsert_candidate", fail_second_upsert)
+    provider = FakeProvider(
+        provider_result(
+            candidate(company.id, email="first@example.com"),
+            candidate(company.id, email="second@example.com"),
+        )
+    )
+    with pytest.raises(RuntimeError, match="controlled database failure"):
+        ContactDiscoveryService(repository, provider).run(
+            company_id=company.id,
+            website_url="https://example.com",
+            dry_run=False,
+        )
+    assert calls == 2
+    session.rollback()
+    session.refresh(state)
+    assert repository.list_candidates_for_company(company.id) == []
+    assert (
+        state.provider,
+        state.discovery_status,
+        state.checked_at,
+        state.last_error,
+    ) == state_snapshot
 
 
 def test_successful_caller_commit_persists_state_and_candidate_atomically(session: Session) -> None:
