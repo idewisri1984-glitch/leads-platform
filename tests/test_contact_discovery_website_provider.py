@@ -13,7 +13,12 @@ from app.modules.contact_discovery.website_provider import (
     WebsiteContactDiscoveryProvider,
     WebsiteContactDiscoveryProviderResult,
 )
-from app.providers.public_web_fetcher import PublicWebFetchErrorCode, PublicWebFetchResult
+from app.providers.public_web_fetcher import (
+    BoundedPublicWebFetcher,
+    FetchResponse,
+    PublicWebFetchErrorCode,
+    PublicWebFetchResult,
+)
 
 HOME = "https://example.com"
 
@@ -73,6 +78,42 @@ def test_provider_returns_typed_result_and_parses_homepage_first() -> None:
     assert result.candidates[0].company_id == 7
     assert result.candidates[0].source_url == HOME
     assert result.candidates[0].source_type == ContactDiscoverySourceType.OTHER_PUBLIC_PAGE
+
+
+def test_stored_homepage_preserves_trailing_slash_and_strips_whitespace() -> None:
+    homepage = f"{HOME}/foundation/"
+    provider, fetcher = provider_for({homepage: fetched(homepage)})
+    result = provider.discover(company_id=1, website_url=f"  {homepage}  ")
+    assert result.successful_pages == 1
+    assert fetcher.calls == [(homepage, None)]
+
+
+def test_real_fetcher_follows_trailing_slash_homepage_redirect() -> None:
+    initial = f"{HOME}/foundation"
+    final = f"{initial}/"
+    calls: list[str] = []
+
+    class Transport:
+        def fetch(self, **kwargs: Any) -> FetchResponse:
+            calls.append(kwargs["url"])
+            if kwargs["url"] == initial:
+                return FetchResponse(302, {"location": "/foundation/"}, b"")
+            return FetchResponse(
+                200,
+                {"content-type": "text/html"},
+                person_card("Django Fellow", "Director").encode(),
+            )
+
+    fetcher = BoundedPublicWebFetcher(
+        transport=Transport(), resolver=lambda _hostname: ["93.184.216.34"]
+    )
+    result = WebsiteContactDiscoveryProvider(fetcher=fetcher).discover(
+        company_id=1, website_url=initial
+    )
+    assert calls == [initial, final]
+    assert result.attempted_pages == result.successful_pages == 1
+    assert result.candidates[0].name == "Django Fellow"
+    assert result.candidates[0].source_url == final
 
 
 def test_redirected_homepage_defines_source_and_site_identity() -> None:

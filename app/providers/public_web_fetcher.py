@@ -141,7 +141,12 @@ class BoundedPublicWebFetcher:
         self._max_redirects = max_redirects
 
     def fetch(self, url: str, *, allowed_hostname: str | None = None) -> PublicWebFetchResult:
-        current_url = url
+        try:
+            current_url = normalize_public_web_request_url(url)
+        except ValueError:
+            current_url = None
+        if current_url is None:
+            return self._error(safe_error_url(url), PublicWebFetchErrorCode.HOST_NOT_PUBLIC)
         redirects = 0
         visited: set[str] = set()
         while True:
@@ -182,7 +187,7 @@ class BoundedPublicWebFetcher:
                 if redirects >= self._max_redirects:
                     return self._error(current_url, PublicWebFetchErrorCode.REDIRECT_LIMIT)
                 try:
-                    redirect_url = normalize_public_web_url(urljoin(current_url, location))
+                    redirect_url = normalize_public_web_request_url(urljoin(current_url, location))
                 except ValueError:
                     redirect_url = None
                 if redirect_url is None or (
@@ -215,7 +220,7 @@ class BoundedPublicWebFetcher:
 
     def _verified_addresses(self, url: str) -> tuple[str, tuple[str, ...]] | None:
         try:
-            normalized = normalize_public_web_url(url)
+            normalized = normalize_public_web_request_url(url)
         except ValueError:
             return None
         if normalized is None:
@@ -258,6 +263,15 @@ def _address_sort_key(
 
 
 def normalize_public_web_url(value: str | None) -> str | None:
+    normalized = normalize_public_web_request_url(value)
+    if normalized is None:
+        return None
+    parsed = urlsplit(normalized)
+    path = parsed.path.rstrip("/")
+    return urlunsplit(SplitResult(parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def normalize_public_web_request_url(value: str | None) -> str | None:
     if value is None or not value.strip():
         return None
     parsed = urlsplit(value.strip())
@@ -286,8 +300,7 @@ def normalize_public_web_url(value: str | None) -> str | None:
     host = f"[{hostname}]" if ":" in hostname else hostname
     if port is not None:
         host = f"{host}:{port}"
-    path = parsed.path.rstrip("/")
-    return urlunsplit(SplitResult(parsed.scheme.casefold(), host, path, parsed.query, ""))
+    return urlunsplit(SplitResult(parsed.scheme.casefold(), host, parsed.path, parsed.query, ""))
 
 
 def safe_error_url(value: str) -> str:

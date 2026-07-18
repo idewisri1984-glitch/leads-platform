@@ -16,6 +16,7 @@ from app.modules.contact_discovery.website_contact_parser import (
 from app.providers.public_web_fetcher import (
     BoundedPublicWebFetcher,
     PublicWebFetchResult,
+    normalize_public_web_request_url,
     normalize_public_web_url,
 )
 
@@ -204,7 +205,7 @@ class WebsiteContactDiscoveryProvider:
         if company_id <= 0:
             raise ValueError("Company ID must be greater than zero.")
         try:
-            normalized_homepage = normalize_public_web_url(website_url)
+            normalized_homepage = normalize_public_web_request_url(website_url)
         except ValueError:
             normalized_homepage = None
         if normalized_homepage is None:
@@ -311,7 +312,7 @@ def _discover_page_links(html: str, homepage_url: str) -> tuple[list[_PageLink],
         if not href or href.startswith("#"):
             continue
         try:
-            normalized = normalize_public_web_url(urljoin(homepage_url, href))
+            normalized = normalize_public_web_request_url(urljoin(homepage_url, href))
         except ValueError:
             continue
         if normalized is None:

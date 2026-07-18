@@ -11,6 +11,8 @@ from app.providers.public_web_fetcher import (
     FetchResponse,
     PublicWebFetchErrorCode,
     ResponseTooLargeError,
+    normalize_public_web_request_url,
+    normalize_public_web_url,
 )
 
 PUBLIC_IP = "93.184.216.34"
@@ -58,6 +60,36 @@ def test_accepts_public_http_and_https(url: str) -> None:
     assert result.final_url == url
     assert result.text == "<html></html>"
     assert transport.calls[0]["verified_ip"] == PUBLIC_IP
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("https://EXAMPLE.com/directory", "https://example.com/directory"),
+        ("https://EXAMPLE.com/directory/", "https://example.com/directory/"),
+        (
+            " https://EXAMPLE.com/directory/?a=1#fragment ",
+            "https://example.com/directory/?a=1",
+        ),
+    ],
+)
+def test_request_normalization_preserves_path_semantics(value: str, expected: str) -> None:
+    assert normalize_public_web_request_url(value) == expected
+
+
+def test_request_and_identity_normalization_have_explicit_slash_semantics() -> None:
+    assert normalize_public_web_request_url("https://example.com/about/") == (
+        "https://example.com/about/"
+    )
+    assert normalize_public_web_url("https://example.com/about/") == (
+        normalize_public_web_url("https://example.com/about")
+    )
+    assert normalize_public_web_url("https://example.com/about/") == ("https://example.com/about")
+
+
+def test_request_normalization_rejects_credentials() -> None:
+    with pytest.raises(ValueError):
+        normalize_public_web_request_url("https://user:secret@example.com/directory/")
 
 
 @pytest.mark.parametrize(
@@ -170,6 +202,52 @@ def test_pinned_transport_preserves_host_header(monkeypatch: pytest.MonkeyPatch)
     assert recorded["path"] == "/path?q=1"
 
 
+@pytest.mark.parametrize(
+    ("url", "expected_path"),
+    [
+        ("http://example.com/directory", "/directory"),
+        ("http://example.com/directory/", "/directory/"),
+        ("http://example.com/directory/?a=1", "/directory/?a=1"),
+    ],
+)
+def test_pinned_transport_preserves_request_path(
+    monkeypatch: pytest.MonkeyPatch, url: str, expected_path: str
+) -> None:
+    recorded: dict[str, Any] = {}
+
+    class FakeResponse:
+        status = 200
+
+        def read(self, _amount: int) -> bytes:
+            return b"<html></html>"
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return [("Content-Type", "text/html")]
+
+    class FakeConnection:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def request(self, method: str, path: str, headers: dict[str, str]) -> None:
+            recorded.update(method=method, path=path, headers=headers)
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(public_web_fetcher, "_PinnedHTTPConnection", FakeConnection)
+    public_web_fetcher.PinnedPublicWebTransport().fetch(
+        url=url,
+        hostname="example.com",
+        verified_ip=PUBLIC_IP,
+        timeout=5.0,
+        max_response_bytes=250_000,
+    )
+    assert recorded["path"] == expected_path
+
+
 def test_https_connection_uses_pinned_ip_and_original_sni(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -210,6 +288,59 @@ def test_safe_redirect_is_re_resolved_and_re_pinned() -> None:
     assert result.final_url == "https://www.example.com/home"
     assert resolutions == ["example.com", "www.example.com"]
     assert [call["verified_ip"] for call in transport.calls] == [PUBLIC_IP, "8.8.8.8"]
+
+
+@pytest.mark.parametrize(
+    ("start", "location", "target"),
+    [
+        (
+            "https://example.com/directory",
+            "/directory/",
+            "https://example.com/directory/",
+        ),
+        (
+            "https://example.com/directory/",
+            "/directory",
+            "https://example.com/directory",
+        ),
+    ],
+)
+def test_redirect_preserves_trailing_slash_distinction(
+    start: str, location: str, target: str
+) -> None:
+    def handler(**kwargs: Any) -> FetchResponse:
+        if kwargs["url"] == start:
+            return response(302, headers={"location": location})
+        return response(body=b"<html>safe</html>")
+
+    instance, transport = fetcher(handler)
+    result = instance.fetch(start)
+    assert result.final_url == target
+    assert [call["url"] for call in transport.calls] == [start, target]
+
+
+def test_fragment_cannot_evade_exact_redirect_loop_detection() -> None:
+    instance, transport = fetcher(
+        lambda **_kwargs: response(302, headers={"location": "/same#new-fragment"})
+    )
+    result = instance.fetch("https://EXAMPLE.com/same#initial-fragment")
+    assert result.error_code == PublicWebFetchErrorCode.REDIRECT_LIMIT
+    assert len(transport.calls) == 1
+
+
+def test_two_request_redirect_cycle_remains_bounded() -> None:
+    def handler(**kwargs: Any) -> FetchResponse:
+        location = "/two" if kwargs["url"].endswith("/one") else "/one"
+        return response(302, headers={"location": location})
+
+    instance, transport = fetcher(handler)
+    assert instance.fetch("https://example.com/one").error_code == (
+        PublicWebFetchErrorCode.REDIRECT_LIMIT
+    )
+    assert [call["url"] for call in transport.calls] == [
+        "https://example.com/one",
+        "https://example.com/two",
+    ]
 
 
 @pytest.mark.parametrize(
