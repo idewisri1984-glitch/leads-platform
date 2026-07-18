@@ -63,7 +63,10 @@ class CompanyDiscoveryRun(Base):
     )
     provider: Mapped[str] = mapped_column(String(100), nullable=False)
     run_status: Mapped[CompanyDiscoveryRunStatus] = mapped_column(
-        String(50), default=CompanyDiscoveryRunStatus.PENDING, nullable=False
+        String(50),
+        default=CompanyDiscoveryRunStatus.PENDING,
+        server_default=CompanyDiscoveryRunStatus.PENDING,
+        nullable=False,
     )
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     request_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -129,7 +132,10 @@ class CompanyDiscoveryCandidate(Base):
     identity_key: Mapped[str] = mapped_column(String(700), nullable=False)
     best_position: Mapped[int | None] = mapped_column(Integer)
     candidate_status: Mapped[CompanyDiscoveryCandidateStatus] = mapped_column(
-        String(50), default=CompanyDiscoveryCandidateStatus.DISCOVERED, nullable=False
+        String(50),
+        default=CompanyDiscoveryCandidateStatus.DISCOVERED,
+        server_default=CompanyDiscoveryCandidateStatus.DISCOVERED,
+        nullable=False,
     )
     promoted_company_id: Mapped[int | None] = mapped_column(
         ForeignKey("companies.id", ondelete="SET NULL"), index=True
