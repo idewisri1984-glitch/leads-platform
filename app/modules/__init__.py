@@ -2,6 +2,10 @@ from app.modules.company.models import Company
 from app.modules.company.repository import CompanyRepository
 from app.modules.company.schemas import CompanyCreate, CompanyRead
 from app.modules.company.service import CompanyService
+from app.modules.company_discovery.models import (
+    CompanyDiscoveryCandidate,
+    CompanyDiscoveryRun,
+)
 from app.modules.company_discovery.profile_execution import (
     SearchProfileDiscoveryExecutionError,
     SearchProfileDiscoveryService,
@@ -76,6 +80,8 @@ __all__ = [
     "CompanyRepository",
     "CompanyService",
     "CompanyEnrichment",
+    "CompanyDiscoveryCandidate",
+    "CompanyDiscoveryRun",
     "DiscoveryProvider",
     "DiscoveryProviderConfigurationError",
     "DiscoveryProviderError",
