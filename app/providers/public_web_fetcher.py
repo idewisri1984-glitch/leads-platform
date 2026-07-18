@@ -14,6 +14,7 @@ HostnameResolver = Callable[[str], Sequence[str]]
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _HTML_CONTENT_TYPES = {"text/html", "application/xhtml+xml"}
 _HOSTNAME_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_MAX_ADDRESS_ATTEMPTS = 4
 
 
 @dataclass(frozen=True)
@@ -147,7 +148,7 @@ class BoundedPublicWebFetcher:
             if current_url in visited:
                 return self._error(current_url, PublicWebFetchErrorCode.REDIRECT_LIMIT)
             visited.add(current_url)
-            verified = self._verified_address(current_url)
+            verified = self._verified_addresses(current_url)
             if verified is None:
                 code = (
                     PublicWebFetchErrorCode.REDIRECT_UNSAFE
@@ -155,18 +156,23 @@ class BoundedPublicWebFetcher:
                     else PublicWebFetchErrorCode.HOST_NOT_PUBLIC
                 )
                 return self._error(safe_error_url(current_url), code)
-            hostname, verified_ip = verified
-            try:
-                response = self._transport.fetch(
-                    url=current_url,
-                    hostname=hostname,
-                    verified_ip=verified_ip,
-                    timeout=self._timeout_seconds,
-                    max_response_bytes=self._max_response_bytes,
-                )
-            except ResponseTooLargeError:
-                return self._error(current_url, PublicWebFetchErrorCode.RESPONSE_TOO_LARGE)
-            except (OSError, ssl.SSLError, http.client.HTTPException):
+            hostname, verified_addresses = verified
+            response = None
+            for verified_ip in verified_addresses:
+                try:
+                    response = self._transport.fetch(
+                        url=current_url,
+                        hostname=hostname,
+                        verified_ip=verified_ip,
+                        timeout=self._timeout_seconds,
+                        max_response_bytes=self._max_response_bytes,
+                    )
+                except ResponseTooLargeError:
+                    return self._error(current_url, PublicWebFetchErrorCode.RESPONSE_TOO_LARGE)
+                except (OSError, ssl.SSLError, http.client.HTTPException):
+                    continue
+                break
+            if response is None:
                 return self._error(current_url, PublicWebFetchErrorCode.REQUEST_FAILED)
 
             if response.status_code in _REDIRECT_STATUSES:
@@ -207,7 +213,7 @@ class BoundedPublicWebFetcher:
                 content_type=content_type or None,
             )
 
-    def _verified_address(self, url: str) -> tuple[str, str] | None:
+    def _verified_addresses(self, url: str) -> tuple[str, tuple[str, ...]] | None:
         try:
             normalized = normalize_public_web_url(url)
         except ValueError:
@@ -222,14 +228,15 @@ class BoundedPublicWebFetcher:
         except ValueError:
             direct_address = None
         if direct_address is not None:
-            return (hostname, str(direct_address)) if is_public_address(direct_address) else None
+            return (hostname, (str(direct_address),)) if is_public_address(direct_address) else None
         try:
             addresses = tuple(ipaddress.ip_address(value) for value in self._resolver(hostname))
         except (OSError, ValueError):
             return None
         if not addresses or not all(is_public_address(address) for address in addresses):
             return None
-        return hostname, str(addresses[0])
+        ordered = tuple(sorted(set(addresses), key=_address_sort_key))
+        return hostname, tuple(str(address) for address in ordered[:_MAX_ADDRESS_ATTEMPTS])
 
     @staticmethod
     def _error(url: str, code: PublicWebFetchErrorCode) -> PublicWebFetchResult:
@@ -237,9 +244,17 @@ class BoundedPublicWebFetcher:
 
 
 def resolve_hostname(hostname: str) -> Sequence[str]:
-    return tuple(
-        {str(item[4][0]) for item in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)}
-    )
+    addresses = {
+        ipaddress.ip_address(item[4][0])
+        for item in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    }
+    return tuple(str(address) for address in sorted(addresses, key=_address_sort_key))
+
+
+def _address_sort_key(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> tuple[int, int]:
+    return address.version, int(address)
 
 
 def normalize_public_web_url(value: str | None) -> str | None:
