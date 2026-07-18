@@ -98,39 +98,88 @@ def execute_contact_discovery(
     make_provider = provider_factory or WebsiteContactDiscoveryProvider
     make_service = service_factory or ContactDiscoveryService
 
-    with make_session() as session:
-        try:
-            company = CompanyRepository(session).get(company_id)
-            if company is None:
-                session.rollback()
-                return ContactDiscoveryCommandOutcome(exit_code=1, error_code=_COMPANY_NOT_FOUND)
-            website = company.website
-            if website is None or not website.strip():
-                session.rollback()
-                return ContactDiscoveryCommandOutcome(
-                    exit_code=1,
-                    error_code=_COMPANY_WEBSITE_MISSING,
-                )
+    try:
+        session = make_session()
+    except Exception:
+        return _execution_failed_outcome()
 
-            provider = make_provider()
-            service = make_service(ContactDiscoveryRepository(session), provider)
-            result = service.run(
-                company_id=company.id,
-                website_url=website,
-                dry_run=not persist,
-            )
-            if persist:
-                session.commit()
-            else:
-                session.rollback()
-        except Exception:
-            session.rollback()
-            return ContactDiscoveryCommandOutcome(exit_code=1, error_code=_EXECUTION_FAILED)
+    close_succeeded = True
+    try:
+        outcome = _execute_with_session(
+            session=session,
+            company_id=company_id,
+            persist=persist,
+            make_provider=make_provider,
+            make_service=make_service,
+        )
+    finally:
+        close_succeeded = _safe_close(session)
+    if not close_succeeded:
+        return _execution_failed_outcome()
+    return outcome
+
+
+def _execute_with_session(
+    *,
+    session: Session,
+    company_id: int,
+    persist: bool,
+    make_provider: ProviderFactory,
+    make_service: ServiceFactory,
+) -> ContactDiscoveryCommandOutcome:
+    try:
+        company = CompanyRepository(session).get(company_id)
+        if company is None:
+            return _outcome_after_rollback(session, _COMPANY_NOT_FOUND)
+        website = company.website
+        if website is None or not website.strip():
+            return _outcome_after_rollback(session, _COMPANY_WEBSITE_MISSING)
+
+        provider = make_provider()
+        service = make_service(ContactDiscoveryRepository(session), provider)
+        result = service.run(
+            company_id=company.id,
+            website_url=website,
+            dry_run=not persist,
+        )
+        if persist:
+            session.commit()
+        elif not _safe_rollback(session):
+            return _execution_failed_outcome()
+    except Exception:
+        _safe_rollback(session)
+        return _execution_failed_outcome()
 
     return ContactDiscoveryCommandOutcome(
         exit_code=1 if result.status == ContactDiscoveryStatus.FAILED else 0,
         result=result,
     )
+
+
+def _outcome_after_rollback(session: Session, local_error: str) -> ContactDiscoveryCommandOutcome:
+    if not _safe_rollback(session):
+        return _execution_failed_outcome()
+    return ContactDiscoveryCommandOutcome(exit_code=1, error_code=local_error)
+
+
+def _safe_rollback(session: Session) -> bool:
+    try:
+        session.rollback()
+    except Exception:
+        return False
+    return True
+
+
+def _safe_close(session: Session) -> bool:
+    try:
+        session.close()
+    except Exception:
+        return False
+    return True
+
+
+def _execution_failed_outcome() -> ContactDiscoveryCommandOutcome:
+    return ContactDiscoveryCommandOutcome(exit_code=1, error_code=_EXECUTION_FAILED)
 
 
 def _print_result(result: ContactDiscoveryRunResult) -> None:

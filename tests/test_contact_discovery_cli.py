@@ -1,19 +1,24 @@
 from collections.abc import Callable, Generator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+import typer
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session, sessionmaker
 from typer.testing import CliRunner
 
 import app.cli.contact_discovery as cli
 from app.cli.main import app as main_app
+from app.core.database.base import Base
 from app.core.database.session import SessionLocal
 from app.modules.company.models import Company
+from app.modules.contact.models import Contact
 from app.modules.contact_discovery.models import (
     CompanyContactDiscoveryState,
     ContactDiscoveryCandidate,
+    ContactDiscoveryCandidateStatus,
     ContactDiscoverySourceType,
     ContactDiscoveryStatus,
 )
@@ -24,6 +29,7 @@ from app.modules.contact_discovery.service import (
     ContactDiscoveryRunResult,
     ContactDiscoveryService,
 )
+from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
 from app.modules.project.models import Project
 
 runner = CliRunner()
@@ -88,6 +94,71 @@ def result(
 
 class RecordingProvider:
     provider_name = "fake"
+
+    def discover(
+        self,
+        *,
+        company_id: int,
+        website_url: str,
+    ) -> WebsiteContactDiscoveryProviderResult:
+        return WebsiteContactDiscoveryProviderResult(
+            attempted_pages=1,
+            successful_pages=1,
+        )
+
+
+def recording_provider_factory() -> ContactDiscoveryProvider:
+    return RecordingProvider()
+
+
+class StaticProvider:
+    provider_name = "fake"
+
+    def __init__(self, provider_result: WebsiteContactDiscoveryProviderResult) -> None:
+        self.provider_result = provider_result
+
+    def discover(
+        self,
+        *,
+        company_id: int,
+        website_url: str,
+    ) -> WebsiteContactDiscoveryProviderResult:
+        return self.provider_result
+
+
+_TEST_UNSET = object()
+
+
+class FailingAfterStateRepository(ContactDiscoveryRepository):
+    def update_state(
+        self,
+        company_id: int,
+        *,
+        provider: object = _TEST_UNSET,
+        discovery_status: object = _TEST_UNSET,
+        checked_at: object = _TEST_UNSET,
+        last_error: object = _TEST_UNSET,
+    ) -> CompanyContactDiscoveryState:
+        super().update_state(
+            company_id,
+            provider=provider,
+            discovery_status=discovery_status,
+            checked_at=checked_at,
+            last_error=last_error,
+        )
+        raise RuntimeError("ATOMIC_ROLLBACK_SECRET_SQL")
+
+
+def isolated_session_factory(tmp_path: Path) -> sessionmaker[Session]:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'contact-discovery.db').as_posix()}")
+    Base.metadata.create_all(bind=engine)
+    return sessionmaker(
+        bind=engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+        class_=Session,
+    )
 
 
 class FakeService:
@@ -223,7 +294,7 @@ def test_default_and_yes_only_are_dry_run(extra: list[str]) -> None:
         company_id=company_id,
         persist=False,
         yes="--yes" in extra,
-        provider_factory=RecordingProvider,
+        provider_factory=recording_provider_factory,
         service_factory=factory_for(fake),
     )
     assert outcome.exit_code == 0
@@ -259,7 +330,7 @@ def test_dry_run_rolls_back_defensively_and_never_commits(
         persist=False,
         yes=False,
         session_factory=lambda: database_session,
-        provider_factory=RecordingProvider,
+        provider_factory=recording_provider_factory,
         service_factory=factory_for(fake),
     )
     assert outcome.exit_code == 0
@@ -284,7 +355,7 @@ def test_dry_run_exit_codes(status: ContactDiscoveryStatus, exit_code: int) -> N
         company_id=company_id,
         persist=False,
         yes=False,
-        provider_factory=RecordingProvider,
+        provider_factory=recording_provider_factory,
         service_factory=factory_for(fake),
     )
     assert outcome.exit_code == exit_code
@@ -329,7 +400,7 @@ def test_confirmed_persist_commits_exactly_once_after_service(
         persist=True,
         yes=True,
         session_factory=lambda: database_session,
-        provider_factory=RecordingProvider,
+        provider_factory=recording_provider_factory,
         service_factory=factory_for(fake),
     )
     assert outcome.exit_code == exit_code
@@ -368,7 +439,7 @@ def test_service_exception_rolls_back_real_flushed_state_and_is_sanitized() -> N
         company_id=company_id,
         persist=True,
         yes=True,
-        provider_factory=RecordingProvider,
+        provider_factory=recording_provider_factory,
         service_factory=make_service,
     )
     assert captured_repository is not None
@@ -407,12 +478,351 @@ def test_commit_exception_rolls_back_and_does_not_retry_commit(
         persist=True,
         yes=True,
         session_factory=lambda: database_session,
-        provider_factory=RecordingProvider,
+        provider_factory=recording_provider_factory,
         service_factory=factory_for(fake),
     )
     assert outcome.error_code == "contact_discovery_execution_failed"
     assert commits == rollbacks == 1
     assert counts() == (0, 0)
+
+
+def test_service_and_rollback_exceptions_emit_only_fixed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, company_id = create_company(website="https://stored.example")
+    database_session = SessionLocal()
+    commits = 0
+    rollbacks = 0
+
+    def track_commit() -> None:
+        nonlocal commits
+        commits += 1
+
+    def fail_rollback() -> None:
+        nonlocal rollbacks
+        rollbacks += 1
+        raise RuntimeError("ROLLBACK_SECRET_DB_PATH")
+
+    fake = FakeService(
+        result(company_id),
+        error=RuntimeError("SERVICE_SECRET_SQL https://secret.example traceback"),
+    )
+    monkeypatch.setattr(cli, "SessionLocal", lambda: database_session)
+    monkeypatch.setattr(cli, "WebsiteContactDiscoveryProvider", recording_provider_factory)
+    monkeypatch.setattr(cli, "ContactDiscoveryService", factory_for(fake))
+    monkeypatch.setattr(database_session, "commit", track_commit)
+    monkeypatch.setattr(database_session, "rollback", fail_rollback)
+
+    response = runner.invoke(cli.app, ["run", "--company-id", str(company_id)])
+
+    assert response.exit_code == 1
+    assert response.output.strip() == "contact_discovery_execution_failed"
+    assert commits == 0
+    assert rollbacks == 1
+
+
+def test_commit_and_rollback_exceptions_emit_only_fixed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, company_id = create_company(website="https://stored.example")
+    database_session = SessionLocal()
+    commits = 0
+    rollbacks = 0
+
+    def fail_commit() -> None:
+        nonlocal commits
+        commits += 1
+        raise RuntimeError("COMMIT_SECRET_SQL")
+
+    def fail_rollback() -> None:
+        nonlocal rollbacks
+        rollbacks += 1
+        raise RuntimeError("ROLLBACK_SECRET_DB_PATH")
+
+    fake = FakeService(result(company_id, dry_run=False, state_persisted=True))
+    monkeypatch.setattr(cli, "SessionLocal", lambda: database_session)
+    monkeypatch.setattr(cli, "WebsiteContactDiscoveryProvider", recording_provider_factory)
+    monkeypatch.setattr(cli, "ContactDiscoveryService", factory_for(fake))
+    monkeypatch.setattr(database_session, "commit", fail_commit)
+    monkeypatch.setattr(database_session, "rollback", fail_rollback)
+
+    response = runner.invoke(
+        cli.app,
+        ["run", "--company-id", str(company_id), "--persist", "--yes"],
+    )
+
+    assert response.exit_code == 1
+    assert response.output.strip() == "contact_discovery_execution_failed"
+    assert commits == 1
+    assert rollbacks == 1
+
+
+def test_normal_dry_run_rollback_exception_suppresses_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, company_id = create_company(website="https://stored.example")
+    database_session = SessionLocal()
+    commits = 0
+    rollbacks = 0
+
+    def track_commit() -> None:
+        nonlocal commits
+        commits += 1
+
+    def fail_rollback() -> None:
+        nonlocal rollbacks
+        rollbacks += 1
+        raise RuntimeError("ROLLBACK_SECRET_DB_PATH")
+
+    fake = FakeService(result(company_id))
+    monkeypatch.setattr(cli, "SessionLocal", lambda: database_session)
+    monkeypatch.setattr(cli, "WebsiteContactDiscoveryProvider", recording_provider_factory)
+    monkeypatch.setattr(cli, "ContactDiscoveryService", factory_for(fake))
+    monkeypatch.setattr(database_session, "commit", track_commit)
+    monkeypatch.setattr(database_session, "rollback", fail_rollback)
+
+    response = runner.invoke(cli.app, ["run", "--company-id", str(company_id)])
+
+    assert response.exit_code == 1
+    assert response.output.strip() == "contact_discovery_execution_failed"
+    assert "Contact discovery" not in response.output
+    assert commits == 0
+    assert rollbacks == 1
+
+
+def test_missing_company_rollback_exception_replaces_local_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_session = SessionLocal()
+    rollbacks = 0
+
+    def fail_rollback() -> None:
+        nonlocal rollbacks
+        rollbacks += 1
+        raise RuntimeError("ROLLBACK_SECRET_DB_PATH")
+
+    def forbidden_provider() -> ContactDiscoveryProvider:
+        raise AssertionError("Provider must not be created for a missing company.")
+
+    monkeypatch.setattr(cli, "SessionLocal", lambda: database_session)
+    monkeypatch.setattr(cli, "WebsiteContactDiscoveryProvider", forbidden_provider)
+    monkeypatch.setattr(database_session, "rollback", fail_rollback)
+
+    response = runner.invoke(cli.app, ["run", "--company-id", "999999"])
+
+    assert response.exit_code == 1
+    assert response.output.strip() == "contact_discovery_execution_failed"
+    assert "company_not_found" not in response.output
+    assert rollbacks == 1
+
+
+def test_real_sqlite_persist_commits_candidate_and_state_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    make_session = isolated_session_factory(tmp_path)
+    with make_session() as setup_session:
+        project = Project(name="F6E persist integration")
+        setup_session.add(project)
+        setup_session.flush()
+        company = Company(
+            project_id=project.id,
+            name="Persist Company",
+            website="https://stored.example",
+        )
+        setup_session.add(company)
+        setup_session.commit()
+        company_id = company.id
+        original_company = (company.name, company.website, company.status)
+
+    provider_result = WebsiteContactDiscoveryProviderResult(
+        candidates=(candidate(company_id),),
+        attempted_pages=1,
+        successful_pages=1,
+    )
+    cli_session = make_session()
+    commits = 0
+    original_commit = cli_session.commit
+
+    def track_commit() -> None:
+        nonlocal commits
+        commits += 1
+        original_commit()
+
+    monkeypatch.setattr(cli_session, "commit", track_commit)
+    monkeypatch.setattr(cli, "SessionLocal", lambda: cli_session)
+    monkeypatch.setattr(
+        cli, "WebsiteContactDiscoveryProvider", lambda: StaticProvider(provider_result)
+    )
+
+    response = runner.invoke(
+        cli.app,
+        ["run", "--company-id", str(company_id), "--persist", "--yes"],
+    )
+
+    assert response.exit_code == 0
+    assert "Status: SUCCEEDED" in response.output
+    assert commits == 1
+    with make_session() as inspection_session:
+        states = list(inspection_session.scalars(select(CompanyContactDiscoveryState)))
+        candidates = list(inspection_session.scalars(select(ContactDiscoveryCandidate)))
+        persisted_company = inspection_session.get(Company, company_id)
+        assert len(states) == len(candidates) == 1
+        assert states[0].company_id == company_id
+        assert states[0].discovery_status == ContactDiscoveryStatus.SUCCEEDED
+        assert states[0].last_error is None
+        assert candidates[0].company_id == company_id
+        assert persisted_company is not None
+        assert (
+            persisted_company.name,
+            persisted_company.website,
+            persisted_company.status,
+        ) == original_company
+        assert inspection_session.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+def test_real_sqlite_dry_run_preserves_existing_state_and_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    make_session = isolated_session_factory(tmp_path)
+    checked_at = datetime(2025, 1, 2, 3, 4, tzinfo=UTC)
+    with make_session() as setup_session:
+        project = Project(name="F6E dry-run integration")
+        setup_session.add(project)
+        setup_session.flush()
+        company = Company(
+            project_id=project.id,
+            name="Dry Run Company",
+            website="https://stored.example",
+        )
+        setup_session.add(company)
+        setup_session.flush()
+        company_id = company.id
+        repository = ContactDiscoveryRepository(setup_session)
+        repository.update_state(
+            company_id,
+            provider="existing",
+            discovery_status=ContactDiscoveryStatus.PARTIAL,
+            checked_at=checked_at,
+            last_error="secondary_page_fetch_failed",
+        )
+        repository.upsert_candidate(
+            company_id,
+            candidate(company_id, title="Existing title", confidence=40),
+        )
+        setup_session.commit()
+        original_company = (company.name, company.website, company.status)
+
+    provider_result = WebsiteContactDiscoveryProviderResult(
+        candidates=(candidate(company_id, title="Changed title", confidence=95),),
+        attempted_pages=1,
+        successful_pages=1,
+    )
+    cli_session = make_session()
+    monkeypatch.setattr(cli, "SessionLocal", lambda: cli_session)
+    monkeypatch.setattr(
+        cli, "WebsiteContactDiscoveryProvider", lambda: StaticProvider(provider_result)
+    )
+
+    response = runner.invoke(cli.app, ["run", "--company-id", str(company_id)])
+
+    assert response.exit_code == 0
+    assert "Mode: DRY_RUN" in response.output
+    assert "Status: SUCCEEDED" in response.output
+    with make_session() as inspection_session:
+        states = list(inspection_session.scalars(select(CompanyContactDiscoveryState)))
+        candidates = list(inspection_session.scalars(select(ContactDiscoveryCandidate)))
+        persisted_company = inspection_session.get(Company, company_id)
+        assert len(states) == len(candidates) == 1
+        assert states[0].discovery_status == ContactDiscoveryStatus.PARTIAL
+        assert states[0].last_error == "secondary_page_fetch_failed"
+        assert states[0].checked_at == checked_at.replace(tzinfo=None)
+        assert candidates[0].title == "Existing title"
+        assert candidates[0].confidence == 40
+        assert candidates[0].discovery_status == ContactDiscoveryCandidateStatus.DISCOVERED
+        assert persisted_company is not None
+        assert (
+            persisted_company.name,
+            persisted_company.website,
+            persisted_company.status,
+        ) == original_company
+        assert inspection_session.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+def test_real_sqlite_persist_exception_rolls_back_candidate_and_state_together(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    make_session = isolated_session_factory(tmp_path)
+    with make_session() as setup_session:
+        project = Project(name="F6E rollback integration")
+        setup_session.add(project)
+        setup_session.flush()
+        company = Company(
+            project_id=project.id,
+            name="Rollback Company",
+            website="https://stored.example",
+        )
+        setup_session.add(company)
+        setup_session.commit()
+        company_id = company.id
+        original_company = (company.name, company.website, company.status)
+
+    provider_result = WebsiteContactDiscoveryProviderResult(
+        candidates=(candidate(company_id),),
+        attempted_pages=1,
+        successful_pages=1,
+    )
+    cli_session = make_session()
+    commits = 0
+    original_commit = cli_session.commit
+
+    def track_commit() -> None:
+        nonlocal commits
+        commits += 1
+        original_commit()
+
+    def make_failing_service(
+        repository: ContactDiscoveryRepository,
+        provider: ContactDiscoveryProvider,
+    ) -> ContactDiscoveryService:
+        return ContactDiscoveryService(FailingAfterStateRepository(repository.session), provider)
+
+    monkeypatch.setattr(cli_session, "commit", track_commit)
+    monkeypatch.setattr(cli, "SessionLocal", lambda: cli_session)
+    monkeypatch.setattr(
+        cli, "WebsiteContactDiscoveryProvider", lambda: StaticProvider(provider_result)
+    )
+    monkeypatch.setattr(cli, "ContactDiscoveryService", make_failing_service)
+
+    response = runner.invoke(
+        cli.app,
+        ["run", "--company-id", str(company_id), "--persist", "--yes"],
+    )
+
+    assert response.exit_code == 1
+    assert response.output.strip() == "contact_discovery_execution_failed"
+    assert commits == 0
+    with make_session() as inspection_session:
+        assert (
+            inspection_session.scalar(
+                select(func.count()).select_from(CompanyContactDiscoveryState)
+            )
+            == 0
+        )
+        assert (
+            inspection_session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate))
+            == 0
+        )
+        persisted_company = inspection_session.get(Company, company_id)
+        assert persisted_company is not None
+        assert (
+            persisted_company.name,
+            persisted_company.website,
+            persisted_company.status,
+        ) == original_company
+        assert inspection_session.scalar(select(func.count()).select_from(Contact)) == 0
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt(), SystemExit(2)])
@@ -424,10 +834,58 @@ def test_base_exceptions_are_not_converted(error: BaseException) -> None:
             company_id=company_id,
             persist=False,
             yes=False,
-            provider_factory=RecordingProvider,
+            provider_factory=recording_provider_factory,
             service_factory=factory_for(fake),
         )
     assert counts() == (0, 0)
+
+
+def test_close_exception_is_sanitized_without_replacing_normal_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, company_id = create_company(website="https://stored.example")
+    database_session = SessionLocal()
+    fake = FakeService(result(company_id))
+
+    def fail_close() -> None:
+        raise RuntimeError("CLOSE_SECRET_DB_PATH")
+
+    monkeypatch.setattr(database_session, "close", fail_close)
+    outcome = cli.execute_contact_discovery(
+        company_id=company_id,
+        persist=False,
+        yes=False,
+        session_factory=lambda: database_session,
+        provider_factory=recording_provider_factory,
+        service_factory=factory_for(fake),
+    )
+
+    assert outcome == cli.ContactDiscoveryCommandOutcome(
+        exit_code=1,
+        error_code="contact_discovery_execution_failed",
+    )
+
+
+def test_close_exception_does_not_replace_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, company_id = create_company(website="https://stored.example")
+    database_session = SessionLocal()
+    fake = FakeService(result(company_id), error=KeyboardInterrupt())
+
+    def fail_close() -> None:
+        raise RuntimeError("CLOSE_SECRET_DB_PATH")
+
+    monkeypatch.setattr(database_session, "close", fail_close)
+    with pytest.raises(KeyboardInterrupt):
+        cli.execute_contact_discovery(
+            company_id=company_id,
+            persist=False,
+            yes=False,
+            session_factory=lambda: database_session,
+            provider_factory=recording_provider_factory,
+            service_factory=factory_for(fake),
+        )
 
 
 def test_deterministic_safe_summary_omits_urls_and_bounds_candidate_output() -> None:
@@ -455,7 +913,7 @@ def test_deterministic_safe_summary_omits_urls_and_bounds_candidate_output() -> 
 
     stream = StringIO()
     monkeypatch_context = pytest.MonkeyPatch()
-    monkeypatch_context.setattr(cli.typer, "echo", lambda value: stream.write(f"{value}\n"))
+    monkeypatch_context.setattr(typer, "echo", lambda value: stream.write(f"{value}\n"))
     try:
         cli._print_result(run_result)
     finally:
@@ -488,7 +946,7 @@ def test_no_errors_and_missing_candidate_values_have_stable_output(
 ) -> None:
     run_result = result(1, candidates=(candidate(1, name=None, title=None, phone=None),))
     lines: list[str] = []
-    monkeypatch.setattr(cli.typer, "echo", lambda value: lines.append(str(value)))
+    monkeypatch.setattr(typer, "echo", lambda value: lines.append(str(value)))
     cli._print_result(run_result)
     assert "Errors: none" in lines
     assert "  Name: -" in lines
