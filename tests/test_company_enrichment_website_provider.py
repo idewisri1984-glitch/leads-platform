@@ -99,13 +99,24 @@ def test_homepage_is_fetched_parsed_and_normalized() -> None:
         max_pages=1,
     ).enrich(target("https://EXAMPLE.com/"))
     assert result.provider == "website"
-    assert result.source_url == "https://example.com"
+    assert result.source_url == "https://example.com/"
     assert result.email == "Sales@example.com"
     assert result.phone == "+1 212 555 0199"
     assert result.instagram_url == "https://instagram.com/example"
     assert result.linkedin_url == "https://linkedin.com/company/example"
     assert result.contact_page_url == "https://example.com/contact-us"
     assert result.about_page_url == "https://example.com/about-us"
+
+
+def test_homepage_request_preserves_trailing_slash() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return html_response(request, "<html></html>")
+
+    provider(handler, max_pages=1).enrich(target(" https://EXAMPLE.com/foundation/ "))
+    assert requested == ["https://example.com/foundation/"]
 
 
 def test_unknown_response_charset_returns_sanitized_provider_error() -> None:

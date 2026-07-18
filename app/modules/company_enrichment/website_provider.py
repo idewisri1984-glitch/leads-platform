@@ -2,7 +2,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from app.modules.company_enrichment.normalization import normalize_public_url
 from app.modules.company_enrichment.schemas import (
     CompanyEnrichmentProviderResult,
     CompanyEnrichmentTarget,
@@ -15,6 +14,7 @@ from app.providers.public_web_fetcher import (
     FetchResponse,
     PublicWebFetchErrorCode,
     ResponseTooLargeError,
+    normalize_public_web_request_url,
 )
 from app.providers.public_web_fetcher import (
     PublicWebTransport as _SafeFetcher,
@@ -82,7 +82,7 @@ class WebsiteEnrichmentProvider:
             )
 
         try:
-            homepage_url = normalize_public_url(target.website)
+            homepage_url = normalize_public_web_request_url(target.website)
         except ValueError:
             homepage_url = None
         if homepage_url is None:
@@ -107,7 +107,7 @@ class WebsiteEnrichmentProvider:
             if pages_fetched >= self._max_pages or page_url is None:
                 continue
             try:
-                normalized_page = normalize_public_url(page_url)
+                normalized_page = normalize_public_web_request_url(page_url)
             except ValueError:
                 continue
             if (
