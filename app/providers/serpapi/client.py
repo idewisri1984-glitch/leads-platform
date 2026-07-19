@@ -3,6 +3,7 @@ from typing import Any
 
 import httpx
 
+from app.core.country_targets import get_country_target
 from app.providers.serpapi.exceptions import (
     SerpApiAuthenticationError,
     SerpApiConfigurationError,
@@ -73,12 +74,15 @@ class SerpApiClient:
         city: str | None,
         industry: str | None,
         limit: int,
+        google_country_code: str | None = None,
     ) -> SerpApiSearchResponse:
         if not self._api_key:
             raise SerpApiConfigurationError("SERPAPI_API_KEY is required to use SerpAPI.")
 
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise SerpApiRequestError("SerpAPI result limit must be between 1 and 100.")
+
+        request_google_country_code = self._normalize_serpapi_country_code(google_country_code)
 
         search_query = self._build_search_query(
             query=query,
@@ -94,6 +98,8 @@ class SerpApiClient:
             "num": limit,
             "json_restrictor": _JSON_RESTRICTOR,
         }
+        if request_google_country_code is not None:
+            params["gl"] = request_google_country_code
 
         try:
             with self._http_client.stream(
@@ -247,6 +253,19 @@ class SerpApiClient:
             raise SerpApiRequestError("At least one SerpAPI search query part is required.")
 
         return " ".join(parts)
+
+    def _normalize_serpapi_country_code(self, google_country_code: str | None) -> str | None:
+        if google_country_code is None:
+            return None
+
+        if isinstance(google_country_code, bool) or not isinstance(google_country_code, str):
+            raise SerpApiRequestError("SerpAPI country code must be a non-empty string.")
+
+        normalized = google_country_code.strip()
+        if not normalized:
+            raise SerpApiRequestError("SerpAPI country code must be a non-empty string.")
+
+        return get_country_target(normalized).serpapi_gl
 
     def _parse_company_result(self, raw_result: object) -> SerpApiCompanyResult | None:
         if not isinstance(raw_result, dict):

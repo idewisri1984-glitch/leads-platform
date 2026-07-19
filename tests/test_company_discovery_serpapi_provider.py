@@ -51,6 +51,7 @@ class StubSerpApiClient:
         self.city: str | None = "not-called"
         self.industry: str | None = "not-called"
         self.limit: int | None = None
+        self.google_country_code: str | None = None
         self.call_count = 0
 
     def search_companies(
@@ -61,6 +62,7 @@ class StubSerpApiClient:
         city: str | None,
         industry: str | None,
         limit: int,
+        google_country_code: str | None = None,
     ) -> SerpApiSearchResponse:
         self.call_count += 1
         self.query = query
@@ -68,6 +70,7 @@ class StubSerpApiClient:
         self.city = city
         self.industry = industry
         self.limit = limit
+        self.google_country_code = google_country_code
 
         if self.error is not None:
             raise self.error
@@ -85,6 +88,11 @@ def make_query() -> SearchQuery:
         source_template="{target_customer_type} {city} {country}",
         limit=7,
     )
+
+
+def make_query_with_country_code() -> SearchQuery:
+    query = make_query()
+    return query.model_copy(update={"country_code": "GB"})
 
 
 def make_provider(client: StubSerpApiClient) -> SerpApiDiscoveryProvider:
@@ -115,6 +123,7 @@ def test_search_passes_query_text_limit_and_no_separate_geography() -> None:
     assert client.country is None
     assert client.city is None
     assert client.industry is None
+    assert client.google_country_code is None
 
 
 def test_vendor_result_maps_to_generic_result() -> None:
@@ -326,6 +335,15 @@ def test_generic_response_exposes_no_raw_provider_json() -> None:
 
     assert "raw_json" not in response_fields
     assert "raw_payload" not in response_fields
+
+
+def test_search_maps_country_code_to_google_country_parameter() -> None:
+    query = make_query_with_country_code()
+    client = StubSerpApiClient()
+
+    make_provider(client).search(query)
+
+    assert client.google_country_code == "uk"
 
 
 def test_search_performs_no_network_db_or_ingestion_calls(

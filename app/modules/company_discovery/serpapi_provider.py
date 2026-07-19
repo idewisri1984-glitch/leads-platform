@@ -1,5 +1,6 @@
 from pydantic import ValidationError
 
+from app.core.country_targets import get_country_target
 from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProviderAuthenticationError,
     DiscoveryProviderConfigurationError,
@@ -43,11 +44,17 @@ class SerpApiDiscoveryProvider:
 
     def search(self, query: SearchQuery) -> DiscoveryProviderResponse:
         try:
+            if query.country_code is None:
+                google_country_code = None
+            else:
+                google_country_code = get_country_target(query.country_code).serpapi_gl
+
             response = self.client.search_companies(
                 query=query.text,
                 country=None,
                 city=None,
                 industry=None,
+                google_country_code=google_country_code,
                 limit=query.limit,
             )
         except SerpApiConfigurationError:

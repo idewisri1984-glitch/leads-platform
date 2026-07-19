@@ -14,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.core.country_targets import normalize_iso_country_codes
 from app.modules.company_discovery.models import (
     CompanyDiscoveryCandidateStatus,
     CompanyDiscoveryRunStatus,
@@ -44,8 +45,7 @@ class CompanyDiscoveryRequestSnapshot(BaseModel):
     def normalize_countries(cls, value: Any) -> tuple[str, ...]:
         if isinstance(value, str):
             raise ValueError("Country codes must be a collection.")
-        normalized = {normalize_country_code(item) for item in value}
-        return tuple(sorted(code for code in normalized if code is not None))
+        return normalize_iso_country_codes(value, max_items=20, allow_empty=True)
 
     @model_validator(mode="after")
     def validate_source(self) -> "CompanyDiscoveryRequestSnapshot":

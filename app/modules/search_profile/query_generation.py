@@ -1,6 +1,7 @@
 import re
 from collections.abc import Iterable, Iterator
 
+from app.core.country_targets import CountryTarget, get_country_target
 from app.modules.search_profile.schemas import (
     SearchProfileRead,
     SearchProfileRunOptions,
@@ -40,7 +41,7 @@ class SearchProfileQueryGenerationError(ValueError):
     """
 
 
-type GeographyTarget = tuple[str | None, str | None]
+type GeographyTarget = tuple[str | None, str | None, CountryTarget | None]
 
 
 class SearchProfileQueryGenerator:
@@ -80,7 +81,10 @@ class SearchProfileQueryGenerator:
             language_values = profile.languages if "language" in placeholders else [None]
 
             for audience_value in audience_values:
-                for city, country in self._geography_targets(profile):
+                for city, country, country_target in self._geography_targets(
+                    profile=profile,
+                    country_codes=run_options.country_codes,
+                ):
                     for language in language_values:
                         rendered = self._render_template(
                             template=template,
@@ -118,6 +122,9 @@ class SearchProfileQueryGenerator:
                                 profile_name=profile.name,
                                 language=language,
                                 country=country,
+                                country_code=country_target.iso_alpha2
+                                if country_target is not None
+                                else None,
                                 city=city,
                                 source_template=template,
                                 limit=query_limit,
@@ -190,24 +197,39 @@ class SearchProfileQueryGenerator:
 
         return []
 
-    def _geography_targets(self, profile: SearchProfileRead) -> Iterator[GeographyTarget]:
+    def _geography_targets(
+        self,
+        *,
+        profile: SearchProfileRead,
+        country_codes: tuple[str, ...] | None,
+    ) -> Iterator[GeographyTarget]:
+        if country_codes is not None:
+            for country_code in country_codes:
+                target = get_country_target(country_code)
+                if profile.cities:
+                    for city in profile.cities:
+                        yield city, target.display_name, target
+                else:
+                    yield None, target.display_name, target
+            return
+
         if profile.cities and profile.countries:
             for city in profile.cities:
                 for country in profile.countries:
-                    yield city, country
+                    yield city, country, None
             return
 
         if profile.cities:
             for city in profile.cities:
-                yield city, None
+                yield city, None, None
             return
 
         if profile.countries:
             for country in profile.countries:
-                yield None, country
+                yield None, country, None
             return
 
-        yield None, None
+        yield None, None, None
 
     def _negative_tokens(self, negative_keywords: Iterable[str]) -> list[str]:
         tokens: list[str] = []
