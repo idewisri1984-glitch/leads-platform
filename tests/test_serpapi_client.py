@@ -1,4 +1,5 @@
 from collections.abc import Callable, Iterator
+from typing import cast
 from urllib.parse import parse_qs
 
 import httpx
@@ -123,6 +124,134 @@ def test_request_query_is_constructed_correctly() -> None:
 
     assert captured_query == "software companies SaaS Bali Indonesia"
     assert response.query == "software companies SaaS Bali Indonesia"
+
+
+def test_request_without_iso_country_code_has_no_gl_param() -> None:
+    captured_params: dict[str, str] = {}
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        params = parse_qs(request.url.query.decode())
+        captured_params.update({key: value[0] for key, value in params.items()})
+        return httpx.Response(200, json={"organic_results": []})
+
+    client = make_client(recording_handler)
+    client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    assert "gl" not in captured_params
+
+
+def test_request_with_iso_country_code_emits_serpapi_gl() -> None:
+    captured_params: dict[str, str] = {}
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        params = parse_qs(request.url.query.decode())
+        captured = {key: value[0] for key, value in params.items()}
+        captured_params.update(captured)
+        return httpx.Response(200, json={"organic_results": []})
+
+    make_client(recording_handler).search_companies(
+        query="companies",
+        country=None,
+        city=None,
+        industry=None,
+        limit=10,
+        iso_country_code="GB",
+    )
+
+    assert captured_params["gl"] == "uk"
+
+
+def test_invalid_iso_country_code_rejected_before_request() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"organic_results": []})
+
+    with pytest.raises(SerpApiRequestError, match="SerpAPI country code was invalid."):
+        make_client(handler).search_companies(
+            query="companies",
+            country=None,
+            city=None,
+            industry=None,
+            limit=10,
+            iso_country_code=cast(str | None, 123),
+        )
+
+    assert calls == 0
+
+
+def test_iso_country_code_can_be_omitted_without_side_effect() -> None:
+    make_client(lambda request: httpx.Response(200, json={"organic_results": []})).search_companies(
+        query="companies",
+        country=None,
+        city=None,
+        industry=None,
+        limit=10,
+    )
+
+
+def test_iso_country_code_can_be_lowercase() -> None:
+    captured_params: dict[str, str] = {}
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        params = parse_qs(request.url.query.decode())
+        captured_params.update({key: value[0] for key, value in params.items()})
+        return httpx.Response(200, json={"organic_results": []})
+
+    make_client(recording_handler).search_companies(
+        query="companies",
+        country=None,
+        city=None,
+        industry=None,
+        limit=10,
+        iso_country_code="gb",
+    )
+
+    assert captured_params["gl"] == "uk"
+
+
+def test_iso_country_code_emits_us_gl() -> None:
+    captured_params: dict[str, str] = {}
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        params = parse_qs(request.url.query.decode())
+        captured_params.update({key: value[0] for key, value in params.items()})
+        return httpx.Response(200, json={"organic_results": []})
+
+    make_client(recording_handler).search_companies(
+        query="companies",
+        country=None,
+        city=None,
+        industry=None,
+        limit=10,
+        iso_country_code="US",
+    )
+
+    assert captured_params["gl"] == "us"
+
+
+@pytest.mark.parametrize("value", ["UK", "ZZ", "SU", "", " ", True, 123])
+def test_invalid_iso_country_code_values_are_rejected_without_requests(value: object) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"organic_results": []})
+
+    with pytest.raises(SerpApiRequestError, match="SerpAPI country code was invalid."):
+        make_client(handler).search_companies(
+            query="companies",
+            country=None,
+            city=None,
+            industry=None,
+            limit=10,
+            iso_country_code=cast(str | None, value),
+        )
+
+    assert calls == 0
 
 
 def test_empty_optional_query_parts_are_omitted() -> None:

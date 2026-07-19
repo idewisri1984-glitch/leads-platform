@@ -8,6 +8,7 @@ from app.modules.search_profile import (
     SearchProfileQueryGenerator,
     SearchProfileRead,
     SearchProfileRunOptions,
+    SearchQuery,
     SearchQueryPreview,
 )
 
@@ -134,6 +135,40 @@ def test_default_templates_are_used_without_mutating_profile() -> None:
     assert profile.query_templates == []
 
 
+def test_no_override_uses_stored_free_text_country_values() -> None:
+    profile = make_profile(
+        target_customer_types=["accounting firms"],
+        countries=["Indonesia", "United States", "US"],
+    )
+
+    preview = generate(profile)
+
+    assert preview.queries[0].text == "accounting firms Indonesia"
+    assert preview.queries[0].country == "Indonesia"
+    assert preview.queries[0].country_code is None
+
+
+def test_explicit_country_codes_override_displays_canonical_names_and_codes() -> None:
+    profile = make_profile(
+        target_customer_types=["accounting firms"],
+        cities=["Berlin"],
+        countries=["Indonesia", "Australia"],
+        query_templates=["{target_customer_type} {city} {country}"],
+    )
+    preview = generate(
+        profile,
+        SearchProfileRunOptions(country_codes=("gb", " DE ", "US")),
+    )
+
+    assert [query.text for query in preview.queries] == [
+        "accounting firms Berlin Germany",
+        "accounting firms Berlin United Kingdom",
+        "accounting firms Berlin United States",
+    ]
+    assert [query.country_code for query in preview.queries] == ["DE", "GB", "US"]
+    assert preview.queries[0].country == "Germany"
+
+
 def test_custom_query_templates_are_used() -> None:
     profile = make_profile(
         product_or_service="industrial pumps",
@@ -174,6 +209,31 @@ def test_cities_only() -> None:
     assert preview.queries[0].text == "property managers Sydney"
     assert preview.queries[0].city == "Sydney"
     assert preview.queries[0].country is None
+
+
+def test_countries_only_uses_free_text_country_code_none() -> None:
+    profile = make_profile(target_customer_types=["accounting firms"], countries=["US"])
+
+    preview = generate(profile)
+
+    assert preview.queries[0].country == "US"
+    assert preview.queries[0].country_code is None
+
+
+def test_cities_and_profile_countries_cross_product_stays_legacy() -> None:
+    profile = make_profile(
+        target_customer_types=["buyers"],
+        cities=["Berlin", "Paris"],
+        countries=["Indonesia", "US"],
+        query_templates=["{target_customer_type} {city} {country}"],
+    )
+
+    assert [query.text for query in generate(profile).queries] == [
+        "buyers Berlin Indonesia",
+        "buyers Berlin US",
+        "buyers Paris Indonesia",
+        "buyers Paris US",
+    ]
 
 
 def test_cities_and_countries_deterministic_ordering() -> None:
@@ -377,6 +437,246 @@ def test_run_option_limits_are_validated() -> None:
         SearchProfileRunOptions(total_result_ceiling=1001)
 
 
+def test_search_query_accepts_country_code_none_and_rejects_unknown_types() -> None:
+    profile = make_profile()
+    assert generate(profile).queries[0].country_code is None
+
+    with pytest.raises(ValidationError):
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code=123,
+            limit=10,
+        )
+
+
+def test_country_code_in_search_query_accepts_none_and_canonicalizes_input() -> None:
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code=None,
+            limit=10,
+        ).country_code
+        is None
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="us",
+            limit=10,
+        ).country_code
+        == "US"
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code=" de ",
+            limit=10,
+        ).country_code
+        == "DE"
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="gb",
+            limit=10,
+        ).country_code
+        == "GB"
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="ID",
+            limit=10,
+        ).country_code
+        == "ID"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "UK",
+        "ZZ",
+        "SU",
+        "",
+        "   ",
+        "United States",
+        "Germany",
+        "not-an-code",
+        True,
+        123,
+        object(),
+    ],
+)
+def test_search_query_rejects_invalid_country_code_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code=value,
+            limit=10,
+        )
+
+
+def test_search_query_rejects_markup_country_code() -> None:
+    with pytest.raises(ValidationError):
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="<US>",
+            limit=10,
+        )
+
+
+def test_country_codes_validation_rejects_plain_string_and_empty_collection() -> None:
+    with pytest.raises(ValidationError):
+        SearchProfileRunOptions(country_codes="US")
+
+    with pytest.raises(ValidationError):
+        SearchProfileRunOptions(country_codes=[])
+
+
+def test_country_codes_validation_uses_normalized_unique_limit() -> None:
+    options = SearchProfileRunOptions(country_codes=["US"] * 21)
+    assert options.country_codes == ("US",)
+
+    duplicates = ["us", " DE ", "US"] * 7 + ["DE", " gb "]
+    duplicates_snapshot = list(duplicates)
+    options = SearchProfileRunOptions(country_codes=duplicates)
+    assert options.country_codes == ("DE", "GB", "US")
+    assert duplicates == duplicates_snapshot
+
+
+def test_country_codes_validation_rejects_unknown_or_invalid_codes() -> None:
+    with pytest.raises(ValidationError):
+        SearchProfileRunOptions(country_codes=("ZZ",))
+
+    with pytest.raises(ValidationError):
+        SearchProfileRunOptions(country_codes=("UK",))
+
+
+def test_country_codes_validation_rejects_too_many_unique_values() -> None:
+    codes = [
+        "US",
+        "DE",
+        "FR",
+        "GB",
+        "ID",
+        "CA",
+        "AU",
+        "JP",
+        "CN",
+        "IN",
+        "ES",
+        "IT",
+        "BR",
+        "MX",
+        "RU",
+        "NL",
+        "SE",
+        "NO",
+        "FI",
+        "DK",
+        "AR",
+    ]
+    with pytest.raises(ValidationError):
+        SearchProfileRunOptions(country_codes=codes)
+
+
+def test_country_codes_validation_limits_collection_size() -> None:
+    codes = [
+        "US",
+        "DE",
+        "FR",
+        "GB",
+        "ID",
+        "CA",
+        "AU",
+        "JP",
+        "CN",
+        "IN",
+        "ES",
+        "IT",
+        "BR",
+        "MX",
+        "RU",
+        "NL",
+        "SE",
+        "NO",
+        "FI",
+        "DK",
+    ]
+    SearchProfileRunOptions(country_codes=codes)
+
+    codes = [
+        "US",
+        "DE",
+        "FR",
+        "GB",
+        "ID",
+        "CA",
+        "AU",
+        "JP",
+        "CN",
+        "IN",
+        "ES",
+        "IT",
+        "BR",
+        "MX",
+        "RU",
+        "NL",
+        "SE",
+        "NO",
+        "FI",
+        "DK",
+        "AR",
+    ]
+    with pytest.raises(ValidationError):
+        SearchProfileRunOptions(country_codes=codes)
+
+
 def test_negative_single_keyword_syntax() -> None:
     profile = make_profile(target_customer_types=["accounting firms"], negative_keywords=["jobs"])
 
@@ -451,6 +751,87 @@ def test_language_variants_only_when_template_contains_language() -> None:
         "startups de Singapore",
     ]
     assert [query.language for query in preview.queries] == [None, "en", "de"]
+
+
+def test_override_country_codes_are_sorted_deduplicated_and_city_cross_product() -> None:
+    profile = make_profile(
+        target_customer_types=["buyers"],
+        cities=["Berlin", "Paris"],
+        countries=["Australia"],
+        query_templates=["{target_customer_type} {city} {country}"],
+    )
+
+    preview = generate(
+        profile,
+        SearchProfileRunOptions(country_codes=("US", "gb ", "DE", " us ")),
+    )
+
+    assert [query.text for query in preview.queries] == [
+        "buyers Berlin Germany",
+        "buyers Paris Germany",
+        "buyers Berlin United Kingdom",
+        "buyers Paris United Kingdom",
+        "buyers Berlin United States",
+        "buyers Paris United States",
+    ]
+    assert [query.country_code for query in preview.queries] == ["DE", "DE", "GB", "GB", "US", "US"]
+
+
+def test_duplicate_heavy_override_does_not_expand_queries_beyond_unique_targets() -> None:
+    profile = make_profile(
+        target_customer_types=["buyers"],
+        cities=["Berlin", "Paris"],
+        query_templates=["{target_customer_type} {city} {country}"],
+    )
+
+    preview = generate(
+        profile,
+        SearchProfileRunOptions(
+            country_codes=(
+                "US",
+                "us",
+                " US ",
+                "DE",
+                "de",
+                "DE ",
+                "GB",
+                "gb",
+                "Gb",
+            )
+            * 3
+            + ("US",),
+        ),
+    )
+
+    assert [query.country_code for query in preview.queries] == [
+        "DE",
+        "DE",
+        "GB",
+        "GB",
+        "US",
+        "US",
+    ]
+    assert [query.country for query in preview.queries] == [
+        "Germany",
+        "Germany",
+        "United Kingdom",
+        "United Kingdom",
+        "United States",
+        "United States",
+    ]
+
+
+def test_override_does_not_mutate_profile() -> None:
+    profile = make_profile(
+        target_customer_types=["accounting firms"],
+        cities=["Berlin"],
+        countries=["Australia", "Indonesia"],
+    )
+    original = profile.model_dump()
+
+    generate(profile, SearchProfileRunOptions(country_codes=("US", "DE")))
+
+    assert profile.model_dump() == original
 
 
 def test_unknown_placeholder_raises_controlled_error() -> None:

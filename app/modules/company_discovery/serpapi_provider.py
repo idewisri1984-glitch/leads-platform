@@ -48,6 +48,7 @@ class SerpApiDiscoveryProvider:
                 country=None,
                 city=None,
                 industry=None,
+                iso_country_code=query.country_code,
                 limit=query.limit,
             )
         except SerpApiConfigurationError:

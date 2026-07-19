@@ -4,6 +4,7 @@ import unicodedata
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
+from app.core.country_targets import normalize_iso_country_code
 from app.providers.public_web_fetcher import is_public_address
 
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -33,10 +34,7 @@ def normalize_display_name(value: str | None) -> str | None:
 def normalize_country_code(value: str | None) -> str | None:
     if value is None:
         return None
-    normalized = value.strip().upper()
-    if not re.fullmatch(r"[A-Z]{2}", normalized, flags=re.ASCII):
-        raise ValueError("Country code must contain exactly two ASCII letters.")
-    return normalized
+    return normalize_iso_country_code(value)
 
 
 def normalize_staging_website(value: str) -> tuple[str, str]:

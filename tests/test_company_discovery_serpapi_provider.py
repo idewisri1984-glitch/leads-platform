@@ -1,7 +1,9 @@
 import inspect
 import socket
 from typing import cast
+from urllib.parse import parse_qs
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -51,6 +53,7 @@ class StubSerpApiClient:
         self.city: str | None = "not-called"
         self.industry: str | None = "not-called"
         self.limit: int | None = None
+        self.iso_country_code: str | None = None
         self.call_count = 0
 
     def search_companies(
@@ -61,6 +64,7 @@ class StubSerpApiClient:
         city: str | None,
         industry: str | None,
         limit: int,
+        iso_country_code: str | None = None,
     ) -> SerpApiSearchResponse:
         self.call_count += 1
         self.query = query
@@ -68,6 +72,7 @@ class StubSerpApiClient:
         self.city = city
         self.industry = industry
         self.limit = limit
+        self.iso_country_code = iso_country_code
 
         if self.error is not None:
             raise self.error
@@ -87,7 +92,12 @@ def make_query() -> SearchQuery:
     )
 
 
-def make_provider(client: StubSerpApiClient) -> SerpApiDiscoveryProvider:
+def make_query_with_country_code() -> SearchQuery:
+    query = make_query()
+    return query.model_copy(update={"country_code": "GB"})
+
+
+def make_provider(client: StubSerpApiClient | SerpApiClient) -> SerpApiDiscoveryProvider:
     return SerpApiDiscoveryProvider(cast(SerpApiClient, client))
 
 
@@ -115,6 +125,7 @@ def test_search_passes_query_text_limit_and_no_separate_geography() -> None:
     assert client.country is None
     assert client.city is None
     assert client.industry is None
+    assert client.iso_country_code is None
 
 
 def test_vendor_result_maps_to_generic_result() -> None:
@@ -328,6 +339,129 @@ def test_generic_response_exposes_no_raw_provider_json() -> None:
     assert "raw_payload" not in response_fields
 
 
+def test_search_maps_country_code_to_canonical_iso_parameter() -> None:
+    query = make_query_with_country_code()
+    client = StubSerpApiClient()
+
+    make_provider(client).search(query)
+
+    assert client.iso_country_code == "GB"
+
+
+def test_search_maps_us_country_code_to_canonical_iso_parameter() -> None:
+    query = SearchQuery(
+        text="accounting firms Berlin Germany",
+        profile_id=1,
+        profile_name="Accounting buyers",
+        country="Germany",
+        city="Berlin",
+        source_template="{target_customer_type} {city} {country}",
+        country_code="us",
+        limit=7,
+    )
+    client = StubSerpApiClient()
+
+    make_provider(client).search(query)
+
+    assert client.iso_country_code == "US"
+
+
+def test_search_does_not_pass_provider_country_value_directly() -> None:
+    query = make_query_with_country_code()
+    client = StubSerpApiClient()
+
+    make_provider(client).search(query)
+
+    assert client.iso_country_code != "uk"
+
+
+def test_real_provider_and_client_send_us_as_gl_once() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"search_metadata": {"status": "Success"}, "organic_results": []},
+        )
+
+    provider = SerpApiDiscoveryProvider(
+        SerpApiClient(
+            api_key="test-key",
+            base_url="https://serpapi.test/search.json",
+            timeout_seconds=5.0,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+    query = make_query().model_copy(update={"country_code": "US"})
+
+    response = provider.search(query)
+    params = parse_qs(requests[0].url.query.decode())
+
+    assert response.query == query.text
+    assert len(requests) == 1
+    assert params["gl"][0] == "us"
+    assert params["q"][0] == query.text
+
+
+def test_real_provider_and_client_send_gb_as_uk_gl_once() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"search_metadata": {"status": "Success"}, "organic_results": []},
+        )
+
+    provider = SerpApiDiscoveryProvider(
+        SerpApiClient(
+            api_key="test-key",
+            base_url="https://serpapi.test/search.json",
+            timeout_seconds=5.0,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+    query = make_query().model_copy(update={"country_code": "GB"})
+
+    response = provider.search(query)
+    params = parse_qs(requests[0].url.query.decode())
+
+    assert response.query == query.text
+    assert len(requests) == 1
+    assert params["gl"][0] == "uk"
+    assert params["q"][0] == query.text
+
+
+def test_real_provider_and_client_with_none_country_code_no_gl() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"search_metadata": {"status": "Success"}, "organic_results": []},
+        )
+
+    provider = SerpApiDiscoveryProvider(
+        SerpApiClient(
+            api_key="test-key",
+            base_url="https://serpapi.test/search.json",
+            timeout_seconds=5.0,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+    )
+    query = make_query().model_copy(update={"country_code": None})
+
+    response = provider.search(query)
+    params = parse_qs(requests[0].url.query.decode())
+
+    assert response.query == query.text
+    assert len(requests) == 1
+    assert "gl" not in params
+    assert params["q"][0] == query.text
+
+
 def test_search_performs_no_network_db_or_ingestion_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -339,3 +473,37 @@ def test_search_performs_no_network_db_or_ingestion_calls(
     response = make_provider(StubSerpApiClient()).search(make_query())
 
     assert response.provider == "serpapi"
+
+
+def test_search_defensive_invalid_country_code_maps_to_request_error() -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"organic_results": []})
+
+    client = SerpApiClient(
+        api_key="test-key",
+        base_url="https://serpapi.test/search.json",
+        timeout_seconds=5.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    provider = make_provider(client)
+    invalid_query = SearchQuery.model_construct(
+        text="accounting firms",
+        profile_id=1,
+        profile_name="Accounting buyers",
+        country="Germany",
+        city="Berlin",
+        source_template="{target_customer_type} {city} {country}",
+        country_code="ZZ",
+        limit=7,
+    )
+    with pytest.raises(DiscoveryProviderRequestError) as error:
+        provider.search(invalid_query)
+
+    assert error.value.__suppress_context__ is True
+    assert "ZZ" not in str(error.value)
+    assert str(error.value) == "Discovery provider request failed."
+    assert requests == 0
