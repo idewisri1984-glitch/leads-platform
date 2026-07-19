@@ -10,16 +10,22 @@ from app.modules.company_import.schemas import (
 from app.modules.search_profile.schemas import SearchQuery
 
 ProviderErrorCode = Literal[
+    "authentication_error",
     "configuration_error",
+    "quota_exceeded",
     "rate_limit_error",
     "request_error",
     "response_error",
+    "response_too_large",
     "provider_error",
 ]
 
 StopReason = Literal[
+    "authentication_error",
     "configuration_error",
+    "quota_exceeded",
     "rate_limit_error",
+    "response_too_large",
     "provider_error",
 ]
 

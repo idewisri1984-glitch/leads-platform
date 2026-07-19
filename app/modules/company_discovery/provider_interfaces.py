@@ -20,7 +20,19 @@ class DiscoveryProviderRateLimitError(DiscoveryProviderRequestError):
     pass
 
 
+class DiscoveryProviderAuthenticationError(DiscoveryProviderError):
+    pass
+
+
+class DiscoveryProviderQuotaExceededError(DiscoveryProviderRateLimitError):
+    pass
+
+
 class DiscoveryProviderResponseError(DiscoveryProviderError):
+    pass
+
+
+class DiscoveryProviderResponseTooLargeError(DiscoveryProviderResponseError):
     pass
 
 

@@ -8,11 +8,14 @@ from app.modules.company_discovery.profile_persistence import (
 )
 from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProvider,
+    DiscoveryProviderAuthenticationError,
     DiscoveryProviderConfigurationError,
     DiscoveryProviderError,
+    DiscoveryProviderQuotaExceededError,
     DiscoveryProviderRateLimitError,
     DiscoveryProviderRequestError,
     DiscoveryProviderResponseError,
+    DiscoveryProviderResponseTooLargeError,
 )
 from app.modules.company_discovery.result_adapter import (
     DiscoveryResultAdapterError,
@@ -44,12 +47,15 @@ __all__ = [
     "CompanyDiscoveryResult",
     "CompanyDiscoveryService",
     "DiscoveryProvider",
+    "DiscoveryProviderAuthenticationError",
     "DiscoveryProviderConfigurationError",
     "DiscoveryProviderError",
+    "DiscoveryProviderQuotaExceededError",
     "DiscoveryProviderRateLimitError",
     "DiscoveryProviderRequestError",
     "DiscoveryProviderResponse",
     "DiscoveryProviderResponseError",
+    "DiscoveryProviderResponseTooLargeError",
     "DiscoveryProviderResult",
     "DiscoveryResultAdapterError",
     "SearchProfileDiscoveryAdapterError",
