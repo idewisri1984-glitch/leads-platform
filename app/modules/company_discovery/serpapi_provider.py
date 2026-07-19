@@ -1,11 +1,14 @@
 from pydantic import ValidationError
 
 from app.modules.company_discovery.provider_interfaces import (
+    DiscoveryProviderAuthenticationError,
     DiscoveryProviderConfigurationError,
     DiscoveryProviderError,
+    DiscoveryProviderQuotaExceededError,
     DiscoveryProviderRateLimitError,
     DiscoveryProviderRequestError,
     DiscoveryProviderResponseError,
+    DiscoveryProviderResponseTooLargeError,
 )
 from app.modules.company_discovery.schemas import (
     DiscoveryProviderResponse,
@@ -13,12 +16,16 @@ from app.modules.company_discovery.schemas import (
 )
 from app.modules.search_profile.schemas import SearchQuery
 from app.providers.serpapi import (
+    SerpApiAuthenticationError,
     SerpApiClient,
     SerpApiConfigurationError,
     SerpApiError,
+    SerpApiProviderError,
+    SerpApiQuotaExceededError,
     SerpApiRateLimitError,
     SerpApiRequestError,
     SerpApiResponseError,
+    SerpApiResponseTooLargeError,
 )
 
 
@@ -47,9 +54,21 @@ class SerpApiDiscoveryProvider:
             raise DiscoveryProviderConfigurationError(
                 "Discovery provider is not configured."
             ) from None
+        except SerpApiAuthenticationError:
+            raise DiscoveryProviderAuthenticationError(
+                "Discovery provider authentication failed."
+            ) from None
+        except SerpApiQuotaExceededError:
+            raise DiscoveryProviderQuotaExceededError(
+                "Discovery provider quota was exceeded."
+            ) from None
         except SerpApiRateLimitError:
             raise DiscoveryProviderRateLimitError(
                 "Discovery provider rate limit exceeded."
+            ) from None
+        except SerpApiResponseTooLargeError:
+            raise DiscoveryProviderResponseTooLargeError(
+                "Discovery provider response exceeded the allowed size."
             ) from None
         except SerpApiResponseError:
             raise DiscoveryProviderResponseError(
@@ -57,6 +76,8 @@ class SerpApiDiscoveryProvider:
             ) from None
         except SerpApiRequestError:
             raise DiscoveryProviderRequestError("Discovery provider request failed.") from None
+        except SerpApiProviderError:
+            raise DiscoveryProviderError("Discovery provider failed.") from None
         except SerpApiError:
             raise DiscoveryProviderError("Discovery provider failed.") from None
 
@@ -77,7 +98,7 @@ class SerpApiDiscoveryProvider:
                     )
                     for result in response.results
                 ],
-                total_results=None,
+                total_results=response.total_results,
             )
         except ValidationError:
             raise DiscoveryProviderResponseError(

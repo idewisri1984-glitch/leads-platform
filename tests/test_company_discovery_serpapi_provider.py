@@ -8,22 +8,29 @@ from pydantic import ValidationError
 import app.modules.company_discovery.serpapi_provider as serpapi_provider_module
 from app.modules.company_discovery import (
     DiscoveryProvider,
+    DiscoveryProviderAuthenticationError,
     DiscoveryProviderConfigurationError,
     DiscoveryProviderError,
+    DiscoveryProviderQuotaExceededError,
     DiscoveryProviderRateLimitError,
     DiscoveryProviderRequestError,
     DiscoveryProviderResponseError,
+    DiscoveryProviderResponseTooLargeError,
     SerpApiDiscoveryProvider,
 )
 from app.modules.search_profile.schemas import SearchQuery
 from app.providers.serpapi import (
+    SerpApiAuthenticationError,
     SerpApiClient,
     SerpApiCompanyResult,
     SerpApiConfigurationError,
     SerpApiError,
+    SerpApiProviderError,
+    SerpApiQuotaExceededError,
     SerpApiRateLimitError,
     SerpApiRequestError,
     SerpApiResponseError,
+    SerpApiResponseTooLargeError,
     SerpApiSearchResponse,
 )
 
@@ -158,6 +165,15 @@ def test_empty_vendor_results_return_empty_generic_results() -> None:
     assert response.total_results is None
 
 
+def test_safe_total_results_is_propagated() -> None:
+    client = StubSerpApiClient(
+        response=SerpApiSearchResponse(query="accounting firms", results=[], total_results=27)
+    )
+    response = make_provider(client).search(make_query())
+    assert response.results == []
+    assert response.total_results == 27
+
+
 def test_search_does_not_mutate_search_query() -> None:
     query = make_query()
     original = query.model_dump()
@@ -227,14 +243,34 @@ def test_generic_mapping_validation_errors_are_controlled(position: int) -> None
             "Discovery provider is not configured.",
         ),
         (
+            SerpApiAuthenticationError(_FAKE_API_KEY),
+            DiscoveryProviderAuthenticationError,
+            "Discovery provider authentication failed.",
+        ),
+        (
+            SerpApiQuotaExceededError(_FAKE_API_KEY),
+            DiscoveryProviderQuotaExceededError,
+            "Discovery provider quota was exceeded.",
+        ),
+        (
             SerpApiRateLimitError(_FAKE_API_KEY),
             DiscoveryProviderRateLimitError,
             "Discovery provider rate limit exceeded.",
         ),
         (
+            SerpApiResponseTooLargeError(_FAKE_API_KEY),
+            DiscoveryProviderResponseTooLargeError,
+            "Discovery provider response exceeded the allowed size.",
+        ),
+        (
             SerpApiRequestError(_FAKE_API_KEY),
             DiscoveryProviderRequestError,
             "Discovery provider request failed.",
+        ),
+        (
+            SerpApiProviderError(_FAKE_API_KEY),
+            DiscoveryProviderError,
+            "Discovery provider failed.",
         ),
         (
             SerpApiResponseError(_FAKE_API_KEY),

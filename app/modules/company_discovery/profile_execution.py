@@ -1,10 +1,13 @@
 from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProvider,
+    DiscoveryProviderAuthenticationError,
     DiscoveryProviderConfigurationError,
     DiscoveryProviderError,
+    DiscoveryProviderQuotaExceededError,
     DiscoveryProviderRateLimitError,
     DiscoveryProviderRequestError,
     DiscoveryProviderResponseError,
+    DiscoveryProviderResponseTooLargeError,
 )
 from app.modules.company_discovery.result_adapter import (
     DiscoveryResultAdapterError,
@@ -28,10 +31,13 @@ from app.modules.search_profile.schemas import (
 )
 
 _PROVIDER_ERROR_MESSAGES: dict[ProviderErrorCode, str] = {
+    "authentication_error": "Discovery provider authentication failed.",
     "configuration_error": "Discovery provider is not configured.",
+    "quota_exceeded": "Discovery provider quota was exceeded.",
     "rate_limit_error": "Discovery provider rate limit exceeded.",
     "request_error": "Discovery provider request failed.",
     "response_error": "Discovery provider response was invalid.",
+    "response_too_large": "Discovery provider response exceeded the allowed size.",
     "provider_error": "Discovery provider failed.",
 }
 _ADAPTER_ERROR_MESSAGE = "Discovery result could not be adapted."
@@ -75,12 +81,26 @@ class SearchProfileDiscoveryService:
         for query in preview.queries:
             try:
                 response = provider.search(query)
+            except DiscoveryProviderAuthenticationError:
+                query_results.append(
+                    self._provider_error_result(query, provider_name, "authentication_error")
+                )
+                stopped_early = True
+                stop_reason = "authentication_error"
+                break
             except DiscoveryProviderConfigurationError:
                 query_results.append(
                     self._provider_error_result(query, provider_name, "configuration_error")
                 )
                 stopped_early = True
                 stop_reason = "configuration_error"
+                break
+            except DiscoveryProviderQuotaExceededError:
+                query_results.append(
+                    self._provider_error_result(query, provider_name, "quota_exceeded")
+                )
+                stopped_early = True
+                stop_reason = "quota_exceeded"
                 break
             except DiscoveryProviderRateLimitError:
                 query_results.append(
@@ -94,6 +114,13 @@ class SearchProfileDiscoveryService:
                     self._provider_error_result(query, provider_name, "request_error")
                 )
                 continue
+            except DiscoveryProviderResponseTooLargeError:
+                query_results.append(
+                    self._provider_error_result(query, provider_name, "response_too_large")
+                )
+                stopped_early = True
+                stop_reason = "response_too_large"
+                break
             except DiscoveryProviderResponseError:
                 query_results.append(
                     self._provider_error_result(query, provider_name, "response_error")

@@ -25,12 +25,15 @@ from app.modules import (
 )
 from app.modules import SearchProfileDiscoveryService as ExportedService
 from app.modules.company_discovery import (
+    DiscoveryProviderAuthenticationError,
     DiscoveryProviderConfigurationError,
     DiscoveryProviderError,
+    DiscoveryProviderQuotaExceededError,
     DiscoveryProviderRateLimitError,
     DiscoveryProviderRequestError,
     DiscoveryProviderResponse,
     DiscoveryProviderResponseError,
+    DiscoveryProviderResponseTooLargeError,
     DiscoveryProviderResult,
     DiscoveryResultAdapterError,
     SearchProfileDiscoveryAdapterError,
@@ -41,6 +44,7 @@ from app.modules.company_discovery import (
     SearchProfileDiscoveryService,
     provider_result_to_ingestion_item,
 )
+from app.modules.company_discovery.schemas import ProviderErrorCode
 from app.modules.company_import.schemas import CompanyIngestionItem
 from app.modules.search_profile.query_generation import SearchProfileQueryGenerator
 from app.modules.search_profile.schemas import (
@@ -71,7 +75,7 @@ class RecordingQueryGenerator:
 class FakeProvider:
     def __init__(
         self,
-        outcomes: Sequence[DiscoveryProviderResponse | Exception],
+        outcomes: Sequence[DiscoveryProviderResponse | BaseException],
         *,
         provider_name: str = "fake",
     ) -> None:
@@ -89,10 +93,14 @@ class FakeProvider:
         self.queries.append(query)
         outcome = self.outcomes[len(self.queries) - 1]
 
-        if isinstance(outcome, Exception):
+        if isinstance(outcome, BaseException):
             raise outcome
 
         return outcome
+
+
+class FatalProviderSignal(BaseException):
+    """Non-standard provider signal intentionally not wrapped by service."""
 
 
 def make_profile(*, enabled: bool = True) -> SearchProfileRead:
@@ -333,16 +341,34 @@ def test_query_remains_when_all_results_fail_adaptation(
     ("provider_error", "code", "message", "stop_reason"),
     [
         (
+            DiscoveryProviderAuthenticationError("unsafe detail"),
+            "authentication_error",
+            "Discovery provider authentication failed.",
+            "authentication_error",
+        ),
+        (
             DiscoveryProviderConfigurationError("unsafe detail"),
             "configuration_error",
             "Discovery provider is not configured.",
             "configuration_error",
         ),
         (
+            DiscoveryProviderQuotaExceededError("unsafe detail"),
+            "quota_exceeded",
+            "Discovery provider quota was exceeded.",
+            "quota_exceeded",
+        ),
+        (
             DiscoveryProviderRateLimitError("unsafe detail"),
             "rate_limit_error",
             "Discovery provider rate limit exceeded.",
             "rate_limit_error",
+        ),
+        (
+            DiscoveryProviderResponseTooLargeError("unsafe detail"),
+            "response_too_large",
+            "Discovery provider response exceeded the allowed size.",
+            "response_too_large",
         ),
         (
             DiscoveryProviderError("unsafe detail"),
@@ -429,6 +455,17 @@ def test_unknown_provider_exception_is_not_swallowed() -> None:
         service.run_dry(make_profile(), provider)
 
 
+def test_fatal_provider_signal_is_not_wrapped_or_stopped_safely() -> None:
+    queries = [make_query(1), make_query(2)]
+    service, _ = make_service(make_preview(queries))
+    provider = FakeProvider([FatalProviderSignal("fatal signal"), make_response(queries[1])])
+
+    with pytest.raises(FatalProviderSignal, match="fatal signal"):
+        service.run_dry(make_profile(), provider)
+
+    assert provider.queries == [queries[0]]
+
+
 def test_disabled_profile_does_not_call_generator_or_provider() -> None:
     query = make_query(1)
     service, generator = make_service(make_preview([query]))
@@ -507,13 +544,15 @@ def test_error_schema_messages_are_normalized_and_required() -> None:
         SearchProfileDiscoveryAdapterError(position=0, message="Failed.")
 
 
-@pytest.mark.parametrize(
-    "change",
-    [
-        lambda values: values.update(adapted_item_count=1),
-        lambda values: values.update(adapter_error_count=1),
-    ],
-)
+def _set_adapted_item_count(values: dict[str, object]) -> None:
+    values["adapted_item_count"] = 1
+
+
+def _set_adapter_error_count(values: dict[str, object]) -> None:
+    values["adapter_error_count"] = 1
+
+
+@pytest.mark.parametrize("change", [_set_adapted_item_count, _set_adapter_error_count])
 def test_query_result_rejects_inconsistent_counters(
     change: Callable[[dict[str, object]], None],
 ) -> None:
@@ -532,16 +571,44 @@ def test_query_result_rejects_inconsistent_counters(
         SearchProfileDiscoveryQueryResult.model_validate(values)
 
 
+def _set_executed_queries_zero(values: dict[str, object]) -> None:
+    values["executed_queries"] = 0
+
+
+def _set_total_provider_results_one(values: dict[str, object]) -> None:
+    values["total_provider_results"] = 1
+
+
+def _set_total_adapted_items_one(values: dict[str, object]) -> None:
+    values["total_adapted_items"] = 1
+
+
+def _set_total_adapter_errors_one(values: dict[str, object]) -> None:
+    values["total_adapter_errors"] = 1
+
+
+def _set_total_provider_errors_one(values: dict[str, object]) -> None:
+    values["total_provider_errors"] = 1
+
+
+def _set_query_count_zero(values: dict[str, object]) -> None:
+    values["query_count"] = 0
+
+
+def _set_estimated_provider_requests_two(values: dict[str, object]) -> None:
+    values["estimated_provider_requests"] = 2
+
+
 @pytest.mark.parametrize(
     "change",
     [
-        lambda values: values.update(executed_queries=0),
-        lambda values: values.update(total_provider_results=1),
-        lambda values: values.update(total_adapted_items=1),
-        lambda values: values.update(total_adapter_errors=1),
-        lambda values: values.update(total_provider_errors=1),
-        lambda values: values.update(query_count=0),
-        lambda values: values.update(estimated_provider_requests=2),
+        _set_executed_queries_zero,
+        _set_total_provider_results_one,
+        _set_total_adapted_items_one,
+        _set_total_adapter_errors_one,
+        _set_total_provider_errors_one,
+        _set_query_count_zero,
+        _set_estimated_provider_requests_two,
     ],
 )
 def test_dry_run_result_rejects_inconsistent_totals(
@@ -566,6 +633,55 @@ def test_dry_run_result_requires_consistent_stop_state() -> None:
 
     with pytest.raises(ValidationError):
         SearchProfileDiscoveryDryRunResult.model_validate(reason_without_stop)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "authentication_error",
+        "configuration_error",
+        "quota_exceeded",
+        "rate_limit_error",
+        "response_error",
+        "response_too_large",
+        "provider_error",
+    ],
+)
+def test_known_provider_error_code_is_accepted(value: str) -> None:
+    error = SearchProfileDiscoveryProviderError(code=value, message="ok")
+    assert error.code == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "authentication_error",
+        "configuration_error",
+        "quota_exceeded",
+        "rate_limit_error",
+        "response_too_large",
+        "provider_error",
+    ],
+)
+def test_known_stop_reason_is_accepted(value: str) -> None:
+    values = make_dry_run_values()
+    values.update(stopped_early=True, stop_reason=value)
+    report = SearchProfileDiscoveryDryRunResult.model_validate(values)
+    assert report.stop_reason == value
+
+
+@pytest.mark.parametrize("value", [42, True, None, "done", "success"])
+def test_unknown_provider_error_code_is_rejected(value: object) -> None:
+    with pytest.raises(ValidationError):
+        SearchProfileDiscoveryProviderError(code=cast(ProviderErrorCode, value), message="ok")
+
+
+@pytest.mark.parametrize("value", [42, True, None, "done", "success"])
+def test_unknown_stop_reason_is_rejected(value: object) -> None:
+    values = make_dry_run_values()
+    values.update(stopped_early=True, stop_reason=value)
+    with pytest.raises(ValidationError):
+        SearchProfileDiscoveryDryRunResult.model_validate(values)
 
 
 def test_schema_list_defaults_are_independent() -> None:
