@@ -578,12 +578,51 @@ def test_country_codes_validation_rejects_plain_string_and_empty_collection() ->
         SearchProfileRunOptions(country_codes=[])
 
 
+def test_country_codes_validation_uses_normalized_unique_limit() -> None:
+    options = SearchProfileRunOptions(country_codes=["US"] * 21)
+    assert options.country_codes == ("US",)
+
+    duplicates = ["us", " DE ", "US"] * 7 + ["DE", " gb "]
+    duplicates_snapshot = list(duplicates)
+    options = SearchProfileRunOptions(country_codes=duplicates)
+    assert options.country_codes == ("DE", "GB", "US")
+    assert duplicates == duplicates_snapshot
+
+
 def test_country_codes_validation_rejects_unknown_or_invalid_codes() -> None:
     with pytest.raises(ValidationError):
         SearchProfileRunOptions(country_codes=("ZZ",))
 
     with pytest.raises(ValidationError):
         SearchProfileRunOptions(country_codes=("UK",))
+
+
+def test_country_codes_validation_rejects_too_many_unique_values() -> None:
+    codes = [
+        "US",
+        "DE",
+        "FR",
+        "GB",
+        "ID",
+        "CA",
+        "AU",
+        "JP",
+        "CN",
+        "IN",
+        "ES",
+        "IT",
+        "BR",
+        "MX",
+        "RU",
+        "NL",
+        "SE",
+        "NO",
+        "FI",
+        "DK",
+        "AR",
+    ]
+    with pytest.raises(ValidationError):
+        SearchProfileRunOptions(country_codes=codes)
 
 
 def test_country_codes_validation_limits_collection_size() -> None:
@@ -736,6 +775,50 @@ def test_override_country_codes_are_sorted_deduplicated_and_city_cross_product()
         "buyers Paris United States",
     ]
     assert [query.country_code for query in preview.queries] == ["DE", "DE", "GB", "GB", "US", "US"]
+
+
+def test_duplicate_heavy_override_does_not_expand_queries_beyond_unique_targets() -> None:
+    profile = make_profile(
+        target_customer_types=["buyers"],
+        cities=["Berlin", "Paris"],
+        query_templates=["{target_customer_type} {city} {country}"],
+    )
+
+    preview = generate(
+        profile,
+        SearchProfileRunOptions(
+            country_codes=(
+                "US",
+                "us",
+                " US ",
+                "DE",
+                "de",
+                "DE ",
+                "GB",
+                "gb",
+                "Gb",
+            )
+            * 3
+            + ("US",),
+        ),
+    )
+
+    assert [query.country_code for query in preview.queries] == [
+        "DE",
+        "DE",
+        "GB",
+        "GB",
+        "US",
+        "US",
+    ]
+    assert [query.country for query in preview.queries] == [
+        "Germany",
+        "Germany",
+        "United Kingdom",
+        "United Kingdom",
+        "United States",
+        "United States",
+    ]
 
 
 def test_override_does_not_mutate_profile() -> None:

@@ -74,13 +74,15 @@ def normalize_iso_country_codes(
     for item in cast(Iterable[object], values):
         normalized.append(normalize_iso_country_code(item))
 
-    if not allow_empty and not normalized:
-        raise ValueError("At least one country code is required.")
+    normalized_unique = tuple(sorted({code for code in normalized if code is not None}))
 
-    if len(normalized) > max_items:
+    if len(normalized_unique) > max_items:
         raise ValueError("Too many country codes.")
 
-    return tuple(sorted({code for code in normalized if code is not None}))
+    if not allow_empty and not normalized_unique:
+        raise ValueError("At least one country code is required.")
+
+    return normalized_unique
 
 
 def _normalize_text(value: str) -> str:

@@ -97,6 +97,17 @@ def test_deterministic_collection_sorting() -> None:
     )
 
 
+def test_duplicate_overflow_is_accepted_when_normalized() -> None:
+    assert normalize_iso_country_codes(["US"] * 21, max_items=20) == ("US",)
+
+
+def test_duplicate_normalized_codes_can_exceed_unique_limit() -> None:
+    assert normalize_iso_country_codes(
+        ["us"] * 10 + [" US "] * 10 + ["US"] * 10,
+        max_items=20,
+    ) == ("US",)
+
+
 def test_empty_explicit_collection_rejected() -> None:
     with pytest.raises(ValueError):
         normalize_iso_country_codes([], max_items=20)
@@ -163,6 +174,193 @@ def test_too_many_codes_rejected() -> None:
             ),
             max_items=20,
         )
+
+
+def test_twenty_unique_codes_are_accepted() -> None:
+    normalized = normalize_iso_country_codes(
+        (
+            "US",
+            "DE",
+            "FR",
+            "GB",
+            "ID",
+            "CA",
+            "AU",
+            "JP",
+            "CN",
+            "IN",
+            "ES",
+            "IT",
+            "BR",
+            "MX",
+            "RU",
+            "NL",
+            "SE",
+            "NO",
+            "FI",
+            "DK",
+        ),
+        max_items=20,
+    )
+    assert normalized == (
+        "AU",
+        "BR",
+        "CA",
+        "CN",
+        "DE",
+        "DK",
+        "ES",
+        "FI",
+        "FR",
+        "GB",
+        "ID",
+        "IN",
+        "IT",
+        "JP",
+        "MX",
+        "NL",
+        "NO",
+        "RU",
+        "SE",
+        "US",
+    )
+    assert len(normalized) == 20
+
+
+def test_twenty_one_unique_codes_are_rejected() -> None:
+    with pytest.raises(ValueError):
+        normalize_iso_country_codes(
+            (
+                "US",
+                "DE",
+                "FR",
+                "GB",
+                "ID",
+                "CA",
+                "AU",
+                "JP",
+                "CN",
+                "IN",
+                "ES",
+                "IT",
+                "BR",
+                "MX",
+                "RU",
+                "NL",
+                "SE",
+                "NO",
+                "FI",
+                "DK",
+                "AR",
+                "BE",
+            ),
+            max_items=20,
+        )
+
+
+def test_duplicate_heavy_inputs_with_twenty_unique_codes_are_accepted() -> None:
+    assert normalize_iso_country_codes(
+        (
+            "us",
+            "DE",
+            "FR",
+            "GB",
+            "ID",
+            "CA",
+            "AU",
+            "JP",
+            "CN",
+            "IN",
+            "ES",
+            "IT",
+            "BR",
+            "MX",
+            "RU",
+            "NL",
+            "SE",
+            "NO",
+            "FI",
+            "DK",
+            "US",
+            "DE",
+            "FR",
+            "GB",
+            "ID",
+            "CA",
+            "AU",
+            "JP",
+            "CN",
+            "IN",
+        ),
+        max_items=20,
+    ) == (
+        "AU",
+        "BR",
+        "CA",
+        "CN",
+        "DE",
+        "DK",
+        "ES",
+        "FI",
+        "FR",
+        "GB",
+        "ID",
+        "IN",
+        "IT",
+        "JP",
+        "MX",
+        "NL",
+        "NO",
+        "RU",
+        "SE",
+        "US",
+    )
+
+
+def test_duplicate_heavy_inputs_with_twenty_one_unique_codes_are_rejected() -> None:
+    with pytest.raises(ValueError):
+        normalize_iso_country_codes(
+            (
+                "US",
+                "DE",
+                "FR",
+                "GB",
+                "ID",
+                "CA",
+                "AU",
+                "JP",
+                "CN",
+                "IN",
+                "ES",
+                "IT",
+                "BR",
+                "MX",
+                "RU",
+                "NL",
+                "SE",
+                "NO",
+                "FI",
+                "DK",
+                "AR",
+                "BE",
+                "US",
+                "DE",
+                "FR",
+                "GB",
+                "ID",
+                "CA",
+                "AU",
+                "JP",
+                "CN",
+                "IN",
+            ),
+            max_items=20,
+        )
+
+
+def test_duplicate_overflow_does_not_hide_invalid_values() -> None:
+    with pytest.raises(ValueError):
+        normalize_iso_country_codes(["US"] * 25 + ["ZZ"], max_items=20)
 
 
 def test_country_target_is_frozen() -> None:
