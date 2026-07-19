@@ -74,7 +74,7 @@ class SerpApiClient:
         city: str | None,
         industry: str | None,
         limit: int,
-        google_country_code: str | None = None,
+        iso_country_code: str | None = None,
     ) -> SerpApiSearchResponse:
         if not self._api_key:
             raise SerpApiConfigurationError("SERPAPI_API_KEY is required to use SerpAPI.")
@@ -82,7 +82,7 @@ class SerpApiClient:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise SerpApiRequestError("SerpAPI result limit must be between 1 and 100.")
 
-        request_google_country_code = self._normalize_serpapi_country_code(google_country_code)
+        request_google_country_code = self._normalize_iso_country_code(iso_country_code)
 
         search_query = self._build_search_query(
             query=query,
@@ -254,18 +254,21 @@ class SerpApiClient:
 
         return " ".join(parts)
 
-    def _normalize_serpapi_country_code(self, google_country_code: str | None) -> str | None:
-        if google_country_code is None:
+    def _normalize_iso_country_code(self, iso_country_code: str | None) -> str | None:
+        if iso_country_code is None:
             return None
 
-        if isinstance(google_country_code, bool) or not isinstance(google_country_code, str):
-            raise SerpApiRequestError("SerpAPI country code must be a non-empty string.")
+        if isinstance(iso_country_code, bool) or not isinstance(iso_country_code, str):
+            raise SerpApiRequestError("SerpAPI country code was invalid.") from None
 
-        normalized = google_country_code.strip()
+        normalized = iso_country_code.strip()
         if not normalized:
-            raise SerpApiRequestError("SerpAPI country code must be a non-empty string.")
+            raise SerpApiRequestError("SerpAPI country code was invalid.") from None
 
-        return get_country_target(normalized).serpapi_gl
+        try:
+            return get_country_target(normalized).serpapi_gl
+        except ValueError:
+            raise SerpApiRequestError("SerpAPI country code was invalid.") from None
 
     def _parse_company_result(self, raw_result: object) -> SerpApiCompanyResult | None:
         if not isinstance(raw_result, dict):

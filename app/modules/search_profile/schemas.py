@@ -2,7 +2,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.core.country_targets import normalize_iso_country_codes
+from app.core.country_targets import normalize_iso_country_code, normalize_iso_country_codes
 
 
 def _normalize_text(value: str) -> str:
@@ -209,6 +209,13 @@ class SearchQuery(BaseModel):
     source_template: str
     country_code: str | None = None
     limit: int
+
+    @field_validator("country_code", mode="before")
+    @classmethod
+    def normalize_country_code(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return normalize_iso_country_code(value)
 
 
 class SearchProfileRunOptions(BaseModel):

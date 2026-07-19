@@ -454,6 +454,122 @@ def test_search_query_accepts_country_code_none_and_rejects_unknown_types() -> N
         )
 
 
+def test_country_code_in_search_query_accepts_none_and_canonicalizes_input() -> None:
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code=None,
+            limit=10,
+        ).country_code
+        is None
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="us",
+            limit=10,
+        ).country_code
+        == "US"
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code=" de ",
+            limit=10,
+        ).country_code
+        == "DE"
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="gb",
+            limit=10,
+        ).country_code
+        == "GB"
+    )
+
+    assert (
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="ID",
+            limit=10,
+        ).country_code
+        == "ID"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "UK",
+        "ZZ",
+        "SU",
+        "",
+        "   ",
+        "United States",
+        "Germany",
+        "not-an-code",
+        True,
+        123,
+        object(),
+    ],
+)
+def test_search_query_rejects_invalid_country_code_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code=value,
+            limit=10,
+        )
+
+
+def test_search_query_rejects_markup_country_code() -> None:
+    with pytest.raises(ValidationError):
+        SearchQuery(
+            text="sample",
+            profile_id=1,
+            profile_name="Profile",
+            country="US",
+            city=None,
+            source_template="{target_customer_type} {country}",
+            country_code="<US>",
+            limit=10,
+        )
+
+
 def test_country_codes_validation_rejects_plain_string_and_empty_collection() -> None:
     with pytest.raises(ValidationError):
         SearchProfileRunOptions(country_codes="US")
