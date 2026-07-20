@@ -1,7 +1,11 @@
-from typing import Annotated
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import Annotated, Literal, Protocol, cast
 
 import typer
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from app.core.config.settings import settings
 from app.core.database.session import SessionLocal
@@ -16,7 +20,17 @@ from app.modules.company_discovery import (
     SearchProfileDiscoveryService,
     SerpApiDiscoveryProvider,
 )
+from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
+from app.modules.company_discovery.staging_orchestration import (
+    CompanyDiscoveryStagingService,
+    CompanyDiscoveryStagingServiceError,
+)
+from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
+from app.modules.company_discovery.staging_service_schemas import (
+    CompanyDiscoveryStagingRunResult,
+)
 from app.modules.company_import.schemas import CompanyIngestionError
+from app.modules.project import ProjectRepository, ProjectService
 from app.modules.search_profile import (
     SearchProfileQueryGenerationError,
     SearchProfileQueryGenerator,
@@ -27,6 +41,7 @@ from app.modules.search_profile import (
 from app.providers.serpapi import SerpApiClient, SerpApiError
 
 app = typer.Typer(help="Company discovery commands.")
+_STAGING_DISPLAY_CANDIDATES = 50
 
 
 @app.command("run-profile")
@@ -134,6 +149,53 @@ def run_search_profile(
 
     if persistence_report.stopped_early:
         raise typer.Exit(1)
+
+
+@app.command("stage-profile")
+def stage_profile(
+    profile_id: Annotated[int, typer.Option(help="Search profile ID to execute.")],
+    provider: Annotated[str, typer.Option(help="Discovery provider name.")] = "serpapi",
+    country: Annotated[
+        list[str] | None,
+        typer.Option("--country", help="Explicit country override code; repeat as needed."),
+    ] = None,
+    max_queries: Annotated[
+        int | None,
+        typer.Option(help="Lower the maximum query count."),
+    ] = None,
+    result_limit_per_query: Annotated[
+        int | None,
+        typer.Option(help="Lower the result limit per query."),
+    ] = None,
+    total_result_ceiling: Annotated[
+        int | None,
+        typer.Option(help="Lower the result ceiling."),
+    ] = None,
+    persist: Annotated[
+        bool,
+        typer.Option("--persist", help="Persist staging candidates and final state."),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Confirm the requested persistence."),
+    ] = False,
+) -> None:
+    """Execute an existing search profile through a safe staging pipeline."""
+    outcome = execute_stage_profile(
+        profile_id=profile_id,
+        provider=provider,
+        country_codes=country,
+        max_queries=max_queries,
+        result_limit_per_query=result_limit_per_query,
+        total_result_ceiling=total_result_ceiling,
+        persist=persist,
+        yes=yes,
+    )
+    if outcome.error_message is not None:
+        typer.secho(outcome.error_message, fg=typer.colors.RED)
+    elif outcome.result is not None:
+        _print_stage_result(outcome.result)
+    raise typer.Exit(outcome.exit_code)
 
 
 @app.callback(invoke_without_command=True)
@@ -372,3 +434,291 @@ def _print_profile_query_results(report: SearchProfileDiscoveryDryRunResult) -> 
         for error in query_result.adapter_errors:
             position = error.position if error.position is not None else ""
             typer.echo(f"- Adapter error at position {position}: {error.message}")
+
+
+@dataclass(frozen=True)
+class StageProfileCommandOutcome:
+    exit_code: int
+    result: CompanyDiscoveryStagingRunResult | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class _ProjectService(Protocol):
+    def get(self, project_id: int) -> object | None: ...
+
+
+def execute_stage_profile(
+    *,
+    profile_id: int,
+    provider: str,
+    country_codes: list[str] | None,
+    max_queries: int | None,
+    result_limit_per_query: int | None,
+    total_result_ceiling: int | None,
+    persist: bool,
+    yes: bool,
+    session_factory: Callable[[], Session] | None = None,
+    search_profile_service_factory: Callable[[SearchProfileRepository], SearchProfileService]
+    | None = None,
+    project_service_factory: Callable[[ProjectRepository], object] | None = None,
+    repository_factory: Callable[[Session], CompanyDiscoveryStagingRepository] | None = None,
+    service_factory: Callable[
+        [CompanyDiscoveryStagingRepository | None], CompanyDiscoveryStagingService
+    ]
+    | None = None,
+    provider_factory: Callable[[], SerpApiDiscoveryProvider] | None = None,
+) -> StageProfileCommandOutcome:
+    if isinstance(profile_id, bool) or not isinstance(profile_id, int) or profile_id <= 0:
+        return StageProfileCommandOutcome(exit_code=1, error_message="Invalid profile ID.")
+
+    if not persist and yes:
+        return StageProfileCommandOutcome(
+            exit_code=1,
+            error_message="--yes is valid only with --persist.",
+        )
+
+    normalized_provider = provider.casefold().strip()
+    if normalized_provider != "serpapi":
+        return StageProfileCommandOutcome(
+            exit_code=1,
+            error_message="Unsupported provider.",
+        )
+
+    if persist and not yes:
+        return StageProfileCommandOutcome(
+            exit_code=1,
+            error_message="Persistence requires --yes.",
+        )
+
+    try:
+        run_options = SearchProfileRunOptions(
+            max_queries=max_queries,
+            result_limit_per_query=result_limit_per_query,
+            total_result_ceiling=total_result_ceiling,
+            country_codes=tuple(country_codes) if country_codes else None,
+        )
+    except ValidationError:
+        return StageProfileCommandOutcome(
+            exit_code=1,
+            error_message="Invalid staging run options.",
+        )
+
+    previewed_country_codes = run_options.country_codes
+    make_provider = provider_factory or _build_staging_discovery_provider
+    make_search_profile_service = search_profile_service_factory or SearchProfileService
+    make_project_service = project_service_factory or ProjectService
+    make_repository = repository_factory or CompanyDiscoveryStagingRepository
+    make_service = service_factory or CompanyDiscoveryStagingService
+
+    make_session = session_factory or SessionLocal
+
+    if persist:
+        session: Session | None = None
+        try:
+            with make_session() as session:
+                profile_service = make_search_profile_service(SearchProfileRepository(session))
+                profile = profile_service.get(profile_id)
+                if profile is None:
+                    return StageProfileCommandOutcome(
+                        exit_code=1,
+                        error_message="Invalid profile ID.",
+                    )
+
+                if not profile.enabled:
+                    return StageProfileCommandOutcome(
+                        exit_code=1,
+                        error_message="Search profile is disabled.",
+                    )
+
+                project = cast(
+                    _ProjectService, make_project_service(ProjectRepository(session))
+                ).get(profile.project_id)
+                if project is None:
+                    return StageProfileCommandOutcome(
+                        exit_code=1,
+                        error_message="Invalid profile-project relationship.",
+                    )
+
+                normalized_options = run_options.model_copy(
+                    update={"country_codes": previewed_country_codes}
+                )
+                SearchProfileQueryGenerator().generate_preview(profile, normalized_options)
+
+                staging_provider = make_provider()
+                staging_repository = make_repository(session)
+                staging_service = make_service(staging_repository)
+                report = staging_service.run(
+                    profile=profile,
+                    provider=staging_provider,
+                    options=normalized_options,
+                    dry_run=False,
+                    repository=staging_repository,
+                )
+                _invoke_session_method(session, "commit")
+        except SearchProfileDiscoveryExecutionError:
+            if session is not None:
+                _safe_rollback(session)
+            return StageProfileCommandOutcome(exit_code=1, error_message="Execution failed.")
+        except CompanyDiscoveryStagingServiceError:
+            if session is not None:
+                _safe_rollback(session)
+            return StageProfileCommandOutcome(exit_code=1, error_message="Execution failed.")
+        except SearchProfileQueryGenerationError:
+            if session is not None:
+                _safe_rollback(session)
+            return StageProfileCommandOutcome(
+                exit_code=1,
+                error_message="Invalid staging run options.",
+            )
+        except ValidationError:
+            if session is not None:
+                _safe_rollback(session)
+            return StageProfileCommandOutcome(
+                exit_code=1,
+                error_message="Invalid staging run options.",
+            )
+        except Exception:
+            if session is not None:
+                _safe_rollback(session)
+            return StageProfileCommandOutcome(
+                exit_code=1,
+                error_message="Staging persistence failed.",
+            )
+
+        return StageProfileCommandOutcome(
+            exit_code=_exit_code_for_staging_status(report.status),
+            result=report,
+        )
+
+    try:
+        with make_session() as session:
+            profile_service = make_search_profile_service(SearchProfileRepository(session))
+            profile = profile_service.get(profile_id)
+            if profile is None:
+                return StageProfileCommandOutcome(
+                    exit_code=1,
+                    error_message="Invalid profile ID.",
+                )
+
+            if not profile.enabled:
+                return StageProfileCommandOutcome(
+                    exit_code=1,
+                    error_message="Search profile is disabled.",
+                )
+
+            project = cast(_ProjectService, make_project_service(ProjectRepository(session))).get(
+                profile.project_id
+            )
+            if project is None:
+                return StageProfileCommandOutcome(
+                    exit_code=1,
+                    error_message="Invalid profile-project relationship.",
+                )
+
+            normalized_options = run_options.model_copy(
+                update={"country_codes": previewed_country_codes}
+            )
+            SearchProfileQueryGenerator().generate_preview(profile, normalized_options)
+
+            report = make_service(None).run(
+                profile=profile,
+                provider=make_provider(),
+                options=normalized_options,
+                dry_run=True,
+                repository=None,
+            )
+    except SearchProfileQueryGenerationError:
+        return StageProfileCommandOutcome(
+            exit_code=1,
+            error_message="Invalid staging run options.",
+        )
+    except ValidationError:
+        return StageProfileCommandOutcome(
+            exit_code=1,
+            error_message="Invalid staging run options.",
+        )
+    except SearchProfileDiscoveryExecutionError:
+        return StageProfileCommandOutcome(exit_code=1, error_message="Execution failed.")
+    except CompanyDiscoveryStagingServiceError:
+        return StageProfileCommandOutcome(exit_code=1, error_message="Execution failed.")
+    except Exception:
+        return StageProfileCommandOutcome(
+            exit_code=1,
+            error_message="Command failed.",
+        )
+
+    return StageProfileCommandOutcome(
+        exit_code=_exit_code_for_staging_status(report.status),
+        result=report,
+    )
+
+
+def _exit_code_for_staging_status(status: CompanyDiscoveryRunStatus) -> int:
+    if status in (CompanyDiscoveryRunStatus.SUCCEEDED, CompanyDiscoveryRunStatus.NOT_FOUND):
+        return 0
+    return 1
+
+
+def _print_stage_result(result: CompanyDiscoveryStagingRunResult) -> None:
+    typer.echo(f"Mode: {'DRY_RUN' if result.dry_run else 'PERSIST'}")
+    typer.echo(f"Project ID: {result.project_id}")
+    typer.echo(f"Search Profile ID: {result.search_profile_id}")
+    typer.echo(f"Profile Name: {result.profile_name}")
+    typer.echo(f"Provider: {result.provider}")
+    typer.echo(f"Status: {result.status.value}")
+    typer.echo(f"Request Fingerprint: {result.request_fingerprint}")
+    typer.echo(f"Query Count: {result.query_count}")
+    typer.echo(f"Executed Queries: {result.executed_queries}")
+    typer.echo(f"Successful Queries: {result.successful_queries}")
+    typer.echo(f"Provider Result Count: {result.provider_result_count}")
+    typer.echo(f"Provider Error Count: {result.provider_error_count}")
+    typer.echo(f"Existing Adapter Error Count: {result.existing_adapter_error_count}")
+    typer.echo(f"Rejected Candidate Count: {result.rejected_candidate_count}")
+    typer.echo(f"Duplicate Candidate Count: {result.duplicate_candidate_count}")
+    typer.echo(f"Unique Candidate Count: {result.unique_candidate_count}")
+    typer.echo(f"Candidate Upserts: {result.candidate_upserts}")
+    typer.echo(f"Candidates Created: {result.candidates_created}")
+    typer.echo(f"Candidates Updated: {result.candidates_updated}")
+    typer.echo(f"Candidates Protected: {result.candidates_protected}")
+    typer.echo(f"Run ID: {result.run_id if result.run_id is not None else ''}")
+    typer.echo(f"Run Persisted: {'yes' if result.run_persisted else 'no'}")
+    typer.echo(f"Stopped Early: {result.stopped_early}")
+    typer.echo(f"Stop Reason: {result.stop_reason or ''}")
+    typer.echo(f"Error Code: {result.error_code or ''}")
+
+    displayed = result.candidates[:_STAGING_DISPLAY_CANDIDATES]
+    for index, candidate in enumerate(displayed, start=1):
+        typer.echo(f"Candidate {index}")
+        typer.echo(f"  Name: {candidate.name or ''}")
+        typer.echo(f"  Normalized Website: {candidate.website or ''}")
+        typer.echo(f"  Website Identity: {candidate.website_identity or ''}")
+        typer.echo(f"  Country Code: {candidate.country_code or ''}")
+        typer.echo(f"  Best Position: {candidate.best_position or ''}")
+        typer.echo(f"  Identity Key: {candidate.identity_key}")
+
+    hidden = len(result.candidates) - len(displayed)
+    if hidden > 0:
+        typer.echo(f"Additional candidates not displayed: {hidden}")
+
+
+def _safe_rollback(session: Session) -> None:
+    with suppress(Exception):
+        _invoke_session_method(session, "rollback")
+
+
+def _invoke_session_method(session: Session, method: Literal["commit", "rollback"]) -> None:
+    callback = getattr(session, method)
+    if not callable(callback):
+        raise TypeError(f"Session method not callable: {method}")
+
+    callback()
+
+
+def _build_staging_discovery_provider() -> SerpApiDiscoveryProvider:
+    client = SerpApiClient(
+        api_key=settings.serpapi_api_key,
+        base_url=settings.serpapi_base_url,
+        timeout_seconds=settings.serpapi_timeout_seconds,
+    )
+    return SerpApiDiscoveryProvider(client)
