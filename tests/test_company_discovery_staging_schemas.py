@@ -491,3 +491,76 @@ def test_staging_run_result_protected_updated_overlap_is_allowed() -> None:
     )
     assert result.candidates_updated == 1
     assert result.candidates_protected == 1
+
+
+def test_candidate_preview_normalizes_name_and_website_and_country_code() -> None:
+    preview = CompanyDiscoveryStagingCandidatePreview(
+        name="  Acme   Co.  ",
+        website="https://WWW.Example.COM/search?q=One",
+        website_identity=" example ",
+        country_code="de",
+        best_position=1,
+        identity_key="name_country:acme co|DE",
+    )
+
+    assert preview.name == "Acme Co."
+    assert preview.website == "https://www.example.com/search?q=One"
+    assert preview.website_identity == "example"
+    assert preview.country_code == "DE"
+
+
+def test_candidate_preview_rejects_invalid_country_codes() -> None:
+    for code in ["UK", "ZZ", "SU", "DEU", "", "12", "<DE>"]:
+        with pytest.raises(ValidationError):
+            CompanyDiscoveryStagingCandidatePreview(
+                name="Acme",
+                website="https://example.com",
+                website_identity="example.com",
+                country_code=code,
+                best_position=1,
+                identity_key="name_country:acme|DE",
+            )
+
+
+def test_candidate_preview_rejects_markup_and_empty_identity_key() -> None:
+    with pytest.raises(ValidationError):
+        CompanyDiscoveryStagingCandidatePreview(
+            name="Acme",
+            website="https://example.com",
+            website_identity="example.com",
+            country_code="DE",
+            best_position=1,
+            identity_key="",
+        )
+
+    with pytest.raises(ValidationError):
+        CompanyDiscoveryStagingCandidatePreview(
+            name="Acme",
+            website="https://example.com",
+            website_identity="<tag>",
+            country_code="DE",
+            best_position=1,
+            identity_key=" name_country:acme|de ",
+        )
+
+
+def test_candidate_preview_rejects_invalid_website_and_invalid_query_text() -> None:
+    with pytest.raises(ValidationError):
+        CompanyDiscoveryStagingCandidatePreview(
+            name="Acme",
+            website="not a url",
+            website_identity="example.com",
+            country_code="DE",
+            best_position=1,
+            identity_key="name_country:acme|DE",
+        )
+
+    with pytest.raises(ValidationError):
+        CompanyDiscoveryStagingCandidatePreview(
+            name="Acme <tag>",
+            website="https://example.com",
+            website_identity="example.com",
+            country_code="DE",
+            best_position=1,
+            identity_key="name_country:acme|DE",
+        )

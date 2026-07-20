@@ -609,3 +609,450 @@ def test_base_exception_is_not_caught_by_orchestrator() -> None:
             dry_run=True,
             repository=None,
         )
+
+
+class FakeProviderNameProvider:
+    def __init__(self, provider_name: object) -> None:
+        self.provider_name = provider_name
+
+    def search(self, query: SearchQuery) -> None:
+        raise AssertionError(query.text)
+
+
+class BadProviderNameProperty:
+    def __init__(self, provider_name: object) -> None:
+        self._provider_name = provider_name
+
+    @property
+    def provider_name(self) -> object:
+        if isinstance(self._provider_name, BaseException):
+            raise self._provider_name
+        return self._provider_name
+
+    def search(self, query: SearchQuery) -> None:
+        raise AssertionError(query.text)
+
+
+class ExecutionResultNoModelDump:
+    pass
+
+
+class ExecutionResultMalformedPayload:
+    def model_dump(self) -> object:
+        return {"not": "a", "provider": 1}
+
+
+class ExecutionResultNestedQueryInvalid:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+    def model_dump(self) -> object:
+        return self.payload
+
+
+def test_dry_run_with_malformed_execution_result_without_model_dump_is_deterministic() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    repository = RecordingRepository()
+    service = make_run(
+        FakeDiscoveryExecutionService(
+            cast(SearchProfileDiscoveryDryRunResult, ExecutionResultNoModelDump())
+        ),
+        FakeQueryGenerator(preview),
+    )
+
+    result = service.run(
+        profile=make_profile(),
+        provider=FakeProvider(),
+        options=SearchProfileRunOptions(),
+        dry_run=True,
+        repository=cast(CompanyDiscoveryStagingRepository, repository),
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "execution_invalid"
+    assert result.query_count == 1
+    assert result.executed_queries == 0
+    assert result.provider_result_count == 0
+    assert result.candidate_upserts == 0
+    assert result.run_id is None
+    assert repository.calls == []
+
+
+def test_persisted_run_with_malformed_execution_result_without_model_dump_is_safe() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=2,
+        estimated_provider_requests=2,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query, query],
+    )
+    repository = RecordingRepository()
+    service = make_run(
+        FakeDiscoveryExecutionService(
+            cast(SearchProfileDiscoveryDryRunResult, ExecutionResultNoModelDump())
+        ),
+        FakeQueryGenerator(preview),
+    )
+
+    result = service.run(
+        profile=make_profile(),
+        provider=FakeProvider(),
+        options=SearchProfileRunOptions(),
+        dry_run=False,
+        repository=cast(CompanyDiscoveryStagingRepository, repository),
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "execution_invalid"
+    assert result.query_count == 2
+    assert result.executed_queries == 0
+    assert result.provider_result_count == 0
+    assert result.run_id == 1
+    assert result.run_persisted is True
+    assert result.candidate_upserts == 0
+    assert len(repository.calls) == 2
+    assert repository.calls[0][0] == "create_run"
+    assert repository.calls[1][0] == "update_run"
+
+
+def test_dry_run_with_malformed_execution_result_nested_query_is_safe() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    valid_result = make_dry_result([query], [make_query_result(query)])
+    payload = valid_result.model_dump()
+    payload["query_results"] = [
+        {
+            "query": "not-a-query",
+            "provider": "fake",
+            "provider_result_count": 1,
+            "adapted_item_count": 0,
+            "adapter_error_count": 0,
+            "provider_error": None,
+            "items": [],
+            "adapter_errors": [],
+        }
+    ]
+
+    service = make_run(
+        FakeDiscoveryExecutionService(
+            cast(SearchProfileDiscoveryDryRunResult, ExecutionResultNestedQueryInvalid(payload))
+        ),
+        FakeQueryGenerator(preview),
+    )
+    result = service.run(
+        profile=make_profile(),
+        provider=FakeProvider(),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "execution_invalid"
+    assert result.query_count == 1
+    assert result.executed_queries == 0
+    assert result.provider_result_count == 0
+    assert result.candidate_upserts == 0
+
+
+def test_dry_run_with_inconsistent_stop_reason_is_safe() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    valid_result = make_dry_result([query], [make_query_result(query)])
+    payload = valid_result.model_dump()
+    payload["stopped_early"] = True
+    payload["stop_reason"] = None
+
+    service = make_run(
+        FakeDiscoveryExecutionService(
+            cast(SearchProfileDiscoveryDryRunResult, ExecutionResultNestedQueryInvalid(payload))
+        ),
+        FakeQueryGenerator(preview),
+    )
+    result = service.run(
+        profile=make_profile(),
+        provider=FakeProvider(),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "execution_invalid"
+    assert result.query_count == 1
+    assert result.executed_queries == 0
+
+
+def test_dry_run_with_invalid_execution_counters_is_safe() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    valid_result = make_dry_result([query], [make_query_result(query)])
+    payload = valid_result.model_dump()
+    payload["query_count"] = 1
+    payload["executed_queries"] = 2
+
+    service = make_run(
+        FakeDiscoveryExecutionService(
+            cast(SearchProfileDiscoveryDryRunResult, ExecutionResultNestedQueryInvalid(payload))
+        ),
+        FakeQueryGenerator(preview),
+    )
+    result = service.run(
+        profile=make_profile(),
+        provider=FakeProvider(),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "execution_invalid"
+    assert result.query_count == 1
+    assert result.executed_queries == 0
+    assert result.provider_result_count == 0
+
+
+def test_execution_result_model_dump_malformed_payload_stays_safe() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+
+    service = make_run(
+        FakeDiscoveryExecutionService(
+            cast(SearchProfileDiscoveryDryRunResult, ExecutionResultMalformedPayload())
+        ),
+        FakeQueryGenerator(preview),
+    )
+    result = service.run(
+        profile=make_profile(),
+        provider=FakeProvider(),
+        options=None,
+        dry_run=False,
+        repository=cast(CompanyDiscoveryStagingRepository, RecordingRepository()),
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "execution_invalid"
+    assert result.run_persisted is True
+    assert result.candidate_upserts == 0
+
+
+def test_provider_name_invalid_blank_is_configuration_error_and_prevents_execution() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    execution = FakeDiscoveryExecutionService(
+        make_dry_result([query], [make_query_result(query)]),
+    )
+    service = make_run(execution, FakeQueryGenerator(preview))
+
+    result = service.run(
+        profile=make_profile(),
+        provider=cast(DiscoveryProvider, FakeProviderNameProvider("   ")),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "configuration_error"
+    assert result.provider == "invalid-provider"
+    assert execution.calls == []
+
+
+def test_provider_name_non_string_is_configuration_error_and_prevents_execution() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    execution = FakeDiscoveryExecutionService(
+        make_dry_result([query], [make_query_result(query)]),
+    )
+    service = make_run(execution, FakeQueryGenerator(preview))
+
+    result = service.run(
+        profile=make_profile(),
+        provider=cast(DiscoveryProvider, FakeProviderNameProvider(12)),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "configuration_error"
+    assert result.provider == "invalid-provider"
+    assert execution.calls == []
+
+
+def test_provider_name_with_markup_is_configuration_error() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    execution = FakeDiscoveryExecutionService(
+        make_dry_result([query], [make_query_result(query)]),
+    )
+    service = make_run(execution, FakeQueryGenerator(preview))
+
+    result = service.run(
+        profile=make_profile(),
+        provider=cast(DiscoveryProvider, FakeProviderNameProvider("<serpapi>")),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "configuration_error"
+    assert result.provider == "invalid-provider"
+    assert execution.calls == []
+
+
+def test_provider_name_property_exception_is_configuration_error() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    execution = FakeDiscoveryExecutionService(
+        make_dry_result([query], [make_query_result(query)]),
+    )
+    service = make_run(execution, FakeQueryGenerator(preview))
+
+    provider = BadProviderNameProperty(RuntimeError("provider-name-secret"))
+
+    result = service.run(
+        profile=make_profile(),
+        provider=cast(DiscoveryProvider, provider),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.FAILED
+    assert result.error_code == "configuration_error"
+    assert result.provider == "invalid-provider"
+    assert execution.calls == []
+
+
+def test_provider_name_property_base_exception_is_not_caught() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+
+    class BaseExceptionMarker(BaseException): ...
+
+    with pytest.raises(BaseExceptionMarker):
+        make_run(
+            FakeDiscoveryExecutionService(make_dry_result([query], [make_query_result(query)])),
+            FakeQueryGenerator(preview),
+        ).run(
+            profile=make_profile(),
+            provider=cast(DiscoveryProvider, BadProviderNameProperty(BaseExceptionMarker())),
+            options=None,
+            dry_run=True,
+            repository=None,
+        )
+
+
+def test_provider_name_is_normalized_before_execution() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    execution = FakeDiscoveryExecutionService(
+        make_dry_result([query], [make_query_result(query)]),
+    )
+    service = make_run(execution, FakeQueryGenerator(preview))
+
+    result = service.run(
+        profile=make_profile(),
+        provider=cast(DiscoveryProvider, FakeProviderNameProvider("  fake  ")),
+        options=None,
+        dry_run=True,
+        repository=None,
+    )
+
+    assert result.status == CompanyDiscoveryRunStatus.NOT_FOUND
+    assert result.provider == "fake"
+    assert len(execution.calls) == 1

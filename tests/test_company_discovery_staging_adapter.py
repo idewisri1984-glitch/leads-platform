@@ -1,3 +1,5 @@
+import traceback
+
 import pytest
 
 from app.modules.company_discovery.staging_adapter import (
@@ -265,3 +267,106 @@ def test_adapter_failure_raises_controlled_error() -> None:
             query=query,
             item=make_item(name="Acme", website="https://example.com", row_number=1),
         )
+
+
+def _assert_sanitized_adapter_exception(
+    exception: CompanyDiscoveryStagingAdapterError,
+    *,
+    forbidden: tuple[str, ...],
+) -> None:
+    assert str(exception) == "Company discovery candidate could not be staged."
+    assert exception.__cause__ is None
+
+    trace = "".join(
+        traceback.format_exception(type(exception), exception, exception.__traceback__, chain=False)
+    )
+    for marker in forbidden:
+        assert marker not in str(exception)
+        assert marker not in repr(exception)
+        assert marker not in trace
+
+
+def test_adapter_failure_sanitizes_sensitive_name_marker() -> None:
+    query = make_query(country_code="US")
+    with pytest.raises(CompanyDiscoveryStagingAdapterError) as excinfo:
+        adapt_item_to_candidate_draft(
+            project_id=1,
+            provider="serpapi",
+            query=query,
+            item=make_item(
+                name="RAW-NAME-SECRET",
+                website="https://RAW-URL-SECRET:pass@example.com/path",
+                row_number=1,
+            ),
+        )
+
+    _assert_sanitized_adapter_exception(
+        excinfo.value,
+        forbidden=("RAW-NAME-SECRET", "RAW-URL-SECRET", "FAKE-API-KEY-SECRET", "RAW-QUERY-SECRET"),
+    )
+
+
+def test_adapter_failure_sanitizes_sensitive_url_marker() -> None:
+    query = make_query(country_code="US")
+    with pytest.raises(CompanyDiscoveryStagingAdapterError) as excinfo:
+        adapt_item_to_candidate_draft(
+            project_id=1,
+            provider="serpapi",
+            query=query,
+            item=make_item(
+                name="Acme",
+                website="https://user:password@example.com/RAW-URL-SECRET",
+                row_number=2,
+            ),
+        )
+
+    _assert_sanitized_adapter_exception(
+        excinfo.value,
+        forbidden=("RAW-NAME-SECRET", "RAW-URL-SECRET", "FAKE-API-KEY-SECRET", "RAW-QUERY-SECRET"),
+    )
+
+
+def test_adapter_failure_sanitizes_sensitive_api_key_marker() -> None:
+    query = make_query(country_code="US")
+    with pytest.raises(CompanyDiscoveryStagingAdapterError) as excinfo:
+        adapt_item_to_candidate_draft(
+            project_id=1,
+            provider="serpapi",
+            query=query,
+            item=make_item(
+                name="Acme",
+                website="https://user:FAKE-API-KEY-SECRET@example.com/RAW-QUERY-SECRET",
+                row_number=3,
+            ),
+        )
+
+    _assert_sanitized_adapter_exception(
+        excinfo.value,
+        forbidden=("RAW-NAME-SECRET", "RAW-URL-SECRET", "FAKE-API-KEY-SECRET", "RAW-QUERY-SECRET"),
+    )
+
+
+def test_adapter_failure_sanitizes_sensitive_query_marker() -> None:
+    query = SearchQuery(
+        text="RAW-QUERY-SECRET",
+        profile_id=1,
+        profile_name="Demo profile",
+        country="United States",
+        city=None,
+        source_template="{target_customer_type} {city} {country}",
+        country_code="US",
+        language=None,
+        limit=10,
+    )
+    with pytest.raises(CompanyDiscoveryStagingAdapterError) as excinfo:
+        adapt_item_to_candidate_draft(
+            project_id=1,
+            provider="serpapi",
+            query=query,
+            item=make_item(name="Acme<", website="https://example.com", row_number=4),
+        )
+
+    _assert_sanitized_adapter_exception(
+        excinfo.value,
+        forbidden=("RAW-NAME-SECRET", "RAW-URL-SECRET", "FAKE-API-KEY-SECRET", "RAW-QUERY-SECRET"),
+    )

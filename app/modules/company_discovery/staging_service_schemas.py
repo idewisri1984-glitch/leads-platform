@@ -5,7 +5,11 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
-from app.modules.company_discovery.staging_normalization import normalize_country_code
+from app.modules.company_discovery.staging_normalization import (
+    normalize_country_code,
+    normalize_display_name,
+    normalize_staging_website,
+)
 
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
@@ -105,20 +109,49 @@ class CompanyDiscoveryStagingCandidatePreview(BaseModel):
     best_position: PositiveInt | None = None
     identity_key: str = Field(max_length=700)
 
-    @field_validator("name", "website", "website_identity", "country_code")
+    @field_validator("name")
     @classmethod
-    def _clean_text(cls, value: str | None) -> str | None:
+    def _clean_name(cls, value: str | None) -> str | None:
+        return normalize_display_name(value)
+
+    @field_validator("website")
+    @classmethod
+    def _clean_website(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        website, _ = normalize_staging_website(value)
+        return website
+
+    @field_validator("website_identity")
+    @classmethod
+    def _clean_website_identity(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized = " ".join(value.strip().split())
-        return normalized or None
+        if not normalized:
+            return None
+        if "<" in normalized or ">" in normalized:
+            raise ValueError("Raw markup is not allowed in company discovery text.")
+        return normalized
 
     @field_validator("country_code")
     @classmethod
     def _upper_country_code(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return value.upper()
+        return normalize_country_code(value)
+
+    @field_validator("identity_key")
+    @classmethod
+    def _clean_identity_key(cls, value: str | None) -> str | None:
+        if value is None:
+            raise ValueError("Identity key is required.")
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("Identity key is required.")
+        if "<" in normalized or ">" in normalized:
+            raise ValueError("Raw markup is not allowed in company discovery text.")
+        return normalized
 
 
 class CompanyDiscoveryStagingRunResult(BaseModel):

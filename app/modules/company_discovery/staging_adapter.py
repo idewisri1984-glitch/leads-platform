@@ -48,8 +48,8 @@ def adapt_item_to_candidate_draft(
             country_code=query.country_code,
             position=_safe_position(item.source_row_number),
         )
-    except ValidationError as error:
-        raise CompanyDiscoveryStagingAdapterError(_SAFE_ADAPTER_ERROR_MESSAGE) from error
+    except ValidationError:
+        raise CompanyDiscoveryStagingAdapterError(_SAFE_ADAPTER_ERROR_MESSAGE) from None
 
     try:
         normalized = normalize_candidate_identity(
@@ -57,8 +57,8 @@ def adapt_item_to_candidate_draft(
             website=draft.website,
             country_code=draft.country_code,
         )
-    except (ValueError, TypeError) as error:
-        raise CompanyDiscoveryStagingAdapterError(_SAFE_ADAPTER_ERROR_MESSAGE) from error
+    except (ValueError, TypeError):
+        raise CompanyDiscoveryStagingAdapterError(_SAFE_ADAPTER_ERROR_MESSAGE) from None
 
     return draft, normalized
 
@@ -104,7 +104,7 @@ def candidate_create_from_adapter_payload(
         project_id=draft.project_id,
         run_id=run_id,
         provider=draft.provider,
-        name=draft.name,
+        name=normalized.name,
         website=normalized.website,
         country_code=normalized.country_code,
         position=draft.position,

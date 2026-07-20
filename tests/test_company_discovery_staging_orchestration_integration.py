@@ -1382,3 +1382,144 @@ def test_persistence_failure_on_update_run_propagates_without_masking() -> None:
     assert case.calls[0][0] == "create_run"
     assert case.calls[1][0] == "upsert_candidate"
     assert case.calls[-1][0] == "update_run"
+
+
+def test_persisted_duplicate_merge_preserves_latest_name_and_position(
+    sqlite_session: Session,
+) -> None:
+    project = Project(name="Duplicate merge")
+    sqlite_session.add(project)
+    sqlite_session.flush()
+
+    profile = make_profile_from_db(sqlite_session, project)
+    profile_read = SearchProfileRead.model_validate(profile)
+    query = make_query(profile_read, 1, country_code="DE")
+    preview = SearchQueryPreview(
+        profile_id=profile_read.id,
+        profile_name=profile_read.name,
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    repository = CompanyDiscoveryStagingRepository(sqlite_session)
+
+    first = run_orchestrator(
+        profile=profile_read,
+        provider=FakeProvider(),
+        dry_run=False,
+        preview=preview,
+        execution_result=make_dry_result(
+            profile_read,
+            [
+                make_query_result(
+                    query,
+                    items=[make_item(name="   ", row=8, website="https://www.example.com/path")],
+                )
+            ],
+        ),
+        repository=repository,
+    )
+    sqlite_session.commit()
+    assert first.candidate_upserts == 1
+    assert first.run_id is not None
+
+    second = run_orchestrator(
+        profile=profile_read,
+        provider=FakeProvider(),
+        dry_run=False,
+        preview=preview,
+        execution_result=make_dry_result(
+            profile_read,
+            [
+                make_query_result(
+                    query,
+                    items=[make_item(name="Later Name", row=3, website="https://example.com/path")],
+                )
+            ],
+        ),
+        repository=repository,
+    )
+    sqlite_session.commit()
+
+    assert second.candidate_upserts == 1
+    assert second.run_id is not None
+
+    candidate = sqlite_session.scalar(select(CompanyDiscoveryCandidate))
+    assert candidate is not None
+    assert candidate.name == "Later Name"
+    assert candidate.best_position == 3
+    assert candidate.first_seen_run_id == first.run_id
+    assert candidate.last_seen_run_id == second.run_id
+
+
+def test_repeated_runs_preserve_merged_name_and_position_across_runs(
+    sqlite_session: Session,
+) -> None:
+    project = Project(name="Duplicate merge run matrix")
+    sqlite_session.add(project)
+    sqlite_session.flush()
+    profile = make_profile_from_db(sqlite_session, project)
+    profile_read = SearchProfileRead.model_validate(profile)
+    query = make_query(profile_read, 1, country_code="DE")
+    preview = SearchQueryPreview(
+        profile_id=profile_read.id,
+        profile_name=profile_read.name,
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    repository = CompanyDiscoveryStagingRepository(sqlite_session)
+
+    first = run_orchestrator(
+        profile=profile_read,
+        provider=FakeProvider(),
+        dry_run=False,
+        preview=preview,
+        execution_result=make_dry_result(
+            profile_read,
+            [
+                make_query_result(
+                    query,
+                    items=[make_item(name="   ", row=8, website="https://www.example.com/path")],
+                )
+            ],
+        ),
+        repository=repository,
+    )
+    sqlite_session.commit()
+
+    second = run_orchestrator(
+        profile=profile_read,
+        provider=FakeProvider(),
+        dry_run=False,
+        preview=preview,
+        execution_result=make_dry_result(
+            profile_read,
+            [
+                make_query_result(
+                    query,
+                    items=[make_item(name="Later Name", row=3, website="https://example.com/path")],
+                )
+            ],
+        ),
+        repository=repository,
+    )
+    sqlite_session.commit()
+
+    assert first.run_id is not None and second.run_id is not None
+    run_count = sqlite_session.scalar(select(func.count()).select_from(CompanyDiscoveryRun))
+    candidate_count = sqlite_session.scalar(
+        select(func.count()).select_from(CompanyDiscoveryCandidate)
+    )
+    candidate = sqlite_session.scalar(select(CompanyDiscoveryCandidate))
+    assert run_count == 2
+    assert candidate_count == 1
+    assert candidate is not None
+    assert candidate.first_seen_run_id == first.run_id
+    assert candidate.last_seen_run_id == second.run_id
+    assert candidate.best_position == 3
+    assert candidate.name == "Later Name"

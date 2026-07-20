@@ -3,8 +3,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from pydantic import ValidationError
-
 from app.modules.company_discovery.models import CompanyDiscoveryRun, CompanyDiscoveryRunStatus
 from app.modules.company_discovery.profile_execution import (
     SearchProfileDiscoveryExecutionError,
@@ -59,6 +57,8 @@ _ALLOWED_ORCHESTRATION_ERROR_CODES = {
     "execution_failed",
 }
 
+_INVALID_PROVIDER_NAME = "invalid-provider"
+
 
 class CompanyDiscoveryStagingService:
     """
@@ -94,14 +94,37 @@ class CompanyDiscoveryStagingService:
             )
 
         preview = self.query_generator.generate_preview(profile, options)
-        provider_name = provider.provider_name
+
+        try:
+            provider_name = self._resolve_provider_name(provider)
+        except BaseException:
+            raise
+
+        if provider_name is None:
+            return self._failed_run_result(
+                profile=profile,
+                provider_name=_INVALID_PROVIDER_NAME,
+                preview=preview,
+                options=options,
+                query_count=preview.query_count,
+                executed_queries=0,
+                successful_queries=0,
+                provider_result_count=0,
+                provider_error_count=0,
+                dry_run=dry_run,
+                repository=effective_repository,
+                error_code="configuration_error",
+                existing_adapter_error_count=0,
+                rejected_candidate_count=0,
+                duplicate_candidate_count=0,
+            )
 
         try:
             execution_result = self.execution_service.run_dry(profile, provider, options)
         except SearchProfileDiscoveryExecutionError:
             raise
         except Exception:
-            # All unexpected execution failures are converted to deterministic orchestration result.
+            # Unexpected execution failures are converted to deterministic orchestration result.
             return self._failed_run_result(
                 profile=profile,
                 provider_name=provider_name,
@@ -124,11 +147,26 @@ class CompanyDiscoveryStagingService:
             execution_result = SearchProfileDiscoveryDryRunResult.model_validate(
                 execution_result.model_dump()
             )
-        except ValidationError as error:
-            raise CompanyDiscoveryStagingServiceError("Execution result is invalid.") from error
+        except Exception:
+            # Malformed execution output is treated as a deterministic failed result.
+            return self._failed_run_result(
+                profile=profile,
+                provider_name=provider_name,
+                preview=preview,
+                options=options,
+                query_count=preview.query_count,
+                executed_queries=0,
+                successful_queries=0,
+                provider_result_count=0,
+                provider_error_count=0,
+                dry_run=dry_run,
+                repository=effective_repository,
+                error_code="execution_invalid",
+                existing_adapter_error_count=0,
+                rejected_candidate_count=0,
+                duplicate_candidate_count=0,
+            )
 
-        # Structural mismatch between planned and performed execution is a safe failed result
-        # and must never affect storage in dry-run.
         try:
             self._validate_execution_result(profile, provider_name, preview, execution_result)
             valid_execution_result = True
@@ -153,6 +191,25 @@ class CompanyDiscoveryStagingService:
             rejected_candidate_count = 0
             duplicate_candidate_count = 0
 
+        if not valid_execution_result:
+            return self._failed_run_result(
+                profile=profile,
+                provider_name=provider_name,
+                preview=preview,
+                options=options,
+                query_count=preview.query_count,
+                executed_queries=0,
+                successful_queries=0,
+                provider_result_count=0,
+                provider_error_count=0,
+                dry_run=dry_run,
+                repository=effective_repository,
+                error_code="execution_invalid",
+                existing_adapter_error_count=0,
+                rejected_candidate_count=0,
+                duplicate_candidate_count=0,
+            )
+
         duplicate_candidate_count = sum(row.duplicates for row in adapter_rows.values())
         unique_candidate_count = len(adapter_rows)
         status, error_code = self._evaluate_status_and_error_code(
@@ -161,10 +218,6 @@ class CompanyDiscoveryStagingService:
             candidate_rejections=rejected_candidate_count,
             valid_execution_result=valid_execution_result,
         )
-
-        if not valid_execution_result and not dry_run:
-            error_code = "execution_invalid"
-            status = CompanyDiscoveryRunStatus.FAILED
 
         successful_queries = sum(
             1
@@ -283,6 +336,22 @@ class CompanyDiscoveryStagingService:
             completed_at=completed_at,
             candidates=[self._candidate_preview(item) for item in adapter_rows.values()],
         )
+
+    def _resolve_provider_name(self, provider: DiscoveryProvider) -> str | None:
+        try:
+            raw_provider_name = provider.provider_name
+        except Exception:
+            return None
+
+        if not isinstance(raw_provider_name, str):
+            return None
+
+        normalized = " ".join(raw_provider_name.strip().split())
+        if not normalized:
+            return None
+        if "<" in normalized or ">" in normalized:
+            return None
+        return normalized
 
     def _failed_run_result(
         self,
@@ -534,6 +603,8 @@ class CompanyDiscoveryStagingService:
         candidate_rejections: int,
         valid_execution_result: bool,
     ) -> tuple[CompanyDiscoveryRunStatus, str | None]:
+        first_provider_error = self._first_provider_error_code(execution_result)
+
         successful_query_count = sum(
             1
             for query_result in execution_result.query_results
@@ -542,8 +613,6 @@ class CompanyDiscoveryStagingService:
         provider_error_count = execution_result.total_provider_errors
         adapter_error_count = execution_result.total_adapter_errors
         stopped_early = execution_result.stopped_early
-
-        first_provider_error = self._first_provider_error_code(execution_result)
 
         if not valid_execution_result:
             return CompanyDiscoveryRunStatus.FAILED, "execution_invalid"
