@@ -39,6 +39,12 @@ from app.modules.company_discovery.serpapi_adapter import (
 )
 from app.modules.company_discovery.serpapi_provider import SerpApiDiscoveryProvider
 from app.modules.company_discovery.service import CompanyDiscoveryService
+from app.modules.company_discovery.staging_orchestration import CompanyDiscoveryStagingService
+from app.modules.company_discovery.staging_service_schemas import (
+    CompanyDiscoveryStagingCandidateDraft,
+    CompanyDiscoveryStagingCandidatePreview,
+    CompanyDiscoveryStagingRunResult,
+)
 
 __all__ = [
     "CompanyDiscoveryAdapterError",
@@ -67,6 +73,10 @@ __all__ = [
     "SearchProfileDiscoveryProviderError",
     "SearchProfileDiscoveryQueryResult",
     "SearchProfileDiscoveryService",
+    "CompanyDiscoveryStagingService",
+    "CompanyDiscoveryStagingCandidateDraft",
+    "CompanyDiscoveryStagingCandidatePreview",
+    "CompanyDiscoveryStagingRunResult",
     "SerpApiDiscoveryProvider",
     "provider_result_to_ingestion_item",
     "serpapi_result_to_ingestion_item",
