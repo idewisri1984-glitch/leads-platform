@@ -55,6 +55,11 @@ class FakeProvider:
         raise AssertionError(f"provider search should not be called: {query.text}")
 
 
+class FakeProviderNameProvider(FakeProvider):
+    def __init__(self, provider_name: str) -> None:
+        self.provider_name = provider_name
+
+
 @dataclass
 class RepositorySpyRun:
     id: int
@@ -931,6 +936,176 @@ def test_persisted_rollback_disappears_partial_writes(sqlite_session: Session) -
     with SessionLocal() as verify:
         assert verify.get(CompanyDiscoveryRun, run_id) is None
         assert verify.scalar(select(func.count()).select_from(CompanyDiscoveryCandidate)) == 0
+
+
+def test_persisted_run_with_too_long_provider_name_is_safe_configuration_error(
+    sqlite_session: Session,
+) -> None:
+    project = Project(name="Long provider name boundary")
+    sqlite_session.add(project)
+    sqlite_session.flush()
+
+    profile = make_profile_from_db(sqlite_session, project)
+    profile_read = SearchProfileRead.model_validate(profile)
+    query = make_query(profile_read, 1, country_code="DE")
+    preview = SearchQueryPreview(
+        profile_id=profile_read.id,
+        profile_name=profile_read.name,
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+
+    company_count_before = sqlite_session.scalar(select(func.count()).select_from(Company))
+    contact_count_before = sqlite_session.scalar(select(func.count()).select_from(Contact))
+    dry_result = make_dry_result(
+        profile_read,
+        [
+            make_query_result(
+                query, items=[make_item(name="Acme", row=1, website="https://example.com")]
+            )
+        ],
+    )
+    execution_service = FakeExecutionService(dry_result)
+    repository = CompanyDiscoveryStagingRepository(sqlite_session)
+    service = CompanyDiscoveryStagingService(
+        repository=repository,
+        execution_service=cast(SearchProfileDiscoveryService, execution_service),
+        query_generator=cast(SearchProfileQueryGenerator, FakeQueryGenerator(preview)),
+    )
+
+    report = service.run(
+        profile=profile_read,
+        provider=FakeProviderNameProvider("a" * 101),
+        options=SearchProfileRunOptions(),
+        dry_run=False,
+        repository=repository,
+    )
+
+    sqlite_session.commit()
+    run = sqlite_session.get(CompanyDiscoveryRun, report.run_id)
+
+    assert report.status == CompanyDiscoveryRunStatus.FAILED
+    assert report.error_code == "configuration_error"
+    assert report.provider == "invalid-provider"
+    assert report.run_id is not None
+    assert report.run_persisted is True
+    assert report.candidate_upserts == 0
+    assert execution_service.calls == []
+    assert run is not None
+    assert run.provider == "invalid-provider"
+    assert run.error_code == "configuration_error"
+    assert run.candidate_count == 0
+    assert sqlite_session.scalar(select(func.count()).select_from(CompanyDiscoveryCandidate)) == 0
+    assert sqlite_session.scalar(select(func.count()).select_from(CompanyDiscoveryRun)) == 1
+    assert sqlite_session.scalar(select(func.count()).select_from(Company)) == company_count_before
+    assert sqlite_session.scalar(select(func.count()).select_from(Contact)) == contact_count_before
+
+
+def test_persisted_invalid_provider_name_run_is_removed_after_caller_rollback(
+    sqlite_session: Session,
+) -> None:
+    project = Project(name="Long provider name rollback")
+    sqlite_session.add(project)
+    sqlite_session.flush()
+
+    profile = make_profile_from_db(sqlite_session, project)
+    profile_read = SearchProfileRead.model_validate(profile)
+    query = make_query(profile_read, 1, country_code="DE")
+    preview = SearchQueryPreview(
+        profile_id=profile_read.id,
+        profile_name=profile_read.name,
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+
+    service = CompanyDiscoveryStagingService(
+        repository=CompanyDiscoveryStagingRepository(sqlite_session),
+        execution_service=cast(
+            SearchProfileDiscoveryService,
+            FakeExecutionService(make_dry_result(profile_read, [make_query_result(query)])),
+        ),
+        query_generator=cast(SearchProfileQueryGenerator, FakeQueryGenerator(preview)),
+    )
+
+    report = service.run(
+        profile=profile_read,
+        provider=FakeProviderNameProvider("b" * 101),
+        options=SearchProfileRunOptions(),
+        dry_run=False,
+        repository=service.repository,
+    )
+
+    assert report.status == CompanyDiscoveryRunStatus.FAILED
+    assert report.run_id is not None
+    assert sqlite_session.get(CompanyDiscoveryRun, report.run_id) is not None
+    sqlite_session.rollback()
+    assert sqlite_session.get(CompanyDiscoveryRun, report.run_id) is None
+
+
+def test_persisted_provider_name_exactly_100_characters_is_preserved_and_persists_candidates(
+    sqlite_session: Session,
+) -> None:
+    project = Project(name="Exact provider length")
+    sqlite_session.add(project)
+    sqlite_session.flush()
+
+    profile = make_profile_from_db(sqlite_session, project)
+    profile_read = SearchProfileRead.model_validate(profile)
+    query = make_query(profile_read, 1, country_code="DE")
+    preview = SearchQueryPreview(
+        profile_id=profile_read.id,
+        profile_name=profile_read.name,
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    provider_name = "x" * 100
+    query_result = make_query_result(
+        query,
+        items=[make_item(name="Acme", row=1, website="https://long-provider.example.com")],
+    ).model_copy(update={"provider": provider_name})
+    execution_service = FakeExecutionService(
+        make_dry_result(profile_read, [query_result]).model_copy(
+            update={
+                "provider": provider_name,
+                "query_results": [query_result],
+            }
+        )
+    )
+    repository = CompanyDiscoveryStagingRepository(sqlite_session)
+    service = CompanyDiscoveryStagingService(
+        repository=repository,
+        execution_service=cast(SearchProfileDiscoveryService, execution_service),
+        query_generator=cast(SearchProfileQueryGenerator, FakeQueryGenerator(preview)),
+    )
+
+    report = service.run(
+        profile=profile_read,
+        provider=FakeProviderNameProvider(provider_name),
+        options=SearchProfileRunOptions(),
+        dry_run=False,
+        repository=repository,
+    )
+
+    sqlite_session.commit()
+
+    assert report.status == CompanyDiscoveryRunStatus.SUCCEEDED
+    assert report.provider == provider_name
+    assert len(report.provider) == 100
+    assert len(execution_service.calls) == 1
+    assert report.candidate_upserts == 1
+    run = sqlite_session.get(CompanyDiscoveryRun, report.run_id)
+    assert run is not None
+    assert run.provider == provider_name
+    assert len(run.provider) == 100
 
 
 def test_repeated_runs_preserve_candidate_identity_and_updates(sqlite_session: Session) -> None:

@@ -58,6 +58,7 @@ _ALLOWED_ORCHESTRATION_ERROR_CODES = {
 }
 
 _INVALID_PROVIDER_NAME = "invalid-provider"
+_MAX_PROVIDER_NAME_LENGTH = 100
 
 
 class CompanyDiscoveryStagingService:
@@ -348,6 +349,8 @@ class CompanyDiscoveryStagingService:
 
         normalized = " ".join(raw_provider_name.strip().split())
         if not normalized:
+            return None
+        if len(normalized) > _MAX_PROVIDER_NAME_LENGTH:
             return None
         if "<" in normalized or ">" in normalized:
             return None
