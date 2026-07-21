@@ -708,9 +708,12 @@ def _safe_rollback(session: Session) -> None:
 
 
 def _invoke_session_method(session: Session, method: Literal["commit", "rollback"]) -> None:
+    if not isinstance(method, str) or method not in ("commit", "rollback"):
+        raise ValueError("Unsupported session operation.")
+
     callback = getattr(session, method)
     if not callable(callback):
-        raise TypeError(f"Session method not callable: {method}")
+        raise TypeError("Session operation is not callable.")
 
     callback()
 

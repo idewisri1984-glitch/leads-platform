@@ -1,6 +1,7 @@
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from app.cli import company_discovery as cli
@@ -575,3 +576,191 @@ def test_stage_profile_does_not_call_legacy_persistence(
 
     assert result.exit_code == 0
     assert "Mode: PERSIST" in result.output
+
+
+class _SpySession:
+    def __init__(self) -> None:
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.lookup_calls: list[str] = []
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in (
+            "commit",
+            "rollback",
+            "execute",
+            "close",
+            "flush",
+            "__class__",
+            "__dict__",
+        ):
+            object.__getattribute__(self, "lookup_calls").append(name)
+        return object.__getattribute__(self, name)
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "execute",
+        "close",
+        "flush",
+        "__class__",
+        "__dict__",
+        "",
+        " ",
+        "COMMIT",
+        None,
+        True,
+        7,
+        object(),
+    ],
+)
+def test_invoke_session_method_rejects_unsupported_operations(method: Any) -> None:
+    session = _SpySession()
+
+    with pytest.raises(ValueError, match="Unsupported session operation."):
+        cli._invoke_session_method(cast(Session, session), method)
+
+    assert session.lookup_calls == []
+    assert session.commit_calls == 0
+    assert session.rollback_calls == 0
+
+
+def test_invoke_session_method_commits_once_and_does_not_rollback() -> None:
+    session = _SpySession()
+
+    cli._invoke_session_method(cast(Session, session), "commit")
+
+    assert session.lookup_calls == ["commit"]
+    assert session.commit_calls == 1
+    assert session.rollback_calls == 0
+
+
+def test_invoke_session_method_commit_exception_is_not_suppressed() -> None:
+    class _RaisesSession(_SpySession):
+        def commit(self) -> None:
+            raise ValueError("commit failure")
+
+    session = _RaisesSession()
+
+    with pytest.raises(ValueError, match="commit failure"):
+        cli._invoke_session_method(cast(Session, session), "commit")
+
+    assert session.lookup_calls == ["commit"]
+    assert session.rollback_calls == 0
+
+
+class _CommitBaseException(BaseException):
+    pass
+
+
+def test_invoke_session_method_commit_base_exception_is_not_suppressed() -> None:
+    class _RaisesSession(_SpySession):
+        def commit(self) -> None:
+            raise _CommitBaseException("base commit failure")
+
+    session = _RaisesSession()
+
+    with pytest.raises(_CommitBaseException, match="base commit failure"):
+        cli._invoke_session_method(cast(Session, session), "commit")
+
+    assert session.lookup_calls == ["commit"]
+    assert session.rollback_calls == 0
+
+
+def test_invoke_session_method_rollback_calls_exactly_once_and_does_not_commit() -> None:
+    session = _SpySession()
+
+    cli._invoke_session_method(cast(Session, session), "rollback")
+
+    assert session.lookup_calls == ["rollback"]
+    assert session.commit_calls == 0
+    assert session.rollback_calls == 1
+
+
+def test_invoke_session_method_rollback_exception_is_not_suppressed() -> None:
+    class _RaisesSession(_SpySession):
+        def rollback(self) -> None:
+            raise ValueError("rollback failure")
+
+    session = _RaisesSession()
+
+    with pytest.raises(ValueError, match="rollback failure"):
+        cli._invoke_session_method(cast(Session, session), "rollback")
+
+    assert session.lookup_calls == ["rollback"]
+    assert session.commit_calls == 0
+
+
+class _RollbackBaseException(BaseException):
+    pass
+
+
+def test_invoke_session_method_rollback_base_exception_is_not_suppressed() -> None:
+    class _RaisesSession(_SpySession):
+        def rollback(self) -> None:
+            raise _RollbackBaseException("base rollback failure")
+
+    session = _RaisesSession()
+
+    with pytest.raises(_RollbackBaseException, match="base rollback failure"):
+        cli._invoke_session_method(cast(Session, session), "rollback")
+
+    assert session.lookup_calls == ["rollback"]
+    assert session.commit_calls == 0
+
+
+def test_safe_rollback_calls_rollback_and_suppresses_exception() -> None:
+    class _RaisesSession(_SpySession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rollback_invoked = False
+
+        def rollback(self) -> None:
+            self.rollback_invoked = True
+            raise ValueError("rollback failure")
+
+    session = _RaisesSession()
+
+    cli._safe_rollback(cast(Session, session))
+
+    assert session.lookup_calls == ["rollback"]
+    assert session.commit_calls == 0
+    assert session.rollback_invoked is True
+
+
+def test_safe_rollback_does_not_propagate_exception() -> None:
+    class _RaisesSession(_SpySession):
+        def rollback(self) -> None:
+            raise _RollbackBaseException("rollback base failure")
+
+    session = _RaisesSession()
+
+    with pytest.raises(_RollbackBaseException, match="rollback base failure"):
+        cli._safe_rollback(cast(Session, session))
+
+    assert session.lookup_calls == ["rollback"]
+    assert session.commit_calls == 0
+
+
+def test_safe_rollback_calls_only_rollback_operation() -> None:
+    captured_methods: list[str] = []
+
+    def fake_invoke(session: Any, method: str) -> None:
+        captured_methods.append(method)
+
+    original_invoke = cli._invoke_session_method
+    try:
+        cli._invoke_session_method = fake_invoke
+        session = _SpySession()
+        cli._safe_rollback(cast(Session, session))
+    finally:
+        cli._invoke_session_method = original_invoke
+
+    assert captured_methods == ["rollback"]
