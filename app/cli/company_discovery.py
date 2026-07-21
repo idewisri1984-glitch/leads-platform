@@ -7,6 +7,7 @@ import typer
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.cli.company_discovery_candidates import app as candidate_app
 from app.core.config.settings import settings
 from app.core.database.session import SessionLocal
 from app.modules.company_discovery import (
@@ -41,6 +42,8 @@ from app.modules.search_profile import (
 from app.providers.serpapi import SerpApiClient, SerpApiError
 
 app = typer.Typer(help="Company discovery commands.")
+
+app.add_typer(candidate_app, name="candidate")
 _STAGING_DISPLAY_CANDIDATES = 50
 
 

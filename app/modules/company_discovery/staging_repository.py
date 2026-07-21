@@ -83,7 +83,44 @@ class CompanyDiscoveryStagingRepository:
         return run
 
     def get_candidate(self, candidate_id: int) -> CompanyDiscoveryCandidate | None:
+        self._validate_positive_id(candidate_id, "Candidate")
         return self.session.get(CompanyDiscoveryCandidate, candidate_id)
+
+    def get_candidate_for_project(
+        self,
+        project_id: int,
+        candidate_id: int,
+    ) -> CompanyDiscoveryCandidate | None:
+        self._validate_positive_id(project_id, "Project")
+        self._validate_positive_id(candidate_id, "Candidate")
+        statement = select(CompanyDiscoveryCandidate).where(
+            CompanyDiscoveryCandidate.id == candidate_id,
+            CompanyDiscoveryCandidate.project_id == project_id,
+        )
+        return self.session.scalar(statement)
+
+    def set_candidate_status(
+        self,
+        project_id: int,
+        candidate_id: int,
+        candidate_status: CompanyDiscoveryCandidateStatus,
+    ) -> CompanyDiscoveryCandidate:
+        self._validate_positive_id(project_id, "Project")
+        self._validate_positive_id(candidate_id, "Candidate")
+        if candidate_status not in (
+            CompanyDiscoveryCandidateStatus.REVIEWED,
+            CompanyDiscoveryCandidateStatus.REJECTED,
+        ):
+            raise ValueError("Unsupported candidate status.")
+
+        candidate = self.get_candidate_for_project(project_id, candidate_id)
+        if candidate is None:
+            raise CompanyDiscoveryStagingNotFoundError("Candidate was not found.")
+
+        candidate.candidate_status = candidate_status
+        self.session.add(candidate)
+        self.session.flush()
+        return candidate
 
     def list_candidates_for_project(
         self,
@@ -193,6 +230,11 @@ class CompanyDiscoveryStagingRepository:
             updated=updated,
             protected=protected,
         )
+
+    @staticmethod
+    def _validate_positive_id(value: int, label: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{label} ID must be a positive integer.")
 
     @staticmethod
     def _validate_pagination(limit: int, offset: int) -> None:

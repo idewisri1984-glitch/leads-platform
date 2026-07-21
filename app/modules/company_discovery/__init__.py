@@ -1,3 +1,12 @@
+from app.modules.company_discovery.candidate_review import (
+    CompanyDiscoveryCandidateReviewNotFoundError,
+    CompanyDiscoveryCandidateReviewService,
+    CompanyDiscoveryCandidateTransitionError,
+)
+from app.modules.company_discovery.candidate_review_schemas import (
+    CompanyDiscoveryCandidateReviewAction,
+    CompanyDiscoveryCandidateReviewResult,
+)
 from app.modules.company_discovery.profile_execution import (
     SearchProfileDiscoveryExecutionError,
     SearchProfileDiscoveryService,
@@ -52,6 +61,11 @@ __all__ = [
     "CompanyDiscoveryRequest",
     "CompanyDiscoveryResult",
     "CompanyDiscoveryService",
+    "CompanyDiscoveryCandidateReviewAction",
+    "CompanyDiscoveryCandidateReviewResult",
+    "CompanyDiscoveryCandidateReviewNotFoundError",
+    "CompanyDiscoveryCandidateReviewService",
+    "CompanyDiscoveryCandidateTransitionError",
     "DiscoveryProvider",
     "DiscoveryProviderAuthenticationError",
     "DiscoveryProviderConfigurationError",
