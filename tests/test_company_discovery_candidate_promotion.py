@@ -1,3 +1,4 @@
+import traceback
 from dataclasses import dataclass
 from inspect import getsource
 from typing import cast
@@ -39,8 +40,9 @@ class FakeCompany:
 
 
 class FakeStagingRepository:
-    def __init__(self, candidate: FakeCandidate | None) -> None:
+    def __init__(self, candidate: FakeCandidate | None, events: list[str]) -> None:
         self.candidate = candidate
+        self.events = events
         self.get_calls: list[tuple[int, int]] = []
         self.link_calls: list[tuple[int, int, int]] = []
         self.get_error: BaseException | None = None
@@ -49,6 +51,7 @@ class FakeStagingRepository:
     def get_candidate_for_promotion(
         self, project_id: int, candidate_id: int
     ) -> FakeCandidate | None:
+        self.events.append("candidate")
         self.get_calls.append((project_id, candidate_id))
         if self.get_error is not None:
             raise self.get_error
@@ -61,6 +64,7 @@ class FakeStagingRepository:
     def link_promoted_company(
         self, project_id: int, candidate_id: int, company_id: int
     ) -> FakeCandidate:
+        self.events.append("link")
         self.link_calls.append((project_id, candidate_id, company_id))
         if self.link_error is not None:
             raise self.link_error
@@ -72,16 +76,26 @@ class FakeStagingRepository:
 
 
 class FakeCompanyRepository:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
         self.existing_duplicate: FakeCompany | None = None
         self.companies: dict[int, FakeCompany] = {}
+        self.scope_calls: list[int] = []
         self.get_calls: list[tuple[int, int]] = []
         self.duplicate_calls: list[tuple[int, str]] = []
         self.create_calls: list[dict[str, object]] = []
         self.create_error: BaseException | None = None
         self.duplicate_error: BaseException | None = None
+        self.scope_error: BaseException | None = None
+
+    def acquire_promotion_scope(self, project_id: int) -> None:
+        self.events.append("scope")
+        self.scope_calls.append(project_id)
+        if self.scope_error is not None:
+            raise self.scope_error
 
     def get_for_project(self, project_id: int, company_id: int) -> FakeCompany | None:
+        self.events.append("get")
         self.get_calls.append((project_id, company_id))
         company = self.companies.get(company_id)
         if company is None or company.project_id != project_id:
@@ -89,6 +103,7 @@ class FakeCompanyRepository:
         return company
 
     def find_duplicate_by_website(self, project_id: int, website: str) -> FakeCompany | None:
+        self.events.append("duplicate")
         self.duplicate_calls.append((project_id, website))
         if self.duplicate_error is not None:
             raise self.duplicate_error
@@ -103,6 +118,7 @@ class FakeCompanyRepository:
         country: str | None,
         status: str = "NEW",
     ) -> FakeCompany:
+        self.events.append("create")
         self.create_calls.append(
             {
                 "project_id": project_id,
@@ -126,8 +142,9 @@ def make_service(
     FakeStagingRepository,
     FakeCompanyRepository,
 ]:
-    staging = FakeStagingRepository(candidate or FakeCandidate())
-    companies = FakeCompanyRepository()
+    events: list[str] = []
+    staging = FakeStagingRepository(candidate or FakeCandidate(), events)
+    companies = FakeCompanyRepository(events)
     service = CompanyDiscoveryCandidatePromotionService(
         cast(CandidatePromotionStagingRepository, staging),
         cast(CandidatePromotionCompanyRepository, companies),
@@ -147,6 +164,8 @@ def test_reviewed_candidate_creates_company_and_links_exact_fields() -> None:
     assert result.changed is True
     assert staging.get_calls == [(12, 34)]
     assert staging.link_calls == [(12, 34, 91)]
+    assert companies.scope_calls == [12]
+    assert companies.events == ["scope", "candidate", "duplicate", "create", "link"]
     assert companies.duplicate_calls == [(12, "https://www.example.com/about")]
     assert companies.create_calls == [
         {
@@ -215,6 +234,8 @@ def test_valid_promoted_candidate_is_idempotent_without_repository_write() -> No
     assert result.created_company is False
     assert result.changed is False
     assert companies.get_calls == [(12, 77)]
+    assert companies.scope_calls == [12]
+    assert companies.events == ["scope", "candidate", "get"]
     assert companies.duplicate_calls == []
     assert companies.create_calls == []
     assert staging.link_calls == []
@@ -276,6 +297,7 @@ def test_invalid_ids_are_rejected_before_repository_calls(
         service.promote(project_id, candidate_id)
 
     assert staging.get_calls == []
+    assert companies.scope_calls == []
     assert companies.create_calls == []
 
 
@@ -310,11 +332,13 @@ def test_reviewed_candidate_with_existing_link_is_inconsistent() -> None:
     assert staging.link_calls == []
 
 
-@pytest.mark.parametrize("boundary", ["create", "link"])
+@pytest.mark.parametrize("boundary", ["scope", "create", "link"])
 def test_persistence_failures_propagate(boundary: str) -> None:
     service, staging, companies = make_service()
     failure = RuntimeError("private persistence failure")
-    if boundary == "create":
+    if boundary == "scope":
+        companies.scope_error = failure
+    elif boundary == "create":
         companies.create_error = failure
     else:
         staging.link_error = failure
@@ -327,11 +351,13 @@ class PromotionCriticalFailure(BaseException):
     pass
 
 
-@pytest.mark.parametrize("boundary", ["candidate", "create", "link"])
+@pytest.mark.parametrize("boundary", ["scope", "candidate", "create", "link"])
 def test_baseexception_propagates(boundary: str) -> None:
     service, staging, companies = make_service()
     failure = PromotionCriticalFailure("critical")
-    if boundary == "candidate":
+    if boundary == "scope":
+        companies.scope_error = failure
+    elif boundary == "candidate":
         staging.get_error = failure
     elif boundary == "create":
         companies.create_error = failure
@@ -340,6 +366,100 @@ def test_baseexception_propagates(boundary: str) -> None:
 
     with pytest.raises(PromotionCriticalFailure):
         service.promote(12, 34)
+
+
+def assert_sanitized_error(
+    error: Exception,
+    expected_message: str,
+    markers: tuple[str, ...],
+) -> None:
+    assert str(error) == expected_message
+    assert repr(error) == f"{type(error).__name__}({expected_message!r})"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert error.__suppress_context__ is False
+    for chain in (True, False):
+        formatted = "".join(traceback.format_exception(error, chain=chain))
+        for marker in markers:
+            assert marker not in formatted
+
+
+def test_name_validation_error_chain_is_fully_sanitized() -> None:
+    marker = "RAW_CANDIDATE_NAME_F7G1"
+    service, _, _ = make_service(FakeCandidate(name=f"<{marker}>"))
+
+    with pytest.raises(CompanyDiscoveryCandidatePromotionInvalidDataError) as captured:
+        service.promote(12, 34)
+
+    assert_sanitized_error(
+        captured.value,
+        "Candidate promotion data is invalid.",
+        (marker,),
+    )
+
+
+def test_website_validation_error_chain_is_fully_sanitized() -> None:
+    marker = "RAW_WEBSITE_CREDENTIALS_AND_PATH_F7G1"
+    website = f"ftp://user:{marker}@example.com/{marker}"
+    service, _, _ = make_service(FakeCandidate(website=website))
+
+    with pytest.raises(CompanyDiscoveryCandidatePromotionInvalidDataError) as captured:
+        service.promote(12, 34)
+
+    assert_sanitized_error(
+        captured.value,
+        "Candidate promotion data is invalid.",
+        (marker,),
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "marker"),
+    [
+        (ValueError, "RAW_DUPLICATE_NORMALIZATION_F7G1"),
+        (TypeError, "RAW_DATABASE_NORMALIZATION_DETAIL_F7G1"),
+    ],
+)
+def test_duplicate_lookup_error_chain_is_fully_sanitized(
+    failure_type: type[Exception],
+    marker: str,
+) -> None:
+    service, _, companies = make_service()
+    companies.duplicate_error = failure_type(marker)
+
+    with pytest.raises(CompanyDiscoveryCandidatePromotionInvalidDataError) as captured:
+        service.promote(12, 34)
+
+    assert_sanitized_error(
+        captured.value,
+        "Candidate promotion data is invalid.",
+        (marker,),
+    )
+
+
+def test_country_validation_error_is_fully_sanitized() -> None:
+    marker = "RAW_COUNTRY_F7G1"
+    service, _, _ = make_service(FakeCandidate(country_code=marker + ("X" * 100)))
+
+    with pytest.raises(CompanyDiscoveryCandidatePromotionInvalidDataError) as captured:
+        service.promote(12, 34)
+
+    assert_sanitized_error(
+        captured.value,
+        "Candidate promotion data is invalid.",
+        (marker,),
+    )
+
+
+def test_missing_project_scope_error_chain_is_fully_sanitized() -> None:
+    marker = "RAW_PROJECT_LOOKUP_F7G1"
+    service, _, companies = make_service()
+    companies.scope_error = ValueError(marker)
+
+    with pytest.raises(CompanyDiscoveryCandidatePromotionNotFoundError) as captured:
+        service.promote(12, 34)
+
+    assert_sanitized_error(captured.value, "Candidate was not found.", (marker,))
 
 
 def test_promotion_result_enforces_state_invariants() -> None:

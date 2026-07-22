@@ -1,8 +1,9 @@
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.modules.company.models import Company
 from app.modules.company_import.normalization import normalize_website_hostname
+from app.modules.project.models import Project
 
 
 class CompanyRepository:
@@ -54,6 +55,25 @@ class CompanyRepository:
         statement = select(Company).where(Company.project_id == project_id).order_by(Company.id)
 
         return list(self.session.scalars(statement))
+
+    def acquire_promotion_scope(self, project_id: int) -> None:
+        """Serialize Company promotion work for one Project transaction."""
+        self._validate_positive_id(project_id, "Project")
+
+        if self.session.get_bind().dialect.name == "sqlite":
+            self.session.execute(
+                update(Project).where(Project.id == project_id).values(name=Project.name)
+            )
+            existing_project_id = self.session.scalar(
+                select(Project.id).where(Project.id == project_id)
+            )
+        else:
+            existing_project_id = self.session.scalar(
+                select(Project.id).where(Project.id == project_id).with_for_update()
+            )
+
+        if existing_project_id is None:
+            raise ValueError("Project was not found.")
 
     def get_for_project(self, project_id: int, company_id: int) -> Company | None:
         self._validate_positive_id(project_id, "Project")

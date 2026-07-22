@@ -1,9 +1,13 @@
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
 
 import pytest
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.database.base import Base
 from app.core.database.session import SessionLocal
 from app.modules.company.models import Company
 from app.modules.company.repository import CompanyRepository
@@ -12,6 +16,9 @@ from app.modules.company_discovery import (
     CompanyDiscoveryCandidatePromotionNotFoundError,
     CompanyDiscoveryCandidatePromotionService,
     CompanyDiscoveryCandidateReviewService,
+)
+from app.modules.company_discovery.candidate_promotion_schemas import (
+    CompanyDiscoveryCandidatePromotionResult,
 )
 from app.modules.company_discovery.models import (
     CompanyDiscoveryCandidate,
@@ -23,6 +30,7 @@ from app.modules.company_discovery.staging_schemas import (
     CompanyDiscoveryRequestSnapshot,
     CompanyDiscoveryRunCreate,
 )
+from app.modules.company_import.normalization import normalize_website_hostname
 from app.modules.contact.models import Contact
 from app.modules.project.models import Project
 
@@ -31,6 +39,61 @@ from app.modules.project.models import Project
 def session() -> Generator[Session]:
     with SessionLocal() as value:
         yield value
+
+
+@pytest.fixture
+def concurrency_session_factory(
+    tmp_path: Path,
+) -> Generator[sessionmaker[Session]]:
+    database_path = tmp_path / "candidate-promotion-concurrency.sqlite3"
+    engine = create_engine(
+        f"sqlite:///{database_path.as_posix()}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    with engine.connect() as connection:
+        journal_mode = connection.exec_driver_sql("PRAGMA journal_mode=WAL").scalar_one()
+        connection.exec_driver_sql("PRAGMA busy_timeout=10000")
+        assert journal_mode.lower() == "wal"
+    Base.metadata.create_all(engine)
+    try:
+        yield sessionmaker(bind=engine, expire_on_commit=False)
+    finally:
+        engine.dispose()
+
+
+class BarrierCompanyRepository(CompanyRepository):
+    def __init__(self, session: Session, barrier: Barrier) -> None:
+        super().__init__(session)
+        self.barrier = barrier
+
+    def acquire_promotion_scope(self, project_id: int) -> None:
+        self.barrier.wait(timeout=10)
+        super().acquire_promotion_scope(project_id)
+
+
+def promote_concurrently(
+    session_factory: sessionmaker[Session],
+    project_id: int,
+    candidate_ids: list[int],
+) -> list[CompanyDiscoveryCandidatePromotionResult]:
+    barrier = Barrier(len(candidate_ids))
+
+    def promote(candidate_id: int) -> CompanyDiscoveryCandidatePromotionResult:
+        with session_factory() as worker_session:
+            service = CompanyDiscoveryCandidatePromotionService(
+                CompanyDiscoveryStagingRepository(worker_session),
+                BarrierCompanyRepository(worker_session, barrier),
+            )
+            try:
+                result = service.promote(project_id, candidate_id)
+                worker_session.commit()
+                return result
+            except Exception:
+                worker_session.rollback()
+                raise
+
+    with ThreadPoolExecutor(max_workers=len(candidate_ids)) as executor:
+        return list(executor.map(promote, candidate_ids))
 
 
 def make_project(session: Session, name: str = "Project") -> Project:
@@ -193,3 +256,82 @@ def test_cross_project_candidate_is_not_promoted(session: Session) -> None:
     assert stored.candidate_status == CompanyDiscoveryCandidateStatus.REVIEWED
     assert stored.promoted_company_id is None
     assert session.scalar(select(func.count()).select_from(Company)) == 0
+
+
+def test_different_candidates_with_same_hostname_are_serialized(
+    concurrency_session_factory: sessionmaker[Session],
+) -> None:
+    with concurrency_session_factory() as setup_session:
+        project = make_project(setup_session, "Concurrent Project")
+        first = make_candidate(
+            setup_session,
+            project,
+            website="https://example.com:8443/a",
+        )
+        second = make_candidate(
+            setup_session,
+            project,
+            website="https://example.com:9443/b",
+        )
+        project_id = project.id
+        candidate_ids = [first.id, second.id]
+        setup_session.commit()
+
+    results = promote_concurrently(
+        concurrency_session_factory,
+        project_id,
+        candidate_ids,
+    )
+
+    with concurrency_session_factory() as verification:
+        companies = list(
+            verification.scalars(select(Company).where(Company.project_id == project_id))
+        )
+        matching = [
+            company
+            for company in companies
+            if normalize_website_hostname(company.website) == "example.com"
+        ]
+        stored_candidates = [
+            verification.get_one(CompanyDiscoveryCandidate, candidate_id)
+            for candidate_id in candidate_ids
+        ]
+
+        assert len(companies) == len(matching) == 1
+        assert {result.company_id for result in results} == {matching[0].id}
+        assert all(
+            candidate.candidate_status == CompanyDiscoveryCandidateStatus.PROMOTED
+            and candidate.promoted_company_id == matching[0].id
+            for candidate in stored_candidates
+        )
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+def test_same_candidate_concurrent_promotion_remains_idempotent(
+    concurrency_session_factory: sessionmaker[Session],
+) -> None:
+    with concurrency_session_factory() as setup_session:
+        project = make_project(setup_session, "Same Candidate Project")
+        candidate = make_candidate(setup_session, project)
+        project_id = project.id
+        candidate_id = candidate.id
+        setup_session.commit()
+
+    results = promote_concurrently(
+        concurrency_session_factory,
+        project_id,
+        [candidate_id, candidate_id],
+    )
+
+    with concurrency_session_factory() as verification:
+        companies = list(
+            verification.scalars(select(Company).where(Company.project_id == project_id))
+        )
+        stored_candidate = verification.get_one(CompanyDiscoveryCandidate, candidate_id)
+
+        assert len(companies) == 1
+        assert {result.company_id for result in results} == {companies[0].id}
+        assert sorted(result.changed for result in results) == [False, True]
+        assert stored_candidate.candidate_status == CompanyDiscoveryCandidateStatus.PROMOTED
+        assert stored_candidate.promoted_company_id == companies[0].id
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0

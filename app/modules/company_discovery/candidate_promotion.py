@@ -59,6 +59,8 @@ class CandidatePromotionStagingRepository(Protocol):
 
 
 class CandidatePromotionCompanyRepository(Protocol):
+    def acquire_promotion_scope(self, project_id: int) -> None: ...
+
     def get_for_project(
         self,
         project_id: int,
@@ -99,6 +101,14 @@ class CompanyDiscoveryCandidatePromotionService:
         self._validate_positive_id(project_id)
         self._validate_positive_id(candidate_id)
 
+        scope_failed = False
+        try:
+            self.company_repository.acquire_promotion_scope(project_id)
+        except (TypeError, ValueError):
+            scope_failed = True
+        if scope_failed:
+            raise CompanyDiscoveryCandidatePromotionNotFoundError("Candidate was not found.")
+
         candidate = self.staging_repository.get_candidate_for_promotion(
             project_id,
             candidate_id,
@@ -127,15 +137,16 @@ class CompanyDiscoveryCandidatePromotionService:
 
         company: CandidatePromotionCompanyRecord | None = None
         if website is not None:
+            duplicate_lookup_failed = False
             try:
                 company = self.company_repository.find_duplicate_by_website(
                     project_id,
                     website,
                 )
-            except ValueError as error:
-                raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                    "Candidate promotion data is invalid."
-                ) from error
+            except (TypeError, ValueError):
+                duplicate_lookup_failed = True
+            if duplicate_lookup_failed:
+                raise self._invalid_data_error()
 
         created_company = company is None
         if company is None:
@@ -208,19 +219,15 @@ class CompanyDiscoveryCandidatePromotionService:
     @staticmethod
     def _validate_name(value: str | None) -> str:
         if not isinstance(value, str):
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            )
+            raise CompanyDiscoveryCandidatePromotionService._invalid_data_error()
+        normalization_failed = False
+        normalized: str | None = None
         try:
             normalized = normalize_display_name(value)
-        except ValueError as error:
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            ) from error
-        if normalized is None or len(normalized) > 255:
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            )
+        except (TypeError, ValueError):
+            normalization_failed = True
+        if normalization_failed or normalized is None or len(normalized) > 255:
+            raise CompanyDiscoveryCandidatePromotionService._invalid_data_error()
         return normalized
 
     @staticmethod
@@ -228,27 +235,21 @@ class CompanyDiscoveryCandidatePromotionService:
         if value is None:
             return None
         if not isinstance(value, str) or len(value) > 255:
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            )
+            raise CompanyDiscoveryCandidatePromotionService._invalid_data_error()
+        normalization_failed = False
+        hostname: str | None = None
         try:
             hostname = normalize_website_hostname(value)
-        except ValueError as error:
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            ) from error
-        if hostname is None:
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            )
+        except (TypeError, ValueError):
+            normalization_failed = True
+        if normalization_failed or hostname is None:
+            raise CompanyDiscoveryCandidatePromotionService._invalid_data_error()
         return value
 
     @staticmethod
     def _validate_country(value: str | None) -> str | None:
         if value is not None and (not isinstance(value, str) or len(value) > 100):
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            )
+            raise CompanyDiscoveryCandidatePromotionService._invalid_data_error()
         return value
 
     @classmethod
@@ -265,9 +266,13 @@ class CompanyDiscoveryCandidatePromotionService:
     @classmethod
     def _validate_positive_id(cls, value: int) -> None:
         if not cls._is_positive_id(value):
-            raise CompanyDiscoveryCandidatePromotionInvalidDataError(
-                "Candidate promotion data is invalid."
-            )
+            raise cls._invalid_data_error()
+
+    @staticmethod
+    def _invalid_data_error() -> CompanyDiscoveryCandidatePromotionInvalidDataError:
+        return CompanyDiscoveryCandidatePromotionInvalidDataError(
+            "Candidate promotion data is invalid."
+        )
 
     @staticmethod
     def _is_positive_id(value: object) -> bool:

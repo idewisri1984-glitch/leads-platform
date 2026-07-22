@@ -155,6 +155,29 @@ def test_promotion_duplicate_lookup_is_normalized_and_project_scoped() -> None:
         assert repository.get_for_project(second.id, existing.id) is None
 
 
+@pytest.mark.parametrize("project_id", [0, -1, True, "1", None])
+def test_promotion_scope_rejects_invalid_project_id(project_id: object) -> None:
+    with SessionLocal() as session:
+        repository = CompanyRepository(session)
+
+        with pytest.raises(ValueError, match="Project ID must be a positive integer"):
+            repository.acquire_promotion_scope(project_id)  # type: ignore[arg-type]
+
+
+def test_promotion_scope_verifies_project_and_preserves_project_data() -> None:
+    with SessionLocal() as session:
+        project = ProjectRepository(session).create("Promotion Scope Project")
+        project_id = project.id
+        repository = CompanyRepository(session)
+
+        repository.acquire_promotion_scope(project_id)
+
+        assert project.name == "Promotion Scope Project"
+        with pytest.raises(ValueError, match="Project was not found"):
+            repository.acquire_promotion_scope(project_id + 1_000_000)
+        session.rollback()
+
+
 def test_promotion_repository_methods_do_not_control_session_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -167,6 +190,7 @@ def test_promotion_repository_methods_do_not_control_session_lifecycle(
         monkeypatch.setattr(session, "rollback", lambda: calls.__setitem__("rollback", 1))
         monkeypatch.setattr(session, "close", lambda: calls.__setitem__("close", 1))
 
+        repository.acquire_promotion_scope(project.id)
         company = repository.create_for_promotion(
             project_id=project.id,
             name="Transactionless Company",
