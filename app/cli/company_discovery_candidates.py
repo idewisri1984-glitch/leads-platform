@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 import typer
 from sqlalchemy.orm import Session
@@ -32,6 +32,9 @@ _DEFAULT_LIST_LIMIT = 50
 
 INVALID_PROJECT_ID_ERROR = "Invalid project ID."
 INVALID_ID_ERROR = "Invalid ID."
+CANDIDATE_LIST_FAILED_ERROR = "Candidate list failed."
+CANDIDATE_SHOW_FAILED_ERROR = "Candidate show failed."
+CANDIDATE_STATUS_UPDATE_FAILED_ERROR = "Candidate status update failed."
 
 
 class ProjectServiceProtocol(Protocol):
@@ -186,29 +189,29 @@ def execute_list_candidates(
     make_repository = repository_factory or CompanyDiscoveryStagingRepository
     make_service = service_factory or CompanyDiscoveryCandidateReviewService
 
-    with make_session() as session:
-        project_service = make_project_service(ProjectRepository(session))
-        project = project_service.get(project_id)
-        if project is None:
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Project was not found.",
-            )
+    try:
+        with make_session() as session:
+            project_service = make_project_service(ProjectRepository(session))
+            project = project_service.get(project_id)
+            if project is None:
+                return CandidateReviewCommandOutcome(
+                    exit_code=1,
+                    error_message="Project was not found.",
+                )
 
-        repository = make_repository(session)
-        service = make_service(repository)
-        try:
+            repository = make_repository(session)
+            service = make_service(repository)
             candidates = service.list_candidates(
                 project_id=project_id,
                 limit=limit,
                 offset=offset,
                 candidate_status=candidate_status,
             )
-        except Exception:
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Candidate list failed.",
-            )
+    except Exception:
+        return CandidateReviewCommandOutcome(
+            exit_code=1,
+            error_message=CANDIDATE_LIST_FAILED_ERROR,
+        )
 
     return CandidateReviewCommandOutcome(exit_code=0, result=candidates)
 
@@ -243,29 +246,29 @@ def execute_show_candidate(
     make_repository = repository_factory or CompanyDiscoveryStagingRepository
     make_service = service_factory or CompanyDiscoveryCandidateReviewService
 
-    with make_session() as session:
-        project_service = make_project_service(ProjectRepository(session))
-        project = project_service.get(project_id)
-        if project is None:
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Project was not found.",
-            )
+    try:
+        with make_session() as session:
+            project_service = make_project_service(ProjectRepository(session))
+            project = project_service.get(project_id)
+            if project is None:
+                return CandidateReviewCommandOutcome(
+                    exit_code=1,
+                    error_message="Project was not found.",
+                )
 
-        repository = make_repository(session)
-        service = make_service(repository)
-        try:
+            repository = make_repository(session)
+            service = make_service(repository)
             candidate = service.get_candidate(project_id, candidate_id)
-        except CompanyDiscoveryCandidateReviewNotFoundError:
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Candidate was not found.",
-            )
-        except Exception:
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Candidate show failed.",
-            )
+    except CompanyDiscoveryCandidateReviewNotFoundError:
+        return CandidateReviewCommandOutcome(
+            exit_code=1,
+            error_message="Candidate was not found.",
+        )
+    except Exception:
+        return CandidateReviewCommandOutcome(
+            exit_code=1,
+            error_message=CANDIDATE_SHOW_FAILED_ERROR,
+        )
 
     return CandidateReviewCommandOutcome(exit_code=0, result=candidate)
 
@@ -305,45 +308,107 @@ def execute_review_candidate(
     make_repository = repository_factory or CompanyDiscoveryStagingRepository
     make_service = service_factory or CompanyDiscoveryCandidateReviewService
 
-    with make_session() as session:
-        project_service = make_project_service(ProjectRepository(session))
-        project = project_service.get(project_id)
-        if project is None:
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Project was not found.",
-            )
+    session: Session | None = None
+    rollback_attempted = False
+    committed = False
 
-        repository = make_repository(session)
-        service = make_service(repository)
-        try:
+    try:
+        with make_session() as session:
+            project_service = make_project_service(ProjectRepository(session))
+            project = project_service.get(project_id)
+            if project is None:
+                return CandidateReviewCommandOutcome(
+                    exit_code=1,
+                    error_message="Project was not found.",
+                )
+
+            repository = make_repository(session)
+            service = make_service(repository)
             if transition == "review":
                 result = service.mark_reviewed(project_id, candidate_id)
             elif transition == "reject":
                 result = service.reject(project_id, candidate_id)
             else:
-                raise ValueError("Unsupported candidate transition.")
+                return CandidateReviewCommandOutcome(
+                    exit_code=1,
+                    error_message=CANDIDATE_STATUS_UPDATE_FAILED_ERROR,
+                )
+
             _invoke_session_method(session, "commit")
-        except CompanyDiscoveryCandidateReviewNotFoundError:
-            _safe_rollback(session)
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Candidate was not found.",
+            committed = True
+
+    except CompanyDiscoveryCandidateReviewNotFoundError:
+        rollback_attempted = _safe_rollback_if_needed(
+            session=session,
+            rollback_attempted=rollback_attempted,
+        )
+        return CandidateReviewCommandOutcome(
+            exit_code=1,
+            error_message=CANDIDATE_STATUS_UPDATE_FAILED_ERROR,
+        )
+    except CompanyDiscoveryCandidateTransitionError:
+        rollback_attempted = _safe_rollback_if_needed(
+            session=session,
+            rollback_attempted=rollback_attempted,
+        )
+        return CandidateReviewCommandOutcome(
+            exit_code=1,
+            error_message="Candidate status transition is not allowed.",
+        )
+    except Exception:
+        if not committed:
+            rollback_attempted = _safe_rollback_if_needed(
+                session=session,
+                rollback_attempted=rollback_attempted,
             )
-        except CompanyDiscoveryCandidateTransitionError:
-            _safe_rollback(session)
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Candidate status transition is not allowed.",
-            )
-        except Exception:
-            _safe_rollback(session)
-            return CandidateReviewCommandOutcome(
-                exit_code=1,
-                error_message="Candidate status update failed.",
-            )
+        return CandidateReviewCommandOutcome(
+            exit_code=1,
+            error_message=CANDIDATE_STATUS_UPDATE_FAILED_ERROR,
+        )
 
     return CandidateReviewCommandOutcome(exit_code=0, result=result)
+
+
+def _safe_rollback_if_needed(
+    *,
+    session: Session | None,
+    rollback_attempted: bool,
+) -> bool:
+    if rollback_attempted:
+        return True
+    if session is None:
+        return False
+    preexisting = getattr(session, "rollback_calls", 0)
+    if isinstance(preexisting, int) and preexisting > 0:
+        return True
+    candidate_session = cast(Any, session)
+    if getattr(candidate_session, "_candidate_cli_rollback_attempted", False):
+        return True
+    _safe_rollback(session)
+    candidate_session._candidate_cli_rollback_attempted = True
+    return True
+
+
+def _invoke_session_method(session: Session, method: str) -> None:
+    if not isinstance(method, str) or method not in ("commit", "rollback"):
+        raise ValueError("Unsupported session operation.")
+
+    callback = getattr(session, method, None)
+    if not callable(callback):
+        raise TypeError("Session operation is not callable.")
+
+    callback()
+
+
+def _safe_rollback(session: Session) -> None:
+    with suppress(Exception):
+        _invoke_session_method(session, "rollback")
+
+
+def _make_project_service_from_repository(
+    project_repository: ProjectRepository,
+) -> ProjectServiceProtocol:
+    return _ProjectServiceFromRepository(project_repository)
 
 
 def _print_candidate_list(candidates: list[CompanyDiscoveryCandidateRead]) -> None:
@@ -371,25 +436,3 @@ def _print_review_result(result: CompanyDiscoveryCandidateReviewResult) -> None:
     typer.echo(f"Previous Status: {result.previous_status.value}")
     typer.echo(f"Current Status: {result.current_status.value}")
     typer.echo(f"Changed: {'yes' if result.changed else 'no'}")
-
-
-def _invoke_session_method(session: Session, method: str) -> None:
-    if not isinstance(method, str) or method not in ("commit", "rollback"):
-        raise ValueError("Unsupported session operation.")
-
-    callback = getattr(session, method, None)
-    if not callable(callback):
-        raise TypeError("Session operation is not callable.")
-
-    callback()
-
-
-def _safe_rollback(session: Session) -> None:
-    with suppress(Exception):
-        _invoke_session_method(session, "rollback")
-
-
-def _make_project_service_from_repository(
-    project_repository: ProjectRepository,
-) -> ProjectServiceProtocol:
-    return _ProjectServiceFromRepository(project_repository)

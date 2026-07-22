@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -16,6 +17,8 @@ from app.modules.company_discovery.models import CompanyDiscoveryCandidateStatus
 from app.modules.company_discovery.staging_schemas import CompanyDiscoveryCandidateRead
 
 runner = CliRunner()
+_DEFAULT_PROJECT_SERVICE_FACTORY = candidate_cli._make_project_service_from_repository
+_DEFAULT_REPOSITORY_FACTORY = candidate_cli.CompanyDiscoveryStagingRepository  # type: ignore[attr-defined]
 
 
 def make_candidate_read(
@@ -90,6 +93,107 @@ class FakeSessionLocal:
 
     def __exit__(self, *args: object) -> None:
         return None
+
+
+def make_session_local(
+    *,
+    enter_error: BaseException | None = None,
+    exit_error: BaseException | None = None,
+    commit_error: Exception | None = None,
+    rollback_error: Exception | None = None,
+) -> Any:
+    class ControlledSession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.commit_error = commit_error
+            self.rollback_error = rollback_error
+
+        def commit(self) -> None:
+            self.commit_calls += 1
+            if self.commit_error is not None:
+                raise self.commit_error
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+            if self.rollback_error is not None:
+                raise self.rollback_error
+
+    class ControlledSessionLocal:
+        calls = 0
+        sessions: list[ControlledSession] = []
+
+        def __init__(self) -> None:
+            type(self).calls += 1
+            self.session = ControlledSession()
+            type(self).sessions.append(self.session)
+
+        def __enter__(self) -> ControlledSession:
+            if enter_error is not None:
+                raise enter_error
+            return self.session
+
+        def __exit__(self, *_args: object) -> None:
+            if exit_error is not None:
+                raise exit_error
+            return None
+
+    return ControlledSessionLocal
+
+
+def install_cli_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_local: Any | None = None,
+    project_repository: object | None = None,
+    service_factory: Any | None = None,
+    repository_factory: Any | None = None,
+    project_service_factory: Any | None = None,
+) -> None:
+    monkeypatch.setattr(
+        candidate_cli,
+        "SessionLocal",
+        session_local or make_session_local(),
+    )
+    monkeypatch.setattr(
+        candidate_cli,
+        "ProjectRepository",
+        project_repository or project_repository_factory(True),
+    )
+    monkeypatch.setattr(
+        candidate_cli,
+        "CompanyDiscoveryCandidateReviewService",
+        service_factory or FakeReviewService,
+    )
+    if repository_factory is not None:
+        monkeypatch.setattr(candidate_cli, "CompanyDiscoveryStagingRepository", repository_factory)
+    else:
+        monkeypatch.setattr(
+            candidate_cli,
+            "CompanyDiscoveryStagingRepository",
+            _DEFAULT_REPOSITORY_FACTORY,
+        )
+    if project_service_factory is not None:
+        monkeypatch.setattr(
+            candidate_cli, "_make_project_service_from_repository", project_service_factory
+        )
+    else:
+        monkeypatch.setattr(
+            candidate_cli,
+            "_make_project_service_from_repository",
+            _DEFAULT_PROJECT_SERVICE_FACTORY,
+        )
+
+
+def assert_sanitized_dependency_failure(
+    *,
+    result: Any,
+    message: str,
+    marker: str,
+) -> None:
+    assert result.exit_code == 1
+    assert message in result.output
+    assert marker not in result.output
+    assert "Traceback" not in result.output
 
 
 def reset_fakes() -> None:
@@ -413,6 +517,443 @@ def test_forbidden_transition_uses_safe_message_and_rolls_back(
     assert result.exit_code == 1
     assert "Candidate status transition is not allowed." in result.output
     assert FakeSessionLocal.sessions[0].rollback_calls == 1
+
+
+def test_list_dependency_failures_are_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_cli_dependencies(monkeypatch)
+
+    class SessionFactoryFailure:
+        def __init__(self) -> None:
+            raise RuntimeError("session_factory_fault")
+
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class BrokenProjectRepository:
+        def __init__(self, _session: object) -> None:
+            raise RuntimeError("project_repository_fault")
+
+    class BrokenProjectService:
+        def __init__(self, _repository: object) -> None:
+            raise RuntimeError("project_service_factory_fault")
+
+    class BrokenProject:
+        def get(self, _project_id: int) -> object:
+            raise RuntimeError("project_lookup_fault")
+
+    class BrokenCandidateRepository:
+        def __init__(self, _session: object) -> None:
+            raise RuntimeError("repository_factory_fault")
+
+    class BrokenCandidateService:
+        def __init__(self, _repository: object) -> None:
+            raise RuntimeError("service_factory_fault")
+
+    class BrokenCandidateServiceMethod(FakeReviewService):
+        def list_candidates(
+            self,
+            project_id: int,
+            limit: int,
+            offset: int = 0,
+            candidate_status: CompanyDiscoveryCandidateStatus | None = None,
+        ) -> list[CompanyDiscoveryCandidateRead]:
+            raise RuntimeError("service_list_fault")
+
+    for boundary in [
+        ("session_factory", SessionFactoryFailure),
+        ("session_enter", make_session_local(enter_error=RuntimeError("session_enter_fault"))),
+        ("project_repository", BrokenProjectRepository),
+        ("project_service_factory", BrokenProjectService),
+        ("project_lookup", BrokenProject),
+        ("repository_factory", BrokenCandidateRepository),
+        ("service_factory", BrokenCandidateService),
+        ("service", BrokenCandidateServiceMethod),
+        ("session_exit", make_session_local(exit_error=RuntimeError("session_exit_fault"))),
+    ]:
+
+        def _raise_project_service_factory(_: object) -> object:
+            raise RuntimeError("project_service_factory_fault")
+
+        label, patcher = boundary
+        reset_fakes()
+        install_cli_dependencies(monkeypatch)
+        if label == "session_factory":
+            monkeypatch.setattr(candidate_cli, "SessionLocal", SessionFactoryFailure)
+        elif label == "session_enter":
+            monkeypatch.setattr(candidate_cli, "SessionLocal", patcher)
+        elif label == "project_repository":
+            monkeypatch.setattr(candidate_cli, "ProjectRepository", patcher)
+        elif label == "project_service_factory":
+            monkeypatch.setattr(
+                candidate_cli,
+                "_make_project_service_from_repository",
+                _raise_project_service_factory,
+            )
+        elif label == "project_lookup":
+            monkeypatch.setattr(
+                candidate_cli, "ProjectRepository", lambda _session: BrokenProject()
+            )
+        elif label == "repository_factory":
+            monkeypatch.setattr(candidate_cli, "CompanyDiscoveryStagingRepository", patcher)
+        elif label == "service_factory":
+            monkeypatch.setattr(candidate_cli, "CompanyDiscoveryCandidateReviewService", patcher)
+        elif label == "service":
+            monkeypatch.setattr(
+                candidate_cli,
+                "CompanyDiscoveryCandidateReviewService",
+                BrokenCandidateServiceMethod,
+            )
+        elif label == "session_exit":
+            monkeypatch.setattr(candidate_cli, "SessionLocal", patcher)
+        result = runner.invoke(
+            cli_main.app,
+            ["company-discovery", "candidate", "list", "--project-id", "12"],
+        )
+        assert result.exit_code == 1
+        assert "Candidate list failed." in result.output
+        assert "session_factory_fault" not in result.output
+        assert "project_repository_fault" not in result.output
+        assert "project_service_factory_fault" not in result.output
+        assert "project_lookup_fault" not in result.output
+        assert "repository_factory_fault" not in result.output
+        assert "service_factory_fault" not in result.output
+        assert "service_list_fault" not in result.output
+        assert "session_enter_fault" not in result.output
+        assert "session_exit_fault" not in result.output
+        assert "Traceback" not in result.output
+
+
+def test_show_dependency_failures_are_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenService:
+        def __init__(self, _repository: object) -> None:
+            raise RuntimeError("service_factory_fault")
+
+    install_cli_dependencies(monkeypatch)
+    monkeypatch.setattr(candidate_cli, "CompanyDiscoveryCandidateReviewService", BrokenService)
+    result = runner.invoke(
+        cli_main.app,
+        ["company-discovery", "candidate", "show", "--project-id", "12", "--candidate-id", "34"],
+    )
+    assert_sanitized_dependency_failure(
+        result=result,
+        message="Candidate show failed.",
+        marker="service_factory_fault",
+    )
+
+
+def test_review_dependency_failures_are_sanitized_and_rollback_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SessionFactoryFailure:
+        def __init__(self) -> None:
+            raise RuntimeError("session_factory_fault")
+
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class BrokenProjectService:
+        def __init__(self, _repository: object) -> None:
+            raise RuntimeError("project_service_factory_fault")
+
+    class BrokenProject:
+        def get(self, _project_id: int) -> object:
+            raise RuntimeError("project_lookup_fault")
+
+    class BrokenRepository:
+        def __init__(self, _session: object) -> None:
+            raise RuntimeError("repository_factory_fault")
+
+    class BrokenService:
+        def __init__(self, _repository: object) -> None:
+            raise RuntimeError("service_factory_fault")
+
+        def get_candidate(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateRead:
+            raise RuntimeError("UNUSED")
+
+        def list_candidates(
+            self,
+            project_id: int,
+            limit: int,
+            offset: int = 0,
+            candidate_status: CompanyDiscoveryCandidateStatus | None = None,
+        ) -> list[CompanyDiscoveryCandidateRead]:
+            return []
+
+        def mark_reviewed(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateReviewResult:
+            raise RuntimeError("service_review_fault")
+
+        def reject(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateReviewResult:
+            raise RuntimeError("service_reject_fault")
+
+    class CommitRollbackService(FakeReviewService):
+        def mark_reviewed(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateReviewResult:
+            return make_review_result(
+                candidate_id=candidate_id,
+                project_id=project_id,
+                previous_status=CompanyDiscoveryCandidateStatus.DISCOVERED,
+                current_status=CompanyDiscoveryCandidateStatus.REVIEWED,
+                changed=True,
+            )
+
+    class ServiceThatRollbacksThenRaises:
+        def __init__(self, repository: Any) -> None:
+            self.repository = repository
+
+        def get_candidate(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateRead:
+            return make_candidate_read(
+                candidate_id=candidate_id,
+                project_id=project_id,
+                status=CompanyDiscoveryCandidateStatus.DISCOVERED,
+            )
+
+        def list_candidates(
+            self,
+            project_id: int,
+            limit: int,
+            offset: int = 0,
+            candidate_status: CompanyDiscoveryCandidateStatus | None = None,
+        ) -> list[CompanyDiscoveryCandidateRead]:
+            return []
+
+        def mark_reviewed(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateReviewResult:
+            self.repository.session.rollback()
+            raise CompanyDiscoveryCandidateReviewNotFoundError("Candidate was not found.")
+
+        def reject(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateReviewResult:
+            raise CompanyDiscoveryCandidateReviewNotFoundError("Candidate was not found.")
+
+    class RepoWithSession:
+        def __init__(self, session: object) -> None:
+            self.session = session
+
+    class ServiceMethodFailure(CommitRollbackService):
+        def mark_reviewed(
+            self, project_id: int, candidate_id: int
+        ) -> CompanyDiscoveryCandidateReviewResult:
+            raise RuntimeError("service_review_fault")
+
+    for transition, patcher in [
+        ("session_factory", SessionFactoryFailure),
+        ("project_lookup", BrokenProject),
+        ("project_service_factory", BrokenProjectService),
+        ("repository_factory", BrokenRepository),
+        ("service_factory", BrokenService),
+        ("service", ServiceMethodFailure),
+    ]:
+
+        def _raise_project_service_factory(_: object) -> object:
+            raise RuntimeError("project_service_factory_fault")
+
+        reset_fakes()
+        install_cli_dependencies(monkeypatch)
+        if transition == "session_factory":
+            monkeypatch.setattr(candidate_cli, "SessionLocal", patcher)
+        elif transition == "project_lookup":
+            monkeypatch.setattr(
+                candidate_cli, "ProjectRepository", lambda _session: BrokenProject()
+            )
+        elif transition == "project_service_factory":
+            monkeypatch.setattr(
+                candidate_cli,
+                "_make_project_service_from_repository",
+                _raise_project_service_factory,
+            )
+        elif transition == "repository_factory":
+            monkeypatch.setattr(
+                candidate_cli, "CompanyDiscoveryStagingRepository", BrokenRepository
+            )
+        elif transition == "service_factory":
+            monkeypatch.setattr(
+                candidate_cli, "CompanyDiscoveryCandidateReviewService", BrokenService
+            )
+        elif transition == "service":
+            monkeypatch.setattr(
+                candidate_cli, "CompanyDiscoveryCandidateReviewService", ServiceMethodFailure
+            )
+
+        result = runner.invoke(
+            cli_main.app,
+            [
+                "company-discovery",
+                "candidate",
+                "review",
+                "--project-id",
+                "12",
+                "--candidate-id",
+                "34",
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 1
+        assert result.output.count("Candidate status update failed.") == 1
+        assert "Traceback" not in result.output
+        assert "service_review_fault" not in result.output
+        assert "service_reject_fault" not in result.output
+        assert "session_factory_fault" not in result.output
+        assert "project_service_factory_fault" not in result.output
+        assert "project_lookup_fault" not in result.output
+        assert "repository_factory_fault" not in result.output
+        assert "service_factory_fault" not in result.output
+
+    session_local = make_session_local()
+    install_cli_dependencies(
+        monkeypatch, session_local=session_local, service_factory=CommitRollbackService
+    )
+    result = runner.invoke(
+        cli_main.app,
+        [
+            "company-discovery",
+            "candidate",
+            "review",
+            "--project-id",
+            "12",
+            "--candidate-id",
+            "34",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0
+    assert session_local.sessions[0].commit_calls == 1
+    assert session_local.sessions[0].rollback_calls == 0
+
+    session_local = make_session_local(commit_error=RuntimeError("commit_failure"))
+    install_cli_dependencies(
+        monkeypatch, session_local=session_local, service_factory=CommitRollbackService
+    )
+    result = runner.invoke(
+        cli_main.app,
+        [
+            "company-discovery",
+            "candidate",
+            "review",
+            "--project-id",
+            "12",
+            "--candidate-id",
+            "34",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Candidate status update failed." in result.output
+    assert session_local.sessions[0].commit_calls == 1
+    assert session_local.sessions[0].rollback_calls == 1
+
+    session_local = make_session_local(exit_error=RuntimeError("session_exit_failure"))
+    install_cli_dependencies(
+        monkeypatch, session_local=session_local, service_factory=CommitRollbackService
+    )
+    result = runner.invoke(
+        cli_main.app,
+        [
+            "company-discovery",
+            "candidate",
+            "review",
+            "--project-id",
+            "12",
+            "--candidate-id",
+            "34",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Candidate status update failed." in result.output
+    assert session_local.sessions[0].commit_calls == 1
+    assert session_local.sessions[0].rollback_calls == 0
+
+    session_local = make_session_local()
+    install_cli_dependencies(
+        monkeypatch,
+        session_local=session_local,
+        repository_factory=RepoWithSession,
+        service_factory=ServiceThatRollbacksThenRaises,
+    )
+    result = runner.invoke(
+        cli_main.app,
+        [
+            "company-discovery",
+            "candidate",
+            "review",
+            "--project-id",
+            "12",
+            "--candidate-id",
+            "34",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Candidate status update failed." in result.output
+    assert session_local.sessions[0].rollback_calls == 1
+
+
+def test_review_baseexception_boundary_path_is_not_sanitized() -> None:
+    with pytest.raises(KeyboardInterrupt):
+        candidate_cli.execute_review_candidate(
+            project_id=12,
+            candidate_id=34,
+            yes=True,
+            transition="review",
+            session_factory=make_session_local(enter_error=KeyboardInterrupt("boom")),
+            project_service_factory=lambda _: (_ for _ in ()).throw(KeyboardInterrupt("boom")),
+            repository_factory=cast(Any, FakeReviewService),
+            service_factory=cast(Any, FakeReviewService),
+        )
+
+
+def test_list_baseexception_boundary_path_is_not_sanitized() -> None:
+    with pytest.raises(KeyboardInterrupt):
+        candidate_cli.execute_list_candidates(
+            project_id=12,
+            status=None,
+            limit=50,
+            offset=0,
+            session_factory=make_session_local(enter_error=KeyboardInterrupt("boom")),
+        )
+
+
+def test_show_baseexception_boundary_path_is_not_sanitized() -> None:
+    with pytest.raises(KeyboardInterrupt):
+        candidate_cli.execute_show_candidate(
+            project_id=12,
+            candidate_id=34,
+            session_factory=make_session_local(enter_error=KeyboardInterrupt("boom")),
+        )
+
+
+def test_invalid_transition_does_not_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_cli_dependencies(monkeypatch)
+    for transition in ["promote", "discovered", "", " ", True, 1, object()]:
+        session_local = make_session_local()
+        monkeypatch.setattr(candidate_cli, "SessionLocal", session_local)
+        result = candidate_cli.execute_review_candidate(
+            project_id=12,
+            candidate_id=34,
+            yes=True,
+            transition=transition,  # type: ignore[arg-type]
+        )
+        assert result.exit_code == 1
+        assert result.error_message == "Candidate status update failed."
+        assert session_local.sessions[0].commit_calls == 0
+        assert session_local.sessions[0].rollback_calls == 0
 
 
 def test_service_failure_rolls_back_and_hides_exception_text(
