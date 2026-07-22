@@ -7,7 +7,14 @@ import typer
 from sqlalchemy.orm import Session
 
 from app.core.database.session import SessionLocal
+from app.modules.company.repository import CompanyRepository
 from app.modules.company_discovery import (
+    CompanyDiscoveryCandidateNotEligibleError,
+    CompanyDiscoveryCandidatePromotionConsistencyError,
+    CompanyDiscoveryCandidatePromotionInvalidDataError,
+    CompanyDiscoveryCandidatePromotionNotFoundError,
+    CompanyDiscoveryCandidatePromotionResult,
+    CompanyDiscoveryCandidatePromotionService,
     CompanyDiscoveryCandidateReviewNotFoundError,
     CompanyDiscoveryCandidateReviewResult,
     CompanyDiscoveryCandidateReviewService,
@@ -22,8 +29,13 @@ app = typer.Typer(help="Manual candidate review and reject workflow.")
 
 SessionFactory = Callable[[], Session]
 RepositoryFactory = Callable[[Session], CompanyDiscoveryStagingRepository]
+CompanyRepositoryFactory = Callable[[Session], CompanyRepository]
 ServiceFactory = Callable[
     [CompanyDiscoveryStagingRepository], CompanyDiscoveryCandidateReviewService
+]
+PromotionServiceFactory = Callable[
+    [CompanyDiscoveryStagingRepository, CompanyRepository],
+    CompanyDiscoveryCandidatePromotionService,
 ]
 ProjectServiceFactory = Callable[[ProjectRepository], "ProjectServiceProtocol"]
 
@@ -35,6 +47,7 @@ INVALID_ID_ERROR = "Invalid ID."
 CANDIDATE_LIST_FAILED_ERROR = "Candidate list failed."
 CANDIDATE_SHOW_FAILED_ERROR = "Candidate show failed."
 CANDIDATE_STATUS_UPDATE_FAILED_ERROR = "Candidate status update failed."
+CANDIDATE_PROMOTION_FAILED_ERROR = "Candidate promotion failed."
 
 
 class ProjectServiceProtocol(Protocol):
@@ -58,6 +71,13 @@ class CandidateReviewCommandOutcome:
         | list[CompanyDiscoveryCandidateRead]
         | None
     ) = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidatePromotionCommandOutcome:
+    exit_code: int
+    result: CompanyDiscoveryCandidatePromotionResult | None = None
     error_message: str | None = None
 
 
@@ -141,6 +161,29 @@ def reject_candidate(
         typer.secho(outcome.error_message, fg=typer.colors.RED)
     elif isinstance(outcome.result, CompanyDiscoveryCandidateReviewResult):
         _print_review_result(outcome.result)
+    raise typer.Exit(outcome.exit_code)
+
+
+@app.command("promote")
+def promote_candidate(
+    project_id: int = typer.Option(help="Project ID.", min=1),
+    candidate_id: int = typer.Option(help="Candidate ID.", min=1),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm promotion into a canonical Company.",
+    ),
+) -> None:
+    """Promote one REVIEWED candidate into a canonical Company."""
+    outcome = execute_promote_candidate(
+        project_id=project_id,
+        candidate_id=candidate_id,
+        yes=yes,
+    )
+    if outcome.error_message is not None:
+        typer.secho(outcome.error_message, fg=typer.colors.RED)
+    elif outcome.result is not None:
+        _print_promotion_result(outcome.result)
     raise typer.Exit(outcome.exit_code)
 
 
@@ -369,6 +412,111 @@ def execute_review_candidate(
     return CandidateReviewCommandOutcome(exit_code=0, result=result)
 
 
+def execute_promote_candidate(
+    *,
+    project_id: int,
+    candidate_id: int,
+    yes: bool,
+    session_factory: SessionFactory | None = None,
+    project_service_factory: ProjectServiceFactory | None = None,
+    staging_repository_factory: RepositoryFactory | None = None,
+    company_repository_factory: CompanyRepositoryFactory | None = None,
+    promotion_service_factory: PromotionServiceFactory | None = None,
+) -> CandidatePromotionCommandOutcome:
+    if not yes:
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message="Candidate promotion requires --yes.",
+        )
+    if (
+        isinstance(project_id, bool)
+        or not isinstance(project_id, int)
+        or project_id <= 0
+        or isinstance(candidate_id, bool)
+        or not isinstance(candidate_id, int)
+        or candidate_id <= 0
+    ):
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message="Candidate promotion data is invalid.",
+        )
+
+    make_session = session_factory or SessionLocal
+    make_project_service = project_service_factory or _make_project_service_from_repository
+    make_staging_repository = staging_repository_factory or CompanyDiscoveryStagingRepository
+    make_company_repository = company_repository_factory or CompanyRepository
+    make_promotion_service = promotion_service_factory or CompanyDiscoveryCandidatePromotionService
+
+    session: Session | None = None
+    rollback_attempted = False
+    committed = False
+
+    try:
+        with make_session() as session:
+            project_service = make_project_service(ProjectRepository(session))
+            project = project_service.get(project_id)
+            if project is None:
+                return CandidatePromotionCommandOutcome(
+                    exit_code=1,
+                    error_message="Candidate was not found.",
+                )
+
+            staging_repository = make_staging_repository(session)
+            company_repository = make_company_repository(session)
+            service = make_promotion_service(staging_repository, company_repository)
+            result = service.promote(project_id, candidate_id)
+            _invoke_session_method(session, "commit")
+            committed = True
+    except CompanyDiscoveryCandidatePromotionNotFoundError:
+        rollback_attempted = _safe_rollback_if_needed(
+            session=session,
+            rollback_attempted=rollback_attempted,
+        )
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message="Candidate was not found.",
+        )
+    except CompanyDiscoveryCandidateNotEligibleError:
+        rollback_attempted = _safe_rollback_if_needed(
+            session=session,
+            rollback_attempted=rollback_attempted,
+        )
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message="Candidate is not eligible for promotion.",
+        )
+    except CompanyDiscoveryCandidatePromotionInvalidDataError:
+        rollback_attempted = _safe_rollback_if_needed(
+            session=session,
+            rollback_attempted=rollback_attempted,
+        )
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message="Candidate promotion data is invalid.",
+        )
+    except CompanyDiscoveryCandidatePromotionConsistencyError:
+        rollback_attempted = _safe_rollback_if_needed(
+            session=session,
+            rollback_attempted=rollback_attempted,
+        )
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message="Candidate promotion state is inconsistent.",
+        )
+    except Exception:
+        if not committed:
+            rollback_attempted = _safe_rollback_if_needed(
+                session=session,
+                rollback_attempted=rollback_attempted,
+            )
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message=CANDIDATE_PROMOTION_FAILED_ERROR,
+        )
+
+    return CandidatePromotionCommandOutcome(exit_code=0, result=result)
+
+
 def _safe_rollback_if_needed(
     *,
     session: Session | None,
@@ -435,4 +583,14 @@ def _print_review_result(result: CompanyDiscoveryCandidateReviewResult) -> None:
     typer.echo(f"Candidate ID: {result.candidate.id}")
     typer.echo(f"Previous Status: {result.previous_status.value}")
     typer.echo(f"Current Status: {result.current_status.value}")
+    typer.echo(f"Changed: {'yes' if result.changed else 'no'}")
+
+
+def _print_promotion_result(result: CompanyDiscoveryCandidatePromotionResult) -> None:
+    typer.echo(f"Candidate ID: {result.candidate_id}")
+    typer.echo(f"Project ID: {result.project_id}")
+    typer.echo(f"Company ID: {result.company_id}")
+    typer.echo(f"Previous Status: {result.previous_status.value}")
+    typer.echo(f"Current Status: {result.current_status.value}")
+    typer.echo(f"Company Created: {'yes' if result.created_company else 'no'}")
     typer.echo(f"Changed: {'yes' if result.changed else 'no'}")

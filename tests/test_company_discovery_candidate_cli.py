@@ -1081,11 +1081,11 @@ def test_list_and_show_do_not_print_identity_key_or_raw_markup(
         assert "snippets" not in output
 
 
-def test_no_promotion_command_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_promotion_command_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_fakes()
     monkeypatch.setattr(candidate_cli, "SessionLocal", FakeSessionLocal)
     monkeypatch.setattr(candidate_cli, "ProjectRepository", project_repository_factory(True))
     monkeypatch.setattr(candidate_cli, "CompanyDiscoveryCandidateReviewService", FakeReviewService)
 
     result = runner.invoke(cli_main.app, ["company-discovery", "candidate", "--help"])
-    assert "promote" not in result.output.casefold()
+    assert "promote" in result.output.casefold()

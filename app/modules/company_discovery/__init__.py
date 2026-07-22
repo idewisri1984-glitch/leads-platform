@@ -1,3 +1,14 @@
+from app.modules.company_discovery.candidate_promotion import (
+    CompanyDiscoveryCandidateNotEligibleError,
+    CompanyDiscoveryCandidatePromotionConsistencyError,
+    CompanyDiscoveryCandidatePromotionError,
+    CompanyDiscoveryCandidatePromotionInvalidDataError,
+    CompanyDiscoveryCandidatePromotionNotFoundError,
+    CompanyDiscoveryCandidatePromotionService,
+)
+from app.modules.company_discovery.candidate_promotion_schemas import (
+    CompanyDiscoveryCandidatePromotionResult,
+)
 from app.modules.company_discovery.candidate_review import (
     CompanyDiscoveryCandidateReviewNotFoundError,
     CompanyDiscoveryCandidateReviewService,
@@ -66,6 +77,13 @@ __all__ = [
     "CompanyDiscoveryCandidateReviewNotFoundError",
     "CompanyDiscoveryCandidateReviewService",
     "CompanyDiscoveryCandidateTransitionError",
+    "CompanyDiscoveryCandidateNotEligibleError",
+    "CompanyDiscoveryCandidatePromotionConsistencyError",
+    "CompanyDiscoveryCandidatePromotionError",
+    "CompanyDiscoveryCandidatePromotionInvalidDataError",
+    "CompanyDiscoveryCandidatePromotionNotFoundError",
+    "CompanyDiscoveryCandidatePromotionResult",
+    "CompanyDiscoveryCandidatePromotionService",
     "DiscoveryProvider",
     "DiscoveryProviderAuthenticationError",
     "DiscoveryProviderConfigurationError",

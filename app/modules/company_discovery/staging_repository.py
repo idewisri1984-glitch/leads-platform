@@ -1,6 +1,7 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.modules.company.models import Company
 from app.modules.company_discovery.models import (
     CompanyDiscoveryCandidate,
     CompanyDiscoveryCandidateStatus,
@@ -20,6 +21,10 @@ from app.modules.search_profile.models import SearchProfile
 
 
 class CompanyDiscoveryStagingNotFoundError(ValueError):
+    pass
+
+
+class CompanyDiscoveryStagingPromotionError(ValueError):
     pass
 
 
@@ -98,6 +103,60 @@ class CompanyDiscoveryStagingRepository:
             CompanyDiscoveryCandidate.project_id == project_id,
         )
         return self.session.scalar(statement)
+
+    def get_candidate_for_promotion(
+        self,
+        project_id: int,
+        candidate_id: int,
+    ) -> CompanyDiscoveryCandidate | None:
+        self._validate_positive_id(project_id, "Project")
+        self._validate_positive_id(candidate_id, "Candidate")
+        statement = (
+            select(CompanyDiscoveryCandidate)
+            .where(
+                CompanyDiscoveryCandidate.id == candidate_id,
+                CompanyDiscoveryCandidate.project_id == project_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        return self.session.scalar(statement)
+
+    def link_promoted_company(
+        self,
+        project_id: int,
+        candidate_id: int,
+        company_id: int,
+    ) -> CompanyDiscoveryCandidate:
+        self._validate_positive_id(project_id, "Project")
+        self._validate_positive_id(candidate_id, "Candidate")
+        self._validate_positive_id(company_id, "Company")
+
+        candidate = self.get_candidate_for_promotion(project_id, candidate_id)
+        if candidate is None:
+            raise CompanyDiscoveryStagingNotFoundError("Candidate was not found.")
+        if (
+            candidate.candidate_status != CompanyDiscoveryCandidateStatus.REVIEWED
+            or candidate.promoted_company_id is not None
+        ):
+            raise CompanyDiscoveryStagingPromotionError("Candidate is not reviewable.")
+
+        company = self.session.scalar(
+            select(Company)
+            .where(Company.id == company_id, Company.project_id == project_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if company is None:
+            raise CompanyDiscoveryStagingPromotionError(
+                "Company is not available for candidate promotion."
+            )
+
+        candidate.candidate_status = CompanyDiscoveryCandidateStatus.PROMOTED
+        candidate.promoted_company_id = company.id
+        self.session.add(candidate)
+        self.session.flush()
+        return candidate
 
     def set_candidate_status(
         self,
@@ -246,5 +305,6 @@ class CompanyDiscoveryStagingRepository:
 
 __all__ = [
     "CompanyDiscoveryStagingNotFoundError",
+    "CompanyDiscoveryStagingPromotionError",
     "CompanyDiscoveryStagingRepository",
 ]
