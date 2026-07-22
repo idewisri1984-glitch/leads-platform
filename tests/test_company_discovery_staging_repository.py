@@ -16,6 +16,7 @@ from app.modules.company_discovery.models import (
 )
 from app.modules.company_discovery.staging_repository import (
     CompanyDiscoveryStagingNotFoundError,
+    CompanyDiscoveryStagingPromotionError,
     CompanyDiscoveryStagingRepository,
 )
 from app.modules.company_discovery.staging_schemas import (
@@ -517,3 +518,146 @@ def test_set_candidate_status_flush_failure_propagates(
         repository.set_candidate_status(
             project.id, created.candidate.id, CompanyDiscoveryCandidateStatus.REJECTED
         )
+
+
+def test_link_promoted_company_is_project_scoped_and_updates_only_promotion_fields(
+    session: Session,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+    candidate = repository.get_candidate(created.candidate.id)
+    assert candidate is not None
+    candidate.candidate_status = CompanyDiscoveryCandidateStatus.REVIEWED
+    company = Company(project_id=project.id, name="Canonical")
+    session.add(company)
+    session.flush()
+    unchanged = {
+        "name": candidate.name,
+        "website": candidate.website,
+        "country_code": candidate.country_code,
+        "identity_key": candidate.identity_key,
+        "provider": candidate.provider,
+        "first_seen_run_id": candidate.first_seen_run_id,
+        "last_seen_run_id": candidate.last_seen_run_id,
+        "best_position": candidate.best_position,
+    }
+
+    linked = repository.link_promoted_company(project.id, candidate.id, company.id)
+
+    assert linked.candidate_status == CompanyDiscoveryCandidateStatus.PROMOTED
+    assert linked.promoted_company_id == company.id
+    assert {field: getattr(linked, field) for field in unchanged} == unchanged
+
+
+def test_link_promoted_company_rejects_missing_and_cross_project_records(
+    session: Session,
+) -> None:
+    first = make_project(session, "First")
+    second = make_project(session, "Second")
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(first.id))
+    created = repository.upsert_candidate(first.id, run.id, candidate_data(first.id, run.id))
+    candidate = repository.get_candidate(created.candidate.id)
+    assert candidate is not None
+    candidate.candidate_status = CompanyDiscoveryCandidateStatus.REVIEWED
+    other_company = Company(project_id=second.id, name="Other")
+    session.add(other_company)
+    session.flush()
+
+    with pytest.raises(CompanyDiscoveryStagingPromotionError):
+        repository.link_promoted_company(first.id, candidate.id, other_company.id)
+    with pytest.raises(CompanyDiscoveryStagingPromotionError):
+        repository.link_promoted_company(first.id, candidate.id, 999_999)
+    with pytest.raises(CompanyDiscoveryStagingNotFoundError):
+        repository.link_promoted_company(second.id, candidate.id, other_company.id)
+    with pytest.raises(CompanyDiscoveryStagingNotFoundError):
+        repository.link_promoted_company(first.id, 999_999, other_company.id)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        CompanyDiscoveryCandidateStatus.DISCOVERED,
+        CompanyDiscoveryCandidateStatus.REJECTED,
+        CompanyDiscoveryCandidateStatus.PROMOTED,
+    ],
+)
+def test_link_promoted_company_allows_only_reviewed_candidate(
+    session: Session,
+    status: CompanyDiscoveryCandidateStatus,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+    candidate = repository.get_candidate(created.candidate.id)
+    assert candidate is not None
+    company = Company(project_id=project.id, name="Canonical")
+    session.add(company)
+    session.flush()
+    candidate.candidate_status = status
+    candidate.promoted_company_id = (
+        company.id if status == CompanyDiscoveryCandidateStatus.PROMOTED else None
+    )
+    session.flush()
+
+    with pytest.raises(CompanyDiscoveryStagingPromotionError):
+        repository.link_promoted_company(project.id, candidate.id, company.id)
+
+
+def test_link_promoted_company_does_not_control_transaction_or_lifecycle(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+    candidate = repository.get_candidate(created.candidate.id)
+    assert candidate is not None
+    candidate.candidate_status = CompanyDiscoveryCandidateStatus.REVIEWED
+    company = Company(project_id=project.id, name="Canonical")
+    session.add(company)
+    session.flush()
+    calls = {"commit": 0, "rollback": 0, "close": 0}
+    monkeypatch.setattr(session, "commit", lambda: calls.__setitem__("commit", 1))
+    monkeypatch.setattr(session, "rollback", lambda: calls.__setitem__("rollback", 1))
+    monkeypatch.setattr(session, "close", lambda: calls.__setitem__("close", 1))
+
+    repository.link_promoted_company(project.id, candidate.id, company.id)
+
+    assert calls == {"commit": 0, "rollback": 0, "close": 0}
+
+
+class PromotionBaseException(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("flush failed"), PromotionBaseException("critical flush failure")],
+)
+def test_link_promoted_company_propagates_flush_failures(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+    candidate = repository.get_candidate(created.candidate.id)
+    assert candidate is not None
+    candidate.candidate_status = CompanyDiscoveryCandidateStatus.REVIEWED
+    company = Company(project_id=project.id, name="Canonical")
+    session.add(company)
+    session.flush()
+
+    def fail_flush(*_objects: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(session, "flush", fail_flush)
+    with pytest.raises(type(failure)):
+        repository.link_promoted_company(project.id, candidate.id, company.id)
