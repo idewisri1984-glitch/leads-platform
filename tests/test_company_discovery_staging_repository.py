@@ -1,5 +1,6 @@
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from sqlalchemy import func, select
@@ -14,6 +15,7 @@ from app.modules.company_discovery.models import (
     CompanyDiscoveryRunStatus,
 )
 from app.modules.company_discovery.staging_repository import (
+    CompanyDiscoveryStagingNotFoundError,
     CompanyDiscoveryStagingRepository,
 )
 from app.modules.company_discovery.staging_schemas import (
@@ -374,3 +376,144 @@ def test_promoted_candidate_preserves_non_null_company_and_all_protected_fields(
     assert unchanged.protected is True and unchanged.updated is False
     assert unchanged.candidate.promoted_company_id == company.id
     assert company.name == original_company_name
+
+
+def test_get_candidate_for_project_is_scoped_by_project_id(session: Session) -> None:
+    first, second = make_project(session, "First"), make_project(session, "Second")
+    repository = CompanyDiscoveryStagingRepository(session)
+    first_run = repository.create_run(run_data(first.id))
+    created = repository.upsert_candidate(
+        first.id, first_run.id, candidate_data(first.id, first_run.id, name="Acme")
+    )
+
+    assert repository.get_candidate_for_project(first.id, created.candidate.id) is not None
+    assert repository.get_candidate_for_project(second.id, created.candidate.id) is None
+
+
+def test_set_candidate_status_allows_only_reviewed_or_rejected(
+    session: Session,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+
+    with pytest.raises(ValueError):
+        repository.set_candidate_status(
+            project.id, created.candidate.id, CompanyDiscoveryCandidateStatus.DISCOVERED
+        )
+    with pytest.raises(ValueError):
+        repository.set_candidate_status(
+            project.id, created.candidate.id, CompanyDiscoveryCandidateStatus.PROMOTED
+        )
+
+
+def test_set_candidate_status_only_updates_candidate_status(
+    session: Session,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    company = Company(project_id=project.id, name="Existing")
+    session.add(company)
+    session.flush()
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(
+        project.id,
+        run.id,
+        candidate_data(
+            project.id,
+            run.id,
+            name="Acme",
+            website="https://www.example.com",
+        ),
+    )
+    model = repository.get_candidate(created.candidate.id)
+    assert model is not None
+    model.candidate_status = CompanyDiscoveryCandidateStatus.REVIEWED
+    model.promoted_company_id = company.id
+    session.flush()
+
+    updated = repository.set_candidate_status(
+        project.id, model.id, CompanyDiscoveryCandidateStatus.REJECTED
+    )
+
+    assert updated.candidate_status == CompanyDiscoveryCandidateStatus.REJECTED
+    assert updated.promoted_company_id == company.id
+
+
+def test_set_candidate_status_not_found_raises_staging_not_found_error(session: Session) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    repository.create_run(run_data(project.id))
+
+    with pytest.raises(CompanyDiscoveryStagingNotFoundError):
+        repository.set_candidate_status(project.id, 99999, CompanyDiscoveryCandidateStatus.REVIEWED)
+
+
+def test_set_candidate_status_rejects_invalid_identifiers(session: Session) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+
+    with pytest.raises(ValueError):
+        repository.set_candidate_status(
+            0, created.candidate.id, CompanyDiscoveryCandidateStatus.REVIEWED
+        )
+    with pytest.raises(ValueError):
+        repository.set_candidate_status(project.id, 0, CompanyDiscoveryCandidateStatus.REVIEWED)
+    with pytest.raises(ValueError):
+        repository.set_candidate_status(
+            cast(int, True),
+            created.candidate.id,
+            CompanyDiscoveryCandidateStatus.REVIEWED,
+        )
+
+
+def test_set_candidate_status_does_not_control_session_transaction_or_lifecycle(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+
+    calls = {"commit": 0, "rollback": 0, "close": 0}
+
+    def track_commit() -> None:
+        calls["commit"] += 1
+
+    def track_rollback() -> None:
+        calls["rollback"] += 1
+
+    def track_close() -> None:
+        calls["close"] += 1
+
+    monkeypatch.setattr(session, "commit", track_commit)
+    monkeypatch.setattr(session, "rollback", track_rollback)
+    monkeypatch.setattr(session, "close", track_close)
+    repository.set_candidate_status(
+        project.id, created.candidate.id, CompanyDiscoveryCandidateStatus.REJECTED
+    )
+    assert calls == {"commit": 0, "rollback": 0, "close": 0}
+
+
+def test_set_candidate_status_flush_failure_propagates(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(project.id, run.id, candidate_data(project.id, run.id))
+
+    def failing_flush(*_objects: object) -> None:
+        raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(session, "flush", failing_flush)
+
+    with pytest.raises(RuntimeError):
+        repository.set_candidate_status(
+            project.id, created.candidate.id, CompanyDiscoveryCandidateStatus.REJECTED
+        )
