@@ -123,6 +123,9 @@ class ContactDiscoveryRepository:
             name=candidate.name,
             title=candidate.title,
             source_url=candidate.source_url,
+            phone=candidate.phone,
+            linkedin_url=candidate.linkedin_url,
+            instagram_url=candidate.instagram_url,
         )
         existing = self.session.scalar(
             select(ContactDiscoveryCandidate).where(
@@ -138,6 +141,8 @@ class ContactDiscoveryRepository:
                 email=clean_discovered_text(candidate.email),
                 normalized_email=normalized_email,
                 phone=clean_discovered_text(candidate.phone),
+                linkedin_url=candidate.linkedin_url,
+                instagram_url=candidate.instagram_url,
                 source_url=clean_discovered_text(candidate.source_url),
                 source_type=candidate.source_type,
                 confidence=candidate.confidence,
@@ -160,6 +165,8 @@ class ContactDiscoveryRepository:
             "email": clean_discovered_text(candidate.email),
             "normalized_email": normalized_email,
             "phone": clean_discovered_text(candidate.phone),
+            "linkedin_url": candidate.linkedin_url,
+            "instagram_url": candidate.instagram_url,
             "source_url": clean_discovered_text(candidate.source_url),
             "notes": clean_discovered_text(candidate.notes),
             "last_error": clean_discovered_text(candidate.last_error),

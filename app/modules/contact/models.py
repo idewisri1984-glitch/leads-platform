@@ -8,7 +8,7 @@ class Contact(Base):
     """
     Contact entity.
 
-    Represents a person associated with a company.
+    Represents a person or generic business contact associated with a company.
     """
 
     __tablename__ = "contacts"
@@ -24,9 +24,9 @@ class Contact(Base):
         index=True,
     )
 
-    first_name: Mapped[str] = mapped_column(
+    first_name: Mapped[str | None] = mapped_column(
         String(100),
-        nullable=False,
+        nullable=True,
     )
 
     last_name: Mapped[str | None] = mapped_column(
@@ -51,6 +51,11 @@ class Contact(Base):
     )
 
     linkedin_url: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    instagram_url: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
     )

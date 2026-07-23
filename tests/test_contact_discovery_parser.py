@@ -463,8 +463,6 @@ def test_parser_has_no_network_provider_automation_contact_or_cli_imports() -> N
         "serpapi",
         "selenium",
         "playwright",
-        "instagram",
-        "linkedin",
         "send_message",
         "contactrepository",
         "from app.modules.contact.models",

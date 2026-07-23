@@ -20,6 +20,7 @@ class ContactService:
             email=data.email,
             phone=data.phone,
             linkedin_url=data.linkedin_url,
+            instagram_url=data.instagram_url,
             country=data.country,
             city=data.city,
             source=data.source,

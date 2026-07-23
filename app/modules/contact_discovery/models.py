@@ -102,6 +102,8 @@ class ContactDiscoveryCandidate(Base):
     email: Mapped[str | None] = mapped_column(String(255))
     normalized_email: Mapped[str | None] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(100))
+    linkedin_url: Mapped[str | None] = mapped_column(String(500))
+    instagram_url: Mapped[str | None] = mapped_column(String(500))
     source_url: Mapped[str | None] = mapped_column(String(500))
     source_type: Mapped[ContactDiscoverySourceType] = mapped_column(String(50), nullable=False)
     confidence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

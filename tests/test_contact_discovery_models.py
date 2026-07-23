@@ -168,6 +168,7 @@ def test_candidate_schema_rejects_missing_identity_and_raw_markup() -> None:
         ContactDiscoveryCandidateCreate(
             company_id=1,
             name="Person",
+            phone="123",
             source_type=ContactDiscoverySourceType.OTHER_PUBLIC_PAGE,
             notes="<html>raw marker</html>",
         )

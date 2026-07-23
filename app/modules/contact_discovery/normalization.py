@@ -35,6 +35,18 @@ def normalize_discovered_email(value: str | None) -> str | None:
     return normalized
 
 
+def normalize_discovered_phone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = _WHITESPACE.sub(" ", value.strip())
+    if not cleaned:
+        return None
+    digits = "".join(character for character in cleaned if character.isdigit())
+    if len(digits) < 3:
+        return None
+    return f"+{digits}" if cleaned.startswith("+") else digits
+
+
 def normalize_source_for_deduplication(value: str | None) -> str | None:
     if value is None or not value.strip():
         return None
@@ -63,16 +75,33 @@ def build_contact_candidate_deduplication_key(
     name: str | None,
     title: str | None,
     source_url: str | None,
+    phone: str | None = None,
+    linkedin_url: str | None = None,
+    instagram_url: str | None = None,
 ) -> str:
+    from app.modules.contact.channel_normalization import (
+        normalize_instagram_url,
+        normalize_linkedin_url,
+    )
+
     normalized_email = normalize_discovered_email(email)
     if normalized_email is not None:
         return f"email:{normalized_email}"
     normalized_name = normalize_person_name(name) or ""
     normalized_title = normalize_title(title) or ""
     canonical_source = normalize_source_for_deduplication(source_url)
-    if not (normalized_name or normalized_title) or canonical_source is None:
-        raise ValueError("Candidate identity is insufficient for deduplication.")
-    return f"person:{normalized_name}|{normalized_title}|{canonical_source}"
+    if (normalized_name or normalized_title) and canonical_source is not None:
+        return f"person:{normalized_name}|{normalized_title}|{canonical_source}"
+    normalized_phone = normalize_discovered_phone(phone)
+    if normalized_phone is not None:
+        return f"phone:{normalized_phone}"
+    canonical_linkedin = normalize_linkedin_url(linkedin_url)
+    if canonical_linkedin is not None:
+        return f"linkedin:{canonical_linkedin}"
+    canonical_instagram = normalize_instagram_url(instagram_url)
+    if canonical_instagram is not None:
+        return f"instagram:{canonical_instagram}"
+    raise ValueError("Candidate identity is insufficient for deduplication.")
 
 
 def clean_discovered_text(value: str | None) -> str | None:

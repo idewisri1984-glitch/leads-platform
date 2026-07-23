@@ -1,11 +1,21 @@
+from contextlib import suppress
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.modules.contact.channel_normalization import (
+    normalize_instagram_url,
+    normalize_linkedin_url,
+)
 from app.modules.contact_discovery.models import (
     ContactDiscoveryCandidateStatus,
     ContactDiscoverySourceType,
     ContactDiscoveryStatus,
+)
+from app.modules.contact_discovery.normalization import (
+    normalize_discovered_email,
+    normalize_discovered_phone,
+    normalize_source_for_deduplication,
 )
 
 
@@ -40,6 +50,8 @@ class ContactDiscoveryCandidateCreate(BaseModel):
     title: str | None = Field(default=None, max_length=255)
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=100)
+    linkedin_url: str | None = Field(default=None, max_length=500)
+    instagram_url: str | None = Field(default=None, max_length=500)
     source_url: str | None = Field(default=None, max_length=500)
     source_type: ContactDiscoverySourceType
     confidence: int = Field(default=0, ge=0, le=100)
@@ -52,12 +64,38 @@ class ContactDiscoveryCandidateCreate(BaseModel):
     def reject_raw_markup(cls, value: str | None) -> str | None:
         return _safe_text(value)
 
+    @field_validator("linkedin_url")
+    @classmethod
+    def normalize_linkedin(cls, value: str | None) -> str | None:
+        return normalize_linkedin_url(value)
+
+    @field_validator("instagram_url")
+    @classmethod
+    def normalize_instagram(cls, value: str | None) -> str | None:
+        return normalize_instagram_url(value)
+
     @model_validator(mode="after")
     def require_meaningful_identity(self) -> "ContactDiscoveryCandidateCreate":
+        usable_email = False
+        with suppress(ValueError):
+            usable_email = normalize_discovered_email(self.email) is not None
+        usable_phone = normalize_discovered_phone(self.phone) is not None
+        existing_person_identity = False
+        with suppress(ValueError):
+            existing_person_identity = bool(
+                any(value is not None and value.strip() for value in (self.name, self.title))
+                and normalize_source_for_deduplication(self.source_url)
+            )
         if not any(
-            value is not None and value.strip() for value in (self.email, self.name, self.title)
+            (
+                usable_email,
+                usable_phone,
+                self.linkedin_url,
+                self.instagram_url,
+                existing_person_identity,
+            )
         ):
-            raise ValueError("Candidate requires an email, name, or title.")
+            raise ValueError("Candidate requires a usable channel or public person identity.")
         return self
 
 
@@ -66,6 +104,8 @@ class ContactDiscoveryCandidateUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=255)
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=100)
+    linkedin_url: str | None = Field(default=None, max_length=500)
+    instagram_url: str | None = Field(default=None, max_length=500)
     source_url: str | None = Field(default=None, max_length=500)
     source_type: ContactDiscoverySourceType | None = None
     confidence: int | None = Field(default=None, ge=0, le=100)
@@ -78,6 +118,16 @@ class ContactDiscoveryCandidateUpdate(BaseModel):
     def reject_raw_markup(cls, value: str | None) -> str | None:
         return _safe_text(value)
 
+    @field_validator("linkedin_url")
+    @classmethod
+    def normalize_linkedin(cls, value: str | None) -> str | None:
+        return normalize_linkedin_url(value)
+
+    @field_validator("instagram_url")
+    @classmethod
+    def normalize_instagram(cls, value: str | None) -> str | None:
+        return normalize_instagram_url(value)
+
 
 class ContactDiscoveryCandidateRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -89,6 +139,8 @@ class ContactDiscoveryCandidateRead(BaseModel):
     email: str | None
     normalized_email: str | None
     phone: str | None
+    linkedin_url: str | None
+    instagram_url: str | None
     source_url: str | None
     source_type: ContactDiscoverySourceType
     confidence: int

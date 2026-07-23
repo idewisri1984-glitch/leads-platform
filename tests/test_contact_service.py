@@ -43,6 +43,21 @@ def test_create_contact_service() -> None:
         assert contact.email == "alan@example.com"
 
 
+def test_create_generic_contact_service_preserves_channels() -> None:
+    company_id = create_company_for_contact_service()
+    with SessionLocal() as session:
+        contact = ContactService(ContactRepository(session)).create(
+            ContactCreate(
+                company_id=company_id,
+                first_name=None,
+                email="info@example.com",
+                instagram_url="https://instagram.com/example",
+            )
+        )
+        assert contact.first_name is None
+        assert contact.instagram_url == "https://www.instagram.com/example"
+
+
 def test_get_contact_service() -> None:
     company_id = create_company_for_contact_service()
 

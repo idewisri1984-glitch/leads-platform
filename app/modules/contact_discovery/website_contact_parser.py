@@ -284,6 +284,9 @@ def parse_contact_discovery_candidates_from_html(
                 name=candidate.name,
                 title=candidate.title,
                 source_url=candidate.source_url,
+                phone=candidate.phone,
+                linkedin_url=candidate.linkedin_url,
+                instagram_url=candidate.instagram_url,
             )
             previous = candidates.get(key)
             if previous is None:
@@ -493,7 +496,7 @@ def _merge_candidates(
     first: ContactDiscoveryCandidateCreate, second: ContactDiscoveryCandidateCreate
 ) -> ContactDiscoveryCandidateCreate:
     values = first.model_dump()
-    for field_name in ("name", "title", "email", "phone"):
+    for field_name in ("name", "title", "email", "phone", "linkedin_url", "instagram_url"):
         if not values[field_name]:
             values[field_name] = getattr(second, field_name)
     values["confidence"] = max(first.confidence, second.confidence)

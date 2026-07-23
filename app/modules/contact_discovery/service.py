@@ -167,6 +167,9 @@ class ContactDiscoveryService:
                     name=validated_candidate.name,
                     title=validated_candidate.title,
                     source_url=validated_candidate.source_url,
+                    phone=validated_candidate.phone,
+                    linkedin_url=validated_candidate.linkedin_url,
+                    instagram_url=validated_candidate.instagram_url,
                 )
             except ValueError:
                 return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)

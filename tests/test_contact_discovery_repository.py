@@ -52,6 +52,7 @@ def candidate(company_id: int, **values: object) -> ContactDiscoveryCandidateCre
         "company_id": company_id,
         "name": "Ada Lovelace",
         "title": "Director",
+        "phone": "+1 212 555 0100",
         "source_url": "https://example.com/team",
         "source_type": ContactDiscoverySourceType.TEAM_PAGE,
         "confidence": 40,
@@ -197,6 +198,81 @@ def test_email_upsert_normalizes_dedupes_and_fills_empty_fields(session: Session
     assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 1
 
 
+def test_social_only_upsert_serializes_and_fills_empty_social_fields(session: Session) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    first = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name=None,
+            title=None,
+            email="info@example.com",
+            phone=None,
+            linkedin_url=None,
+            instagram_url=None,
+        ),
+    )
+    second = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name=None,
+            title=None,
+            email="INFO@example.com",
+            phone=None,
+            linkedin_url="https://linkedin.com/company/example?trk=public",
+            instagram_url="https://instagram.com/example?utm_source=test",
+        ),
+    )
+    assert first.created is True
+    assert second.updated is True
+    assert second.candidate.linkedin_url == "https://www.linkedin.com/company/example"
+    assert second.candidate.instagram_url == "https://www.instagram.com/example"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.PROMOTED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+    ],
+)
+def test_social_fields_remain_protected_after_lifecycle_transition(
+    session: Session, status: ContactDiscoveryCandidateStatus
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    created = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email="person@example.com",
+            linkedin_url="https://linkedin.com/in/original",
+        ),
+    )
+    stored = repository.get_candidate(created.candidate.id)
+    assert stored is not None
+    stored.discovery_status = status
+    session.flush()
+    result = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email="person@example.com",
+            linkedin_url="https://linkedin.com/in/replacement",
+            instagram_url="https://instagram.com/replacement",
+        ),
+    )
+    assert result.protected is True
+    assert result.updated is False
+    assert result.candidate.linkedin_url == "https://www.linkedin.com/in/original"
+    assert result.candidate.instagram_url is None
+
+
 def test_upsert_never_replaces_values_with_null_or_lowers_confidence(session: Session) -> None:
     project = create_project(session, "Project")
     company = create_company(session, project, "Company")
@@ -318,8 +394,6 @@ def test_module_has_no_network_parser_provider_cli_or_automation_imports() -> No
         "serpapi",
         "selenium",
         "playwright",
-        "instagram",
-        "linkedin",
         "send_message",
         "openai",
         "websiteenrichmentprovider",

@@ -405,6 +405,9 @@ def _deduplicate_candidates(
             name=candidate.name,
             title=candidate.title,
             source_url=candidate.source_url,
+            phone=candidate.phone,
+            linkedin_url=candidate.linkedin_url,
+            instagram_url=candidate.instagram_url,
         )
         existing_index = indexes.get(key)
         if existing_index is None:
@@ -418,6 +421,8 @@ def _deduplicate_candidates(
                 "title": existing.title or candidate.title,
                 "email": existing.email or candidate.email,
                 "phone": existing.phone or candidate.phone,
+                "linkedin_url": existing.linkedin_url or candidate.linkedin_url,
+                "instagram_url": existing.instagram_url or candidate.instagram_url,
                 "confidence": max(existing.confidence, candidate.confidence),
             }
         )

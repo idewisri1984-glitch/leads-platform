@@ -38,6 +38,21 @@ def test_create_contact() -> None:
         assert contact.email == "ada@example.com"
 
 
+def test_create_generic_contact_with_social_channels() -> None:
+    company_id = create_company_for_contact()
+    with SessionLocal() as session:
+        contact = ContactRepository(session).create(
+            company_id=company_id,
+            first_name=None,
+            email="info@example.com",
+            linkedin_url="https://www.linkedin.com/company/example",
+            instagram_url="https://www.instagram.com/example",
+        )
+        assert contact.first_name is None
+        assert contact.linkedin_url == "https://www.linkedin.com/company/example"
+        assert contact.instagram_url == "https://www.instagram.com/example"
+
+
 def test_get_contact() -> None:
     company_id = create_company_for_contact()
 

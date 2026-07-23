@@ -82,6 +82,12 @@ def candidate(company_id: int, **values: object) -> ContactDiscoveryCandidateCre
     return ContactDiscoveryCandidateCreate(**data)
 
 
+def candidate_without_usable_identity(company_id: int) -> ContactDiscoveryCandidateCreate:
+    return candidate(company_id).model_copy(
+        update={"email": None, "phone": None, "source_url": None}
+    )
+
+
 def provider_result(
     *candidates: ContactDiscoveryCandidateCreate,
     attempted_pages: int = 1,
@@ -323,7 +329,7 @@ def test_invalid_identity_invalidates_complete_result_before_any_persist_upsert(
     existing_updated_at = existing_row.updated_at
 
     valid = candidate(company.id, email="valid@example.com")
-    invalid = candidate(company.id, email=None, source_url=None)
+    invalid = candidate_without_usable_identity(company.id)
     candidates = (invalid, valid) if invalid_first else (valid, invalid)
     upsert_calls = 0
     original_upsert = repository.upsert_candidate
@@ -405,7 +411,7 @@ def test_invalid_identity_dry_run_remains_mutation_free_after_outer_commit(
         FakeProvider(
             provider_result(
                 candidate(company.id, email="valid@example.com"),
-                candidate(company.id, email=None, source_url=None),
+                candidate_without_usable_identity(company.id),
             )
         ),
     ).run(company_id=company.id, website_url="https://example.com", dry_run=True)
@@ -437,13 +443,14 @@ def test_invalid_identity_dry_run_remains_mutation_free_after_outer_commit(
     [
         ContactDiscoveryCandidateCreate(
             company_id=1,
-            name="Name Only",
+            email="temporary@example.com",
             source_type=ContactDiscoverySourceType.TEAM_PAGE,
-        ),
+        ).model_copy(update={"email": None, "name": "Name Only"}),
         ContactDiscoveryCandidateCreate(
             company_id=1,
             name="Unsafe Source",
             title="Director",
+            phone="123",
             source_url="javascript:alert(1)",
             source_type=ContactDiscoverySourceType.TEAM_PAGE,
         ),
@@ -474,6 +481,7 @@ def test_repository_incompatible_candidate_identity_is_sanitized(
             company_id=1,
             name="Fallback Person",
             title="Director",
+            phone="123",
             source_url="https://example.com/team?ref=nav#people",
             source_type=ContactDiscoverySourceType.TEAM_PAGE,
         ),

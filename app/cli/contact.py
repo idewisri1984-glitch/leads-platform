@@ -13,12 +13,13 @@ app = typer.Typer(help="Contact management commands.")
 @app.command("create")
 def create_contact(
     company_id: int,
-    first_name: str,
+    first_name: str = "",
     last_name: str = "",
     job_title: str = "",
     email: str = "",
     phone: str = "",
     linkedin_url: str = "",
+    instagram_url: str = "",
     country: str = "",
     city: str = "",
     source: str = "",
@@ -30,12 +31,13 @@ def create_contact(
         contact = service.create(
             ContactCreate(
                 company_id=company_id,
-                first_name=first_name,
+                first_name=first_name or None,
                 last_name=last_name or None,
                 job_title=job_title or None,
                 email=email or None,
                 phone=phone or None,
                 linkedin_url=linkedin_url or None,
+                instagram_url=instagram_url or None,
                 country=country or None,
                 city=city or None,
                 source=source or None,
@@ -45,7 +47,7 @@ def create_contact(
     typer.secho("Contact created", fg=typer.colors.GREEN)
     typer.echo(f"ID: {contact.id}")
     typer.echo(f"Company ID: {contact.company_id}")
-    typer.echo(f"Name: {contact.first_name} {contact.last_name or ''}".rstrip())
+    typer.echo(f"Name: {_contact_display_name(contact)}")
 
 
 @app.command("list")
@@ -63,8 +65,7 @@ def list_contacts(company_id: int | None = None) -> None:
     typer.echo("\nContacts\n")
 
     for contact in contacts:
-        full_name = f"{contact.first_name} {contact.last_name or ''}".rstrip()
-        typer.echo(f"{contact.id:>3}  {contact.company_id:>3}  {full_name}")
+        typer.echo(f"{contact.id:>3}  {contact.company_id:>3}  {_contact_display_name(contact)}")
 
 
 @app.command("show")
@@ -82,16 +83,17 @@ def show_contact(contact_id: int) -> None:
     typer.echo()
     typer.echo(f"ID:           {contact.id}")
     typer.echo(f"Company ID:   {contact.company_id}")
-    typer.echo(f"First name:   {contact.first_name}")
-    typer.echo(f"Last name:    {contact.last_name}")
-    typer.echo(f"Job title:    {contact.job_title}")
-    typer.echo(f"Email:        {contact.email}")
-    typer.echo(f"Phone:        {contact.phone}")
-    typer.echo(f"LinkedIn URL: {contact.linkedin_url}")
-    typer.echo(f"Country:      {contact.country}")
-    typer.echo(f"City:         {contact.city}")
-    typer.echo(f"Source:       {contact.source}")
-    typer.echo(f"External ID:  {contact.external_id}")
+    typer.echo(f"First name:    {_display_value(contact.first_name)}")
+    typer.echo(f"Last name:     {_display_value(contact.last_name)}")
+    typer.echo(f"Job title:     {_display_value(contact.job_title)}")
+    typer.echo(f"Email:         {_display_value(contact.email)}")
+    typer.echo(f"Phone:         {_display_value(contact.phone)}")
+    typer.echo(f"LinkedIn URL:  {_display_value(contact.linkedin_url)}")
+    typer.echo(f"Instagram URL: {_display_value(contact.instagram_url)}")
+    typer.echo(f"Country:       {_display_value(contact.country)}")
+    typer.echo(f"City:          {_display_value(contact.city)}")
+    typer.echo(f"Source:        {_display_value(contact.source)}")
+    typer.echo(f"External ID:   {_display_value(contact.external_id)}")
     typer.echo(f"Status:       {contact.status}")
     typer.echo(f"Notes:        {contact.notes}")
 
@@ -111,3 +113,20 @@ def delete_contact(contact_id: int) -> None:
         service.delete(contact)
 
     typer.secho("Contact deleted", fg=typer.colors.GREEN)
+
+
+def _contact_display_name(contact: object) -> str:
+    first_name = getattr(contact, "first_name", None)
+    last_name = getattr(contact, "last_name", None)
+    name = " ".join(value for value in (first_name, last_name) if value)
+    if name:
+        return name
+    for field in ("email", "phone", "linkedin_url", "instagram_url"):
+        value = getattr(contact, field, None)
+        if value:
+            return str(value)
+    return "-"
+
+
+def _display_value(value: str | None) -> str:
+    return value or "-"
