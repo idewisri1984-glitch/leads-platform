@@ -1,6 +1,8 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.contact.channel_normalization import (
+    normalize_contact_email,
+    normalize_contact_phone,
     normalize_instagram_url,
     normalize_linkedin_url,
 )
@@ -38,6 +40,16 @@ class ContactCreate(BaseModel):
             return value
         return " ".join(value.split()) or None
 
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str | None) -> str | None:
+        return normalize_contact_email(value)
+
+    @field_validator("phone")
+    @classmethod
+    def normalize_phone(cls, value: str | None) -> str | None:
+        return normalize_contact_phone(value)
+
     @field_validator("linkedin_url")
     @classmethod
     def normalize_linkedin(cls, value: str | None) -> str | None:
@@ -58,7 +70,7 @@ class ContactCreate(BaseModel):
     def require_name_or_channel(self) -> "ContactCreate":
         has_name = any(_has_text(value) for value in (self.first_name, self.last_name))
         has_channel = any(
-            _has_text(value)
+            value is not None
             for value in (self.email, self.phone, self.linkedin_url, self.instagram_url)
         )
         if not has_name and not has_channel:

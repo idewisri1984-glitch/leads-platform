@@ -1,4 +1,4 @@
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import CheckConstraint, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database.base import Base
@@ -12,6 +12,17 @@ class Contact(Base):
     """
 
     __tablename__ = "contacts"
+    __table_args__ = (
+        CheckConstraint(
+            "NULLIF(TRIM(first_name), '') IS NOT NULL "
+            "OR NULLIF(TRIM(last_name), '') IS NOT NULL "
+            "OR NULLIF(TRIM(email), '') IS NOT NULL "
+            "OR NULLIF(TRIM(phone), '') IS NOT NULL "
+            "OR NULLIF(TRIM(linkedin_url), '') IS NOT NULL "
+            "OR NULLIF(TRIM(instagram_url), '') IS NOT NULL",
+            name="ck_contacts_meaningful_identity",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         primary_key=True,

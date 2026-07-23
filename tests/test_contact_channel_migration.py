@@ -4,10 +4,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _REVISION = "8c5d6e7f8091"
 _PREVIOUS_REVISION = "7b4c5d6e7f80"
 _DOWNGRADE_ERROR = "F7H0 downgrade refused: contacts.first_name contains NULL values."
+_UPGRADE_ERROR = (
+    "F7H0 upgrade refused: contacts contains a row without a meaningful name or channel."
+)
 
 
 def alembic(
@@ -42,6 +47,16 @@ def columns(database: Path, table: str) -> dict[str, tuple[object, ...]]:
         }
 
 
+def table_sql(database: Path, table: str) -> str:
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
 def create_company(database: Path) -> int:
     with sqlite3.connect(database) as connection:
         project_id = connection.execute(
@@ -73,6 +88,7 @@ def test_upgrade_preserves_named_contact_and_supports_generic_channels(tmp_path:
     assert contact_columns["first_name"][3] == 0
     assert {"linkedin_url", "instagram_url"} <= contact_columns.keys()
     assert {"linkedin_url", "instagram_url"} <= candidate_columns.keys()
+    assert "ck_contacts_meaningful_identity" in table_sql(database, "contacts")
 
     with sqlite3.connect(database) as connection:
         assert connection.execute(
@@ -86,6 +102,13 @@ def test_upgrade_preserves_named_contact_and_supports_generic_channels(tmp_path:
         assert connection.execute(
             "SELECT first_name FROM contacts WHERE email = 'info@example.com'"
         ).fetchone() == (None,)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO contacts "
+                "(company_id, first_name, last_name, email, phone, linkedin_url, "
+                "instagram_url, status) VALUES (?, ' ', '', NULL, ' ', NULL, '', 'NEW')",
+                (company_id,),
+            )
 
 
 def test_safe_downgrade_and_reupgrade_without_generic_contacts(tmp_path: Path) -> None:
@@ -105,6 +128,7 @@ def test_safe_downgrade_and_reupgrade_without_generic_contacts(tmp_path: Path) -
     assert contact_columns["first_name"][3] == 1
     assert "instagram_url" not in contact_columns
     assert "linkedin_url" in contact_columns
+    assert "ck_contacts_meaningful_identity" not in table_sql(database, "contacts")
     candidate_columns = columns(database, "contact_discovery_candidates")
     assert "linkedin_url" not in candidate_columns
     assert "instagram_url" not in candidate_columns
@@ -116,6 +140,29 @@ def test_safe_downgrade_and_reupgrade_without_generic_contacts(tmp_path: Path) -
 
     alembic(database, "upgrade", "head")
     assert current_revision(database) == _REVISION
+
+
+def test_upgrade_refuses_invalid_legacy_contact_before_schema_changes(tmp_path: Path) -> None:
+    database = tmp_path / "f7h0-upgrade-refusal.sqlite"
+    alembic(database, "upgrade", _PREVIOUS_REVISION)
+    company_id = create_company(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO contacts "
+            "(company_id, first_name, last_name, email, phone, linkedin_url, status) "
+            "VALUES (?, ' ', '', NULL, ' ', NULL, 'NEW')",
+            (company_id,),
+        )
+
+    result = alembic(database, "upgrade", "head", check=False)
+    assert result.returncode != 0
+    assert _UPGRADE_ERROR in result.stderr
+    assert current_revision(database) == _PREVIOUS_REVISION
+    assert "instagram_url" not in columns(database, "contacts")
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT first_name, last_name, email, phone FROM contacts"
+        ).fetchone() == (" ", "", None, " ")
 
 
 def test_downgrade_refuses_to_fabricate_or_delete_generic_contacts(tmp_path: Path) -> None:

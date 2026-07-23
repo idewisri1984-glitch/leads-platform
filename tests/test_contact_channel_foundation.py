@@ -35,6 +35,33 @@ def test_generic_contact_accepts_one_usable_channel(channel: dict[str, str]) -> 
     assert contact.first_name is None
 
 
+@pytest.mark.parametrize(
+    "channel",
+    [
+        {"email": "x"},
+        {"phone": "abc"},
+    ],
+)
+def test_anonymous_contact_rejects_malformed_channels(channel: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        ContactCreate(company_id=1, **channel)
+
+
+def test_valid_generic_email_is_accepted() -> None:
+    contact = ContactCreate(company_id=1, email="info@Example.COM")
+    assert contact.email == "info@example.com"
+
+
+def test_valid_generic_international_phone_is_accepted() -> None:
+    contact = ContactCreate(company_id=1, phone="+62 812-3456-7890")
+    assert contact.phone == "+6281234567890"
+
+
+def test_named_contact_rejects_explicit_invalid_channel() -> None:
+    with pytest.raises(ValidationError):
+        ContactCreate(company_id=1, first_name="Ada", email="x")
+
+
 def test_fully_empty_anonymous_contact_is_rejected() -> None:
     with pytest.raises(ValidationError, match="usable contact channel"):
         ContactCreate(company_id=1, first_name=" ")

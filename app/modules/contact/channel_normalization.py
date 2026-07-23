@@ -2,6 +2,9 @@ import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 _MULTIPLE_SLASHES = re.compile(r"/+")
+_EMAIL_LOCAL_PART = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$")
+_EMAIL_DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_PHONE_CHARACTERS = re.compile(r"^\+?[0-9\s().-]+$")
 _TRACKING_QUERY_PARAMETERS = frozenset(
     {
         "fbclid",
@@ -19,6 +22,52 @@ _INSTAGRAM_RESERVED_PATHS = frozenset(
     {"accounts", "direct", "explore", "p", "reel", "reels", "stories"}
 )
 _LINKEDIN_PATH_PREFIXES = frozenset({"company", "in", "pub", "school", "showcase"})
+
+
+def normalize_contact_email(value: str | None) -> str | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if (
+        len(candidate) > 255
+        or candidate.count("@") != 1
+        or any(character.isspace() for character in candidate)
+    ):
+        raise ValueError("Contact email is invalid.")
+    local_part, raw_domain = candidate.rsplit("@", 1)
+    if (
+        not local_part
+        or len(local_part) > 64
+        or local_part.startswith(".")
+        or local_part.endswith(".")
+        or ".." in local_part
+        or _EMAIL_LOCAL_PART.fullmatch(local_part) is None
+    ):
+        raise ValueError("Contact email is invalid.")
+    try:
+        domain = raw_domain.encode("idna").decode("ascii").casefold()
+    except UnicodeError as error:
+        raise ValueError("Contact email is invalid.") from error
+    labels = domain.split(".")
+    if len(labels) < 2 or any(_EMAIL_DOMAIN_LABEL.fullmatch(label) is None for label in labels):
+        raise ValueError("Contact email is invalid.")
+    return f"{local_part}@{domain}"
+
+
+def normalize_contact_phone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if len(candidate) > 100 or _PHONE_CHARACTERS.fullmatch(candidate) is None:
+        raise ValueError("Contact phone is invalid.")
+    digits = "".join(character for character in candidate if character.isdigit())
+    if len(digits) < 7 or len(digits) > 15:
+        raise ValueError("Contact phone is invalid.")
+    return f"+{digits}" if candidate.startswith("+") else digits
 
 
 def normalize_linkedin_url(value: str | None) -> str | None:
