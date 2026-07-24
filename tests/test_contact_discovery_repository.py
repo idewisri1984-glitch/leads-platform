@@ -327,3 +327,122 @@ def test_module_has_no_network_parser_provider_cli_or_automation_imports() -> No
         "from app.modules.contact.models import contact",
     ):
         assert forbidden not in source
+
+
+def test_company_scoped_candidate_lookup_and_paginated_filtering(session: Session) -> None:
+    project = create_project(session, "Project")
+    first = create_company(session, project, "First")
+    second = create_company(session, project, "Second")
+    repository = ContactDiscoveryRepository(session)
+    first_ids = [
+        repository.upsert_candidate(
+            first.id, candidate(first.id, email=f"person{index}@example.com")
+        ).candidate.id
+        for index in range(3)
+    ]
+    other_id = repository.upsert_candidate(
+        second.id, candidate(second.id, email="other@example.com")
+    ).candidate.id
+    repository.set_candidate_status(
+        first.id, first_ids[1], ContactDiscoveryCandidateStatus.REVIEWED
+    )
+    assert repository.get_candidate_for_company(first.id, other_id) is None
+    assert repository.get_candidate_for_company(first.id, first_ids[0]) is not None
+    assert [row.id for row in repository.list_candidates_for_company(first.id, 1, 1)] == [
+        first_ids[1]
+    ]
+    assert [
+        row.id
+        for row in repository.list_candidates_for_company(
+            first.id, candidate_status=ContactDiscoveryCandidateStatus.REVIEWED
+        )
+    ] == [first_ids[1]]
+
+
+@pytest.mark.parametrize("target", list(ContactDiscoveryCandidateStatus))
+def test_status_update_allows_only_reviewed_and_rejected(
+    session: Session, target: ContactDiscoveryCandidateStatus
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id, candidate(company.id, email="person@example.com")
+    ).candidate.id
+    if target in (
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+    ):
+        assert (
+            repository.set_candidate_status(company.id, candidate_id, target).discovery_status
+            == target
+        )
+    else:
+        with pytest.raises(ValueError, match="not allowed"):
+            repository.set_candidate_status(company.id, candidate_id, target)
+
+
+@pytest.mark.parametrize(
+    ("limit", "offset"), [(0, 0), (101, 0), (True, 0), (1.5, 0), (1, -1), (1, False)]
+)
+def test_company_candidate_listing_rejects_invalid_pagination_before_sql(
+    session: Session, limit: object, offset: object
+) -> None:
+    with pytest.raises(ValueError):
+        ContactDiscoveryRepository(session).list_candidates_for_company(
+            1,
+            limit=limit,
+            offset=offset,  # type: ignore[arg-type]
+        )
+
+
+def test_status_update_preserves_candidate_fields_and_has_no_contact_side_effect(
+    session: Session,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    created = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email="person@example.com",
+            phone="+1 555 0100",
+            confidence=91,
+            notes="note",
+        ),
+    )
+    before = repository.get_candidate(created.candidate.id)
+    assert before is not None
+    snapshot = (
+        before.company_id,
+        before.name,
+        before.title,
+        before.email,
+        before.normalized_email,
+        before.phone,
+        before.source_url,
+        before.source_type,
+        before.confidence,
+        before.deduplication_key,
+        before.notes,
+        before.last_error,
+    )
+    repository.set_candidate_status(company.id, before.id, ContactDiscoveryCandidateStatus.REJECTED)
+    after = repository.get_candidate(before.id)
+    assert after is not None
+    assert snapshot == (
+        after.company_id,
+        after.name,
+        after.title,
+        after.email,
+        after.normalized_email,
+        after.phone,
+        after.source_url,
+        after.source_type,
+        after.confidence,
+        after.deduplication_key,
+        after.notes,
+        after.last_error,
+    )
+    assert session.scalar(select(func.count()).select_from(Contact)) == 0

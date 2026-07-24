@@ -86,13 +86,62 @@ class ContactDiscoveryRepository:
     def get_candidate(self, candidate_id: int) -> ContactDiscoveryCandidate | None:
         return self.session.get(ContactDiscoveryCandidate, candidate_id)
 
-    def list_candidates_for_company(self, company_id: int) -> list[ContactDiscoveryCandidate]:
+    def get_candidate_for_company(
+        self, company_id: int, candidate_id: int
+    ) -> ContactDiscoveryCandidate | None:
+        self._validate_positive_id(company_id, "Company")
+        self._validate_positive_id(candidate_id, "Candidate")
+        return self.session.scalar(
+            select(ContactDiscoveryCandidate).where(
+                ContactDiscoveryCandidate.id == candidate_id,
+                ContactDiscoveryCandidate.company_id == company_id,
+            )
+        )
+
+    def list_candidates_for_company(
+        self,
+        company_id: int,
+        limit: int = 100,
+        offset: int = 0,
+        candidate_status: ContactDiscoveryCandidateStatus | None = None,
+    ) -> list[ContactDiscoveryCandidate]:
+        self._validate_positive_id(company_id, "Company")
+        self._validate_pagination(limit, offset, maximum=100)
         statement = (
             select(ContactDiscoveryCandidate)
             .where(ContactDiscoveryCandidate.company_id == company_id)
             .order_by(ContactDiscoveryCandidate.id)
+            .limit(limit)
+            .offset(offset)
         )
+        if candidate_status is not None:
+            if not isinstance(candidate_status, ContactDiscoveryCandidateStatus):
+                raise ValueError("Invalid candidate status filter.")
+            statement = statement.where(
+                ContactDiscoveryCandidate.discovery_status == candidate_status
+            )
         return list(self.session.scalars(statement))
+
+    def set_candidate_status(
+        self,
+        company_id: int,
+        candidate_id: int,
+        candidate_status: ContactDiscoveryCandidateStatus,
+    ) -> ContactDiscoveryCandidate:
+        self._validate_positive_id(company_id, "Company")
+        self._validate_positive_id(candidate_id, "Candidate")
+        if candidate_status not in (
+            ContactDiscoveryCandidateStatus.REVIEWED,
+            ContactDiscoveryCandidateStatus.REJECTED,
+        ):
+            raise ValueError("Candidate target status is not allowed.")
+        candidate = self.get_candidate_for_company(company_id, candidate_id)
+        if candidate is None:
+            raise ValueError("Candidate was not found.")
+        candidate.discovery_status = candidate_status
+        self.session.add(candidate)
+        self.session.flush()
+        return candidate
 
     def list_candidates_for_project(
         self, project_id: int, limit: int, offset: int = 0
@@ -192,8 +241,15 @@ class ContactDiscoveryRepository:
         )
 
     @staticmethod
-    def _validate_pagination(limit: int, offset: int) -> None:
-        if limit <= 0:
+    def _validate_pagination(limit: int, offset: int, maximum: int | None = None) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise ValueError("Limit must be greater than zero.")
-        if offset < 0:
+        if maximum is not None and limit > maximum:
+            raise ValueError("Limit exceeds the allowed maximum.")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("Offset must not be negative.")
+
+    @staticmethod
+    def _validate_positive_id(value: int, label: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{label} ID must be a positive integer.")

@@ -5,6 +5,7 @@ from typing import Annotated
 import typer
 from sqlalchemy.orm import Session
 
+from app.cli.contact_discovery_candidates import app as candidate_app
 from app.core.database.session import SessionLocal
 from app.modules.company.repository import CompanyRepository
 from app.modules.contact_discovery.models import ContactDiscoveryStatus
@@ -31,6 +32,7 @@ ServiceFactory = Callable[
 ]
 
 app = typer.Typer(help="Contact discovery commands.")
+app.add_typer(candidate_app, name="candidate")
 
 
 @dataclass(frozen=True)
