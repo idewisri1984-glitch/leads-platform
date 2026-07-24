@@ -206,6 +206,7 @@ def test_session_failures_are_sanitized(failure: str) -> None:
     )
     assert outcome.error_message == "Candidate status update failed."
     assert "secret" not in str(outcome)
+    assert session.close_calls == 1
 
 
 def test_output_omits_forbidden_fields_normalizes_and_bounds(
@@ -237,12 +238,15 @@ def test_keyboard_interrupt_is_not_swallowed() -> None:
         def mark_reviewed(self, company_id: int, candidate_id: int) -> object:
             raise KeyboardInterrupt
 
-    deps = dependencies(FakeSession())
+    session = FakeSession()
+    deps = dependencies(session)
     deps["service_factory"] = InterruptingService
     with pytest.raises(KeyboardInterrupt):
         candidate_cli.execute_status_change(
             company_id=3, candidate_id=7, yes=True, transition="review", **deps
         )
+    assert session.commit_calls == 0
+    assert session.close_calls == 1
 
 
 def test_cross_company_show_is_sanitized_not_found() -> None:
@@ -371,6 +375,7 @@ def test_idempotent_cli_result_commits_once_and_prints_safe_summary(
 
     assert result.exit_code == 0
     assert session.commit_calls == 1
+    assert session.close_calls == 1
     assert "Changed: no" in result.output
     assert f"Previous Status: {status.value}" in result.output
     assert f"Current Status: {status.value}" in result.output
@@ -416,6 +421,7 @@ def test_forbidden_cli_transition_rolls_back_with_fixed_output(
     assert result.output.strip() == "Candidate status transition is not allowed."
     assert session.commit_calls == 0
     assert session.rollback_calls == 1
+    assert session.close_calls == 1
     for forbidden in ("unsafe", "Traceback", "person@example.com", "+1 555"):
         assert forbidden not in result.output
 
@@ -439,7 +445,91 @@ def test_system_exit_propagates_without_commit_or_success_output() -> None:
         )
 
     assert raised.value.code == 23
+    assert isinstance(raised.value, SystemExit)
     assert session.commit_calls == 0
+    assert session.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected_type"),
+    [
+        (SystemExit(23), SystemExit),
+        (KeyboardInterrupt(), KeyboardInterrupt),
+    ],
+)
+def test_close_failure_does_not_replace_active_base_exception(
+    exception: BaseException,
+    expected_type: type[BaseException],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = FakeSession(fail="close")
+
+    class ExitingService(FakeService):
+        def mark_reviewed(self, company_id: int, candidate_id: int) -> object:
+            raise exception
+
+    deps = dependencies(session)
+    deps["service_factory"] = ExitingService
+    with pytest.raises(expected_type) as raised:
+        candidate_cli.execute_status_change(
+            company_id=3,
+            candidate_id=7,
+            yes=True,
+            transition="review",
+            **deps,
+        )
+
+    if isinstance(exception, SystemExit):
+        assert isinstance(raised.value, SystemExit)
+        assert raised.value.code == 23
+    assert session.commit_calls == 0
+    assert session.close_calls == 1
+    assert "close secret" not in capsys.readouterr().out
+
+
+def test_unexpected_exception_closes_session_exactly_once() -> None:
+    session = FakeSession()
+
+    class BrokenService(FakeService):
+        def mark_reviewed(self, company_id: int, candidate_id: int) -> object:
+            raise RuntimeError("unexpected marker")
+
+    deps = dependencies(session)
+    deps["service_factory"] = BrokenService
+    outcome = candidate_cli.execute_status_change(
+        company_id=3,
+        candidate_id=7,
+        yes=True,
+        transition="review",
+        **deps,
+    )
+
+    assert outcome.error_message == "Candidate status update failed."
+    assert session.commit_calls == 0
+    assert session.rollback_calls == 1
+    assert session.close_calls == 1
+    assert "unexpected marker" not in str(outcome)
+
+
+def test_session_construction_failure_does_not_attempt_close() -> None:
+    calls = 0
+
+    def fail_session_construction() -> FakeSession:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("construction marker")
+
+    outcome = candidate_cli.execute_status_change(
+        company_id=3,
+        candidate_id=7,
+        yes=True,
+        transition="review",
+        session_factory=fail_session_construction,
+    )
+
+    assert calls == 1
+    assert outcome.error_message == "Candidate status update failed."
+    assert "construction marker" not in str(outcome)
 
 
 def test_candidate_operations_do_not_construct_discovery_dependencies(

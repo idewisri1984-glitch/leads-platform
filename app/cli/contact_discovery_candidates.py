@@ -176,31 +176,35 @@ def execute_status_change(
     except Exception:
         return CandidateCommandOutcome(1, error_message=_UPDATE_FAILED)
     outcome: CandidateCommandOutcome
+    close_succeeded = False
     try:
-        company = (company_repository_factory or CompanyRepository)(session).get(company_id)
-        if company is None:
+        try:
+            company = (company_repository_factory or CompanyRepository)(session).get(company_id)
+            if company is None:
+                _safe_session_operation(session, "rollback")
+                outcome = CandidateCommandOutcome(1, error_message=_COMPANY_NOT_FOUND)
+            else:
+                repository = (repository_factory or ContactDiscoveryRepository)(session)
+                service = (service_factory or ContactDiscoveryCandidateReviewService)(repository)
+                result = (
+                    service.mark_reviewed(company_id, candidate_id)
+                    if transition == "review"
+                    else service.reject(company_id, candidate_id)
+                )
+                _invoke_session_operation(session, "commit")
+                outcome = CandidateCommandOutcome(0, result=result)
+        except ContactDiscoveryCandidateReviewNotFoundError:
             _safe_session_operation(session, "rollback")
-            outcome = CandidateCommandOutcome(1, error_message=_COMPANY_NOT_FOUND)
-        else:
-            repository = (repository_factory or ContactDiscoveryRepository)(session)
-            service = (service_factory or ContactDiscoveryCandidateReviewService)(repository)
-            result = (
-                service.mark_reviewed(company_id, candidate_id)
-                if transition == "review"
-                else service.reject(company_id, candidate_id)
-            )
-            _invoke_session_operation(session, "commit")
-            outcome = CandidateCommandOutcome(0, result=result)
-    except ContactDiscoveryCandidateReviewNotFoundError:
-        _safe_session_operation(session, "rollback")
-        outcome = CandidateCommandOutcome(1, error_message=_CANDIDATE_NOT_FOUND)
-    except ContactDiscoveryCandidateTransitionError:
-        _safe_session_operation(session, "rollback")
-        outcome = CandidateCommandOutcome(1, error_message=_TRANSITION_FORBIDDEN)
-    except Exception:
-        _safe_session_operation(session, "rollback")
-        outcome = CandidateCommandOutcome(1, error_message=_UPDATE_FAILED)
-    if not _safe_session_operation(session, "close"):
+            outcome = CandidateCommandOutcome(1, error_message=_CANDIDATE_NOT_FOUND)
+        except ContactDiscoveryCandidateTransitionError:
+            _safe_session_operation(session, "rollback")
+            outcome = CandidateCommandOutcome(1, error_message=_TRANSITION_FORBIDDEN)
+        except Exception:
+            _safe_session_operation(session, "rollback")
+            outcome = CandidateCommandOutcome(1, error_message=_UPDATE_FAILED)
+    finally:
+        close_succeeded = _safe_session_operation(session, "close")
+    if not close_succeeded:
         return CandidateCommandOutcome(1, error_message=_UPDATE_FAILED)
     return outcome
 
