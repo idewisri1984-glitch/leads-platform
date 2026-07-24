@@ -93,6 +93,7 @@ def install_provider(monkeypatch: pytest.MonkeyPatch, provider: FakeProvider) ->
 
 def invoke_profile(profile_id: int, *, persist: bool = True, max_queries: int = 1) -> Any:
     mode = "--persist" if persist else "--dry-run"
+    confirmation = ["--yes"] if persist else []
     return runner.invoke(
         cli.app,
         [
@@ -102,6 +103,7 @@ def invoke_profile(profile_id: int, *, persist: bool = True, max_queries: int = 
             "--provider",
             "serpapi",
             mode,
+            *confirmation,
             "--max-queries",
             str(max_queries),
             "--result-limit-per-query",
