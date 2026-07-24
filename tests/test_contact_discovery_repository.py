@@ -1,6 +1,8 @@
 from collections.abc import Generator
 from datetime import UTC, datetime
+from enum import Enum, StrEnum
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import func, select
@@ -25,6 +27,14 @@ from app.modules.contact_discovery.normalization import (
 from app.modules.contact_discovery.repository import ContactDiscoveryRepository
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.project.models import Project
+
+
+class UnrelatedStatus(Enum):
+    REVIEWED = "REVIEWED"
+
+
+class UnrelatedStringStatus(StrEnum):
+    REVIEWED = "REVIEWED"
 
 
 @pytest.fixture
@@ -327,3 +337,217 @@ def test_module_has_no_network_parser_provider_cli_or_automation_imports() -> No
         "from app.modules.contact.models import contact",
     ):
         assert forbidden not in source
+
+
+def test_company_scoped_candidate_lookup_and_paginated_filtering(session: Session) -> None:
+    project = create_project(session, "Project")
+    first = create_company(session, project, "First")
+    second = create_company(session, project, "Second")
+    repository = ContactDiscoveryRepository(session)
+    first_ids = [
+        repository.upsert_candidate(
+            first.id, candidate(first.id, email=f"person{index}@example.com")
+        ).candidate.id
+        for index in range(3)
+    ]
+    other_id = repository.upsert_candidate(
+        second.id, candidate(second.id, email="other@example.com")
+    ).candidate.id
+    repository.set_candidate_status(
+        first.id, first_ids[1], ContactDiscoveryCandidateStatus.REVIEWED
+    )
+    assert repository.get_candidate_for_company(first.id, other_id) is None
+    assert repository.get_candidate_for_company(first.id, first_ids[0]) is not None
+    assert [row.id for row in repository.list_candidates_for_company(first.id, 1, 1)] == [
+        first_ids[1]
+    ]
+    assert [
+        row.id
+        for row in repository.list_candidates_for_company(
+            first.id, candidate_status=ContactDiscoveryCandidateStatus.REVIEWED
+        )
+    ] == [first_ids[1]]
+
+
+@pytest.mark.parametrize("target", list(ContactDiscoveryCandidateStatus))
+def test_status_update_allows_only_reviewed_and_rejected(
+    session: Session, target: ContactDiscoveryCandidateStatus
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id, candidate(company.id, email="person@example.com")
+    ).candidate.id
+    if target in (
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+    ):
+        assert (
+            repository.set_candidate_status(company.id, candidate_id, target).discovery_status
+            == target
+        )
+    else:
+        with pytest.raises(ValueError, match="not allowed"):
+            repository.set_candidate_status(company.id, candidate_id, target)
+
+
+@pytest.mark.parametrize(
+    ("limit", "offset"), [(0, 0), (101, 0), (True, 0), (1.5, 0), (1, -1), (1, False)]
+)
+def test_company_candidate_listing_rejects_invalid_pagination_before_sql(
+    session: Session, limit: object, offset: object
+) -> None:
+    with pytest.raises(ValueError):
+        ContactDiscoveryRepository(session).list_candidates_for_company(
+            1,
+            limit=limit,
+            offset=offset,  # type: ignore[arg-type]
+        )
+
+
+def test_status_update_preserves_candidate_fields_and_has_no_contact_side_effect(
+    session: Session,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    created = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email="person@example.com",
+            phone="+1 555 0100",
+            confidence=91,
+            notes="note",
+        ),
+    )
+    before = repository.get_candidate(created.candidate.id)
+    assert before is not None
+    snapshot = (
+        before.company_id,
+        before.name,
+        before.title,
+        before.email,
+        before.normalized_email,
+        before.phone,
+        before.source_url,
+        before.source_type,
+        before.confidence,
+        before.deduplication_key,
+        before.notes,
+        before.last_error,
+    )
+    repository.set_candidate_status(company.id, before.id, ContactDiscoveryCandidateStatus.REJECTED)
+    after = repository.get_candidate(before.id)
+    assert after is not None
+    assert snapshot == (
+        after.company_id,
+        after.name,
+        after.title,
+        after.email,
+        after.normalized_email,
+        after.phone,
+        after.source_url,
+        after.source_type,
+        after.confidence,
+        after.deduplication_key,
+        after.notes,
+        after.last_error,
+    )
+    assert session.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+@pytest.mark.parametrize(
+    "invalid_status",
+    [
+        "REVIEWED",
+        "REJECTED",
+        "UNKNOWN",
+        "",
+        True,
+        False,
+        1,
+        None,
+        object(),
+        UnrelatedStatus.REVIEWED,
+        UnrelatedStringStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.DISCOVERED,
+        ContactDiscoveryCandidateStatus.PROMOTED,
+    ],
+)
+def test_status_update_rejects_non_enum_and_forbidden_targets_before_flush(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_status: object,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    stored = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email="strict@example.com",
+            phone="+1 555 0100",
+            notes="preserved",
+        ),
+    )
+    candidate_record = repository.get_candidate(stored.candidate.id)
+    assert candidate_record is not None
+    original = (
+        candidate_record.discovery_status,
+        candidate_record.name,
+        candidate_record.title,
+        candidate_record.email,
+        candidate_record.phone,
+        candidate_record.notes,
+    )
+    monkeypatch.setattr(session, "flush", lambda: pytest.fail("unexpected flush"))
+    monkeypatch.setattr(session, "commit", lambda: pytest.fail("unexpected commit"))
+
+    with pytest.raises(ValueError) as raised:
+        repository.set_candidate_status(
+            company.id,
+            candidate_record.id,
+            cast(Any, invalid_status),
+        )
+
+    assert str(raised.value) == "Candidate target status is not allowed."
+    rendered = str(invalid_status)
+    if rendered:
+        assert rendered not in str(raised.value)
+    assert original == (
+        candidate_record.discovery_status,
+        candidate_record.name,
+        candidate_record.title,
+        candidate_record.email,
+        candidate_record.phone,
+        candidate_record.notes,
+    )
+    assert session.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+    ],
+)
+def test_status_update_preserves_actual_enum_type(
+    session: Session,
+    target: ContactDiscoveryCandidateStatus,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id,
+        candidate(company.id, email="enum@example.com"),
+    ).candidate.id
+
+    updated = repository.set_candidate_status(company.id, candidate_id, target)
+
+    assert updated.discovery_status is target
+    assert isinstance(updated.discovery_status, ContactDiscoveryCandidateStatus)

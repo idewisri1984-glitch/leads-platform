@@ -30,6 +30,11 @@ from app.modules.contact_discovery.website_provider import (
 
 __all__ = [
     "CompanyContactDiscoveryState",
+    "ContactDiscoveryCandidateReviewAction",
+    "ContactDiscoveryCandidateReviewNotFoundError",
+    "ContactDiscoveryCandidateReviewResult",
+    "ContactDiscoveryCandidateReviewService",
+    "ContactDiscoveryCandidateTransitionError",
     "ContactDiscoveryCandidate",
     "ContactDiscoveryCandidateCreate",
     "ContactDiscoveryCandidateRead",
@@ -49,3 +54,12 @@ __all__ = [
     "WebsiteContactDiscoveryProviderResult",
     "parse_contact_discovery_candidates_from_html",
 ]
+from app.modules.contact_discovery.candidate_review import (
+    ContactDiscoveryCandidateReviewNotFoundError,
+    ContactDiscoveryCandidateReviewService,
+    ContactDiscoveryCandidateTransitionError,
+)
+from app.modules.contact_discovery.candidate_review_schemas import (
+    ContactDiscoveryCandidateReviewAction,
+    ContactDiscoveryCandidateReviewResult,
+)
