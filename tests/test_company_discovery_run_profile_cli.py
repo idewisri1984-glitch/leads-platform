@@ -236,7 +236,7 @@ def install_pre_dependency_guards(monkeypatch: pytest.MonkeyPatch) -> None:
         (
             ["--profile-id", "7", "--provider", "other", "--dry-run", "--yes"],
             "--yes is valid only with --persist.",
-            ("Unsupported discovery provider",),
+            ("Unsupported discovery provider", "Invalid search profile run options"),
         ),
         (
             ["--profile-id", "7", "--provider", "serpapi", "--persist"],
