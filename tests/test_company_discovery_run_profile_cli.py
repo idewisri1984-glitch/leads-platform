@@ -151,12 +151,66 @@ def test_run_profile_dry_run_executes_after_database_session_closes(
     assert "Traceback" not in result.output
 
 
+def install_pre_dependency_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "SessionLocal",
+        lambda: pytest.fail("SessionLocal must not be constructed."),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SearchProfileRepository",
+        lambda *args, **kwargs: pytest.fail("SearchProfileRepository must not be constructed."),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SearchProfileService",
+        lambda *args, **kwargs: pytest.fail("SearchProfileService must not be constructed."),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SerpApiClient",
+        lambda **kwargs: pytest.fail("SerpApiClient must not be constructed."),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SerpApiDiscoveryProvider",
+        lambda *args, **kwargs: pytest.fail("SerpApiDiscoveryProvider must not be constructed."),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SearchProfileDiscoveryService",
+        lambda *args, **kwargs: pytest.fail(
+            "SearchProfileDiscoveryService must not be constructed."
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SearchProfileDiscoveryPersistenceService",
+        lambda *args, **kwargs: pytest.fail(
+            "SearchProfileDiscoveryPersistenceService must not be constructed."
+        ),
+    )
+
+
 @pytest.mark.parametrize(
-    ("arguments", "message"),
+    ("arguments", "message", "absent_messages"),
     [
         (
             ["--profile-id", "7", "--provider", "serpapi"],
             "Choose exactly one mode: --dry-run or --persist.",
+            (
+                "--yes is valid only with --persist.",
+                "Persistence requires --yes.",
+            ),
+        ),
+        (
+            ["--profile-id", "7", "--provider", "serpapi", "--yes"],
+            "Choose exactly one mode: --dry-run or --persist.",
+            (
+                "--yes is valid only with --persist.",
+                "Persistence requires --yes.",
+            ),
         ),
         (
             [
@@ -169,18 +223,76 @@ def test_run_profile_dry_run_executes_after_database_session_closes(
                 "--yes",
             ],
             "Choose exactly one mode: --dry-run or --persist.",
+            (
+                "--yes is valid only with --persist.",
+                "Persistence requires --yes.",
+            ),
         ),
         (
             ["--profile-id", "7", "--provider", "serpapi", "--dry-run", "--yes"],
             "--yes is valid only with --persist.",
+            ("Unsupported discovery provider",),
+        ),
+        (
+            ["--profile-id", "7", "--provider", "other", "--dry-run", "--yes"],
+            "--yes is valid only with --persist.",
+            ("Unsupported discovery provider",),
         ),
         (
             ["--profile-id", "7", "--provider", "serpapi", "--persist"],
             "Persistence requires --yes.",
+            (
+                "Unsupported discovery provider",
+                "Invalid search profile run options",
+            ),
+        ),
+        (
+            ["--profile-id", "7", "--provider", "other", "--persist"],
+            "Persistence requires --yes.",
+            (
+                "Unsupported discovery provider",
+                "Invalid search profile run options",
+            ),
+        ),
+        (
+            [
+                "--profile-id",
+                "7",
+                "--provider",
+                "serpapi",
+                "--persist",
+                "--max-queries",
+                "0",
+            ],
+            "Persistence requires --yes.",
+            (
+                "Unsupported discovery provider",
+                "Invalid search profile run options",
+            ),
         ),
         (
             ["--profile-id", "7", "--provider", "other", "--dry-run"],
             "supports only serpapi",
+            (
+                "--yes is valid only with --persist.",
+                "Persistence requires --yes.",
+            ),
+        ),
+        (
+            [
+                "--profile-id",
+                "7",
+                "--provider",
+                "other",
+                "--persist",
+                "--yes",
+            ],
+            "supports only serpapi",
+            (
+                "--yes is valid only with --persist.",
+                "Persistence requires --yes.",
+                "Invalid search profile run options",
+            ),
         ),
         (
             [
@@ -193,6 +305,29 @@ def test_run_profile_dry_run_executes_after_database_session_closes(
                 "0",
             ],
             "Invalid search profile run options",
+            (
+                "--yes is valid only with --persist.",
+                "Persistence requires --yes.",
+                "Unsupported discovery provider",
+            ),
+        ),
+        (
+            [
+                "--profile-id",
+                "7",
+                "--provider",
+                "serpapi",
+                "--persist",
+                "--yes",
+                "--max-queries",
+                "0",
+            ],
+            "Invalid search profile run options",
+            (
+                "--yes is valid only with --persist.",
+                "Persistence requires --yes.",
+                "Unsupported discovery provider",
+            ),
         ),
     ],
 )
@@ -200,30 +335,20 @@ def test_run_profile_rejects_invalid_input_before_database_access(
     monkeypatch: pytest.MonkeyPatch,
     arguments: list[str],
     message: str,
+    absent_messages: tuple[str, ...],
 ) -> None:
-    monkeypatch.setattr(cli, "SessionLocal", lambda: pytest.fail("database opened"))
-    monkeypatch.setattr(cli, "SerpApiClient", lambda **kwargs: pytest.fail("client created"))
-    monkeypatch.setattr(
-        cli,
-        "SearchProfileService",
-        lambda *args, **kwargs: pytest.fail("profile service created"),
-    )
-    monkeypatch.setattr(
-        cli,
-        "SearchProfileDiscoveryService",
-        lambda *args, **kwargs: pytest.fail("discovery service created"),
-    )
-    monkeypatch.setattr(
-        cli,
-        "SearchProfileDiscoveryPersistenceService",
-        lambda *args, **kwargs: pytest.fail("persistence service created"),
-    )
+    install_pre_dependency_guards(monkeypatch)
 
     result = runner.invoke(cli.app, ["run-profile", *arguments])
 
     assert result.exit_code == 1
     assert message in result.output
+    for absent_message in absent_messages:
+        assert absent_message not in result.output
     assert "Traceback" not in result.output
+    assert "api_key" not in result.output.casefold()
+    assert "database_url" not in result.output.casefold()
+    assert "raw_exception_marker" not in result.output
 
 
 def test_run_profile_missing_profile_is_controlled(monkeypatch: pytest.MonkeyPatch) -> None:
