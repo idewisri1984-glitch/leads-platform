@@ -104,19 +104,58 @@ def test_dry_run_does_not_open_session(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Discovered companies" in result.output
 
 
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--query", "software", "--yes"], "--yes is valid only with --persist."),
+        (
+            ["--query", "software", "--persist", "--project-id", "42"],
+            "Persistence requires --yes.",
+        ),
+    ],
+)
+def test_confirmation_errors_exit_before_dependency_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    message: str,
+) -> None:
+    monkeypatch.setattr(company_discovery_cli, "SerpApiClient", FailingSerpApiClient)
+    monkeypatch.setattr(company_discovery_cli, "SessionLocal", FailingSessionLocal)
+    monkeypatch.setattr(
+        company_discovery_cli,
+        "CompanyDiscoveryService",
+        lambda *args, **kwargs: pytest.fail("service constructed"),
+    )
+
+    result = runner.invoke(
+        company_discovery_cli.app,
+        arguments,
+    )
+
+    assert result.exit_code == 1
+    assert message in result.output
+    assert "Traceback" not in result.output
+
+
 def test_persist_without_project_id_exits_before_provider_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(company_discovery_cli, "SerpApiClient", FailingSerpApiClient)
     monkeypatch.setattr(company_discovery_cli, "SessionLocal", FailingSessionLocal)
+    monkeypatch.setattr(
+        company_discovery_cli,
+        "CompanyDiscoveryService",
+        lambda *args, **kwargs: pytest.fail("service constructed"),
+    )
 
     result = runner.invoke(
         company_discovery_cli.app,
-        ["--query", "software", "--persist"],
+        ["--query", "software", "--persist", "--yes"],
     )
 
     assert result.exit_code == 1
     assert "--project-id is required when --persist is used." in result.output
+    assert "Traceback" not in result.output
 
 
 def test_persist_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -162,7 +201,7 @@ def test_persist_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
     result = runner.invoke(
         company_discovery_cli.app,
-        ["--query", "software", "--persist", "--project-id", "42"],
+        ["--query", "software", "--persist", "--yes", "--project-id", "42"],
     )
 
     assert result.exit_code == 0
@@ -219,7 +258,7 @@ def test_persist_rolled_back_result_exits_nonzero(monkeypatch: pytest.MonkeyPatc
 
     result = runner.invoke(
         company_discovery_cli.app,
-        ["--query", "software", "--persist", "--project-id", "42"],
+        ["--query", "software", "--persist", "--yes", "--project-id", "42"],
     )
 
     assert result.exit_code == 1

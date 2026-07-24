@@ -166,8 +166,17 @@ def test_run_profile_dry_run_executes_after_database_session_closes(
                 "serpapi",
                 "--dry-run",
                 "--persist",
+                "--yes",
             ],
             "Choose exactly one mode: --dry-run or --persist.",
+        ),
+        (
+            ["--profile-id", "7", "--provider", "serpapi", "--dry-run", "--yes"],
+            "--yes is valid only with --persist.",
+        ),
+        (
+            ["--profile-id", "7", "--provider", "serpapi", "--persist"],
+            "Persistence requires --yes.",
         ),
         (
             ["--profile-id", "7", "--provider", "other", "--dry-run"],
@@ -194,6 +203,21 @@ def test_run_profile_rejects_invalid_input_before_database_access(
 ) -> None:
     monkeypatch.setattr(cli, "SessionLocal", lambda: pytest.fail("database opened"))
     monkeypatch.setattr(cli, "SerpApiClient", lambda **kwargs: pytest.fail("client created"))
+    monkeypatch.setattr(
+        cli,
+        "SearchProfileService",
+        lambda *args, **kwargs: pytest.fail("profile service created"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SearchProfileDiscoveryService",
+        lambda *args, **kwargs: pytest.fail("discovery service created"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SearchProfileDiscoveryPersistenceService",
+        lambda *args, **kwargs: pytest.fail("persistence service created"),
+    )
 
     result = runner.invoke(cli.app, ["run-profile", *arguments])
 
@@ -410,6 +434,7 @@ def run_persist_with_report(
             "--provider",
             "serpapi",
             "--persist",
+            "--yes",
             "--max-queries",
             "1",
             "--result-limit-per-query",
@@ -543,7 +568,7 @@ def test_controlled_persistence_error_is_safe_and_closes_session(
 
     result = runner.invoke(
         cli.app,
-        ["run-profile", "--profile-id", "7", "--provider", "serpapi", "--persist"],
+        ["run-profile", "--profile-id", "7", "--provider", "serpapi", "--persist", "--yes"],
     )
 
     assert result.exit_code == 1
@@ -578,7 +603,7 @@ def test_disabled_profile_in_persist_mode_is_controlled(
 
     result = runner.invoke(
         cli.app,
-        ["run-profile", "--profile-id", "7", "--provider", "serpapi", "--persist"],
+        ["run-profile", "--profile-id", "7", "--provider", "serpapi", "--persist", "--yes"],
     )
 
     assert result.exit_code == 1

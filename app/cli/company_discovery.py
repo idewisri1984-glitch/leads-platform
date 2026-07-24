@@ -59,6 +59,10 @@ def run_search_profile(
         bool,
         typer.Option("--persist", help="Persist discovered companies through ingestion."),
     ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Confirm direct persistence of discovered companies."),
+    ] = False,
     max_queries: Annotated[
         int | None,
         typer.Option(help="Lower the maximum query count."),
@@ -78,6 +82,14 @@ def run_search_profile(
             "Choose exactly one mode: --dry-run or --persist.",
             fg=typer.colors.RED,
         )
+        raise typer.Exit(1)
+
+    if yes and not persist:
+        typer.secho("--yes is valid only with --persist.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    if persist and not yes:
+        typer.secho("Persistence requires --yes.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
     if provider.strip().casefold() != "serpapi":
@@ -217,6 +229,10 @@ def discover_serpapi(
             help="Persist discovered companies through the ingestion service.",
         ),
     ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Confirm direct persistence of discovered companies."),
+    ] = False,
     project_id: Annotated[
         int | None,
         typer.Option(help="Project ID required when --persist is used."),
@@ -224,6 +240,14 @@ def discover_serpapi(
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
+
+    if yes and not persist:
+        typer.secho("--yes is valid only with --persist.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    if persist and not yes:
+        typer.secho("Persistence requires --yes.", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
     try:
         request = CompanyDiscoveryRequest(
