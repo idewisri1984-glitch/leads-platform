@@ -157,3 +157,169 @@ def test_discovery_upsert_remains_protected_after_review(session: Session) -> No
     )
     assert result.protected is True
     assert result.candidate.name == "Person"
+
+
+def test_failure_after_flush_then_caller_rollback_restores_persisted_state(
+    session: Session,
+) -> None:
+    company, candidate = setup_candidate(session)
+    session.commit()
+    candidate_id = candidate.id
+    snapshot = (
+        candidate.name,
+        candidate.title,
+        candidate.email,
+        candidate.phone,
+        candidate.source_url,
+        candidate.confidence,
+    )
+
+    try:
+        ContactDiscoveryCandidateReviewService(ContactDiscoveryRepository(session)).mark_reviewed(
+            company.id, candidate_id
+        )
+        assert session.get(ContactDiscoveryCandidate, candidate_id).discovery_status == "REVIEWED"
+        raise RuntimeError("synthetic post-flush failure")
+    except RuntimeError:
+        session.rollback()
+
+    with SessionLocal() as fresh:
+        restored = fresh.get(ContactDiscoveryCandidate, candidate_id)
+        assert restored is not None
+        assert restored.discovery_status == "DISCOVERED"
+        assert snapshot == (
+            restored.name,
+            restored.title,
+            restored.email,
+            restored.phone,
+            restored.source_url,
+            restored.confidence,
+        )
+        assert fresh.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+def test_cross_project_company_scope_hides_and_preserves_candidate(session: Session) -> None:
+    first, _ = setup_candidate(session, project_name="Project A", company_name="Company A")
+    second, candidate = setup_candidate(
+        session,
+        project_name="Project B",
+        company_name="Company B",
+    )
+    session.commit()
+    company_snapshot = (second.project_id, second.name, second.website, second.status)
+    candidate_snapshot = (
+        candidate.discovery_status,
+        candidate.name,
+        candidate.title,
+        candidate.email,
+        candidate.phone,
+        candidate.source_url,
+    )
+    service = ContactDiscoveryCandidateReviewService(ContactDiscoveryRepository(session))
+
+    with pytest.raises(
+        ContactDiscoveryCandidateReviewNotFoundError,
+        match=r"^Candidate was not found\.$",
+    ):
+        service.mark_reviewed(first.id, candidate.id)
+
+    assert company_snapshot == (second.project_id, second.name, second.website, second.status)
+    assert candidate_snapshot == (
+        candidate.discovery_status,
+        candidate.name,
+        candidate.title,
+        candidate.email,
+        candidate.phone,
+        candidate.source_url,
+    )
+    assert session.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+def test_existing_canonical_contact_is_unchanged_by_candidate_review(session: Session) -> None:
+    company, candidate = setup_candidate(session)
+    contact = Contact(
+        company_id=company.id,
+        first_name="Existing",
+        last_name="Person",
+        job_title="Manager",
+        email="existing@example.com",
+        phone="+1 555 0199",
+        linkedin_url="https://linkedin.com/in/existing",
+        country="US",
+        city="Boston",
+        source="MANUAL",
+        external_id="existing-1",
+        status="ACTIVE",
+        notes="preserve",
+    )
+    session.add(contact)
+    session.commit()
+    contact_id = contact.id
+    snapshot = (
+        contact.company_id,
+        contact.first_name,
+        contact.last_name,
+        contact.job_title,
+        contact.email,
+        contact.phone,
+        contact.linkedin_url,
+        contact.country,
+        contact.city,
+        contact.source,
+        contact.external_id,
+        contact.status,
+        contact.notes,
+    )
+
+    ContactDiscoveryCandidateReviewService(ContactDiscoveryRepository(session)).reject(
+        company.id, candidate.id
+    )
+    session.commit()
+    session.expire_all()
+    reloaded = session.get(Contact, contact_id)
+    assert reloaded is not None
+    assert snapshot == (
+        reloaded.company_id,
+        reloaded.first_name,
+        reloaded.last_name,
+        reloaded.job_title,
+        reloaded.email,
+        reloaded.phone,
+        reloaded.linkedin_url,
+        reloaded.country,
+        reloaded.city,
+        reloaded.source,
+        reloaded.external_id,
+        reloaded.status,
+        reloaded.notes,
+    )
+    assert session.scalar(select(func.count()).select_from(Contact)) == 1
+
+
+def test_review_and_reject_do_not_invoke_discovery_stack(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.contact_discovery import website_contact_parser
+    from app.modules.contact_discovery.service import ContactDiscoveryService
+    from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProvider
+    from app.providers.public_web_fetcher import BoundedPublicWebFetcher
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        pytest.fail("discovery stack invoked")
+
+    monkeypatch.setattr(ContactDiscoveryService, "run", forbidden)
+    monkeypatch.setattr(WebsiteContactDiscoveryProvider, "discover", forbidden)
+    monkeypatch.setattr(
+        website_contact_parser,
+        "parse_contact_discovery_candidates_from_html",
+        forbidden,
+    )
+    monkeypatch.setattr(BoundedPublicWebFetcher, "fetch", forbidden)
+    first_company, first_candidate = setup_candidate(session, company_name="Review")
+    second_company, second_candidate = setup_candidate(session, company_name="Reject")
+    service = ContactDiscoveryCandidateReviewService(ContactDiscoveryRepository(session))
+
+    assert service.mark_reviewed(first_company.id, first_candidate.id).changed is True
+    assert service.reject(second_company.id, second_candidate.id).changed is True
+    session.commit()

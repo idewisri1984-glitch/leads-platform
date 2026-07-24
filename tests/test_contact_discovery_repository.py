@@ -1,6 +1,8 @@
 from collections.abc import Generator
 from datetime import UTC, datetime
+from enum import Enum, StrEnum
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import func, select
@@ -25,6 +27,14 @@ from app.modules.contact_discovery.normalization import (
 from app.modules.contact_discovery.repository import ContactDiscoveryRepository
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.project.models import Project
+
+
+class UnrelatedStatus(Enum):
+    REVIEWED = "REVIEWED"
+
+
+class UnrelatedStringStatus(StrEnum):
+    REVIEWED = "REVIEWED"
 
 
 @pytest.fixture
@@ -446,3 +456,98 @@ def test_status_update_preserves_candidate_fields_and_has_no_contact_side_effect
         after.last_error,
     )
     assert session.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+@pytest.mark.parametrize(
+    "invalid_status",
+    [
+        "REVIEWED",
+        "REJECTED",
+        "UNKNOWN",
+        "",
+        True,
+        False,
+        1,
+        None,
+        object(),
+        UnrelatedStatus.REVIEWED,
+        UnrelatedStringStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.DISCOVERED,
+        ContactDiscoveryCandidateStatus.PROMOTED,
+    ],
+)
+def test_status_update_rejects_non_enum_and_forbidden_targets_before_flush(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_status: object,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    stored = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email="strict@example.com",
+            phone="+1 555 0100",
+            notes="preserved",
+        ),
+    )
+    candidate_record = repository.get_candidate(stored.candidate.id)
+    assert candidate_record is not None
+    original = (
+        candidate_record.discovery_status,
+        candidate_record.name,
+        candidate_record.title,
+        candidate_record.email,
+        candidate_record.phone,
+        candidate_record.notes,
+    )
+    monkeypatch.setattr(session, "flush", lambda: pytest.fail("unexpected flush"))
+    monkeypatch.setattr(session, "commit", lambda: pytest.fail("unexpected commit"))
+
+    with pytest.raises(ValueError) as raised:
+        repository.set_candidate_status(
+            company.id,
+            candidate_record.id,
+            cast(Any, invalid_status),
+        )
+
+    assert str(raised.value) == "Candidate target status is not allowed."
+    rendered = str(invalid_status)
+    if rendered:
+        assert rendered not in str(raised.value)
+    assert original == (
+        candidate_record.discovery_status,
+        candidate_record.name,
+        candidate_record.title,
+        candidate_record.email,
+        candidate_record.phone,
+        candidate_record.notes,
+    )
+    assert session.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+    ],
+)
+def test_status_update_preserves_actual_enum_type(
+    session: Session,
+    target: ContactDiscoveryCandidateStatus,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id,
+        candidate(company.id, email="enum@example.com"),
+    ).candidate.id
+
+    updated = repository.set_candidate_status(company.id, candidate_id, target)
+
+    assert updated.discovery_status is target
+    assert isinstance(updated.discovery_status, ContactDiscoveryCandidateStatus)

@@ -130,7 +130,9 @@ class ContactDiscoveryRepository:
     ) -> ContactDiscoveryCandidate:
         self._validate_positive_id(company_id, "Company")
         self._validate_positive_id(candidate_id, "Candidate")
-        if candidate_status not in (
+        if not isinstance(
+            candidate_status, ContactDiscoveryCandidateStatus
+        ) or candidate_status not in (
             ContactDiscoveryCandidateStatus.REVIEWED,
             ContactDiscoveryCandidateStatus.REJECTED,
         ):
