@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import Table, select
 from sqlalchemy.orm import Session
 
 from app.modules.company.models import Company
@@ -98,6 +98,22 @@ class ContactDiscoveryRepository:
             )
         )
 
+    def get_candidate_for_promotion(
+        self, company_id: int, candidate_id: int
+    ) -> ContactDiscoveryCandidate | None:
+        self._validate_positive_id(company_id, "Company")
+        self._validate_positive_id(candidate_id, "Candidate")
+        statement = (
+            select(ContactDiscoveryCandidate)
+            .where(
+                ContactDiscoveryCandidate.company_id == company_id,
+                ContactDiscoveryCandidate.id == candidate_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        return self.session.scalar(statement)
+
     def list_candidates_for_company(
         self,
         company_id: int,
@@ -140,7 +156,49 @@ class ContactDiscoveryRepository:
         candidate = self.get_candidate_for_company(company_id, candidate_id)
         if candidate is None:
             raise ValueError("Candidate was not found.")
+        if (
+            candidate.discovery_status == ContactDiscoveryCandidateStatus.PROMOTED
+            or candidate.promoted_contact_id is not None
+        ):
+            raise ValueError("Candidate promotion state is protected.")
         candidate.discovery_status = candidate_status
+        self.session.add(candidate)
+        self.session.flush()
+        return candidate
+
+    def link_promoted_contact(
+        self,
+        company_id: int,
+        candidate_id: int,
+        contact_id: int,
+    ) -> ContactDiscoveryCandidate:
+        self._validate_positive_id(company_id, "Company")
+        self._validate_positive_id(candidate_id, "Candidate")
+        self._validate_positive_id(contact_id, "Contact")
+        candidate = self.get_candidate_for_promotion(company_id, candidate_id)
+        if candidate is None:
+            raise ValueError("Candidate was not found.")
+        if (
+            candidate.discovery_status != ContactDiscoveryCandidateStatus.REVIEWED
+            or candidate.promoted_contact_id is not None
+        ):
+            raise ValueError("Candidate is not eligible for promotion.")
+        candidate_table = cast(Table, ContactDiscoveryCandidate.__table__)
+        contacts = candidate_table.metadata.tables.get("contacts")
+        if contacts is None:
+            raise ValueError("Contact is not available for candidate promotion.")
+        available_contact_id = self.session.scalar(
+            select(contacts.c.id)
+            .where(
+                contacts.c.id == contact_id,
+                contacts.c.company_id == company_id,
+            )
+            .with_for_update()
+        )
+        if available_contact_id is None:
+            raise ValueError("Contact is not available for candidate promotion.")
+        candidate.discovery_status = ContactDiscoveryCandidateStatus.PROMOTED
+        candidate.promoted_contact_id = available_contact_id
         self.session.add(candidate)
         self.session.flush()
         return candidate
@@ -184,6 +242,7 @@ class ContactDiscoveryRepository:
         if existing is None:
             created = ContactDiscoveryCandidate(
                 company_id=company_id,
+                promoted_contact_id=None,
                 name=clean_discovered_text(candidate.name),
                 title=clean_discovered_text(candidate.title),
                 email=clean_discovered_text(candidate.email),

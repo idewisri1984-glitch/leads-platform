@@ -551,3 +551,220 @@ def test_status_update_preserves_actual_enum_type(
 
     assert updated.discovery_status is target
     assert isinstance(updated.discovery_status, ContactDiscoveryCandidateStatus)
+
+
+@pytest.mark.parametrize("invalid_id", [0, -1, True, False, 1.5, "1", None])
+def test_promotion_lookup_and_link_reject_invalid_ids(session: Session, invalid_id: object) -> None:
+    repository = ContactDiscoveryRepository(session)
+    with pytest.raises(ValueError):
+        repository.get_candidate_for_promotion(cast(Any, invalid_id), 1)
+    with pytest.raises(ValueError):
+        repository.get_candidate_for_promotion(1, cast(Any, invalid_id))
+    with pytest.raises(ValueError):
+        repository.link_promoted_contact(1, 1, cast(Any, invalid_id))
+
+
+def test_promotion_lookup_is_company_scoped_and_locked() -> None:
+    class RecordingSession:
+        statement: Any = None
+
+        def scalar(self, statement: Any) -> None:
+            self.statement = statement
+
+    recording = RecordingSession()
+    result = ContactDiscoveryRepository(cast(Session, recording)).get_candidate_for_promotion(2, 3)
+    assert result is None
+    assert recording.statement is not None
+    assert recording.statement._execution_options["populate_existing"] is True
+    assert recording.statement._for_update_arg is not None
+    compiled = str(recording.statement)
+    assert "company_id" in compiled
+    assert "contact_discovery_candidates.id" in compiled
+
+
+def test_promotion_lookup_hides_cross_company_candidate(session: Session) -> None:
+    project = create_project(session, "Project")
+    first = create_company(session, project, "First")
+    second = create_company(session, project, "Second")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        second.id, candidate(second.id, email="other@example.com")
+    ).candidate.id
+    assert repository.get_candidate_for_promotion(first.id, candidate_id) is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ContactDiscoveryCandidateStatus.DISCOVERED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+        ContactDiscoveryCandidateStatus.PROMOTED,
+    ],
+)
+def test_link_rejects_ineligible_candidate_states(
+    session: Session, status: ContactDiscoveryCandidateStatus
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id, candidate(company.id, email=f"{status.value.lower()}@example.com")
+    ).candidate.id
+    stored = repository.get_candidate(candidate_id)
+    assert stored is not None
+    stored.discovery_status = status
+    session.flush()
+    with pytest.raises(ValueError, match="not eligible"):
+        repository.link_promoted_contact(company.id, candidate_id, 1)
+
+
+def test_link_requires_company_scoped_contact(session: Session) -> None:
+    project = create_project(session, "Project")
+    first = create_company(session, project, "First")
+    second = create_company(session, project, "Second")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        first.id, candidate(first.id, email="reviewed@example.com")
+    ).candidate.id
+    repository.set_candidate_status(
+        first.id, candidate_id, ContactDiscoveryCandidateStatus.REVIEWED
+    )
+    other_contact = Contact(company_id=second.id, first_name="Other", status="NEW")
+    session.add(other_contact)
+    session.flush()
+    with pytest.raises(ValueError, match="not available"):
+        repository.link_promoted_contact(first.id, candidate_id, other_contact.id)
+    with pytest.raises(ValueError, match="not available"):
+        repository.link_promoted_contact(first.id, candidate_id, other_contact.id + 1000)
+
+
+def test_link_promotes_candidate_without_other_side_effects(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email="reviewed@example.com",
+            phone="+15550100",
+            notes="preserve",
+        ),
+    ).candidate.id
+    repository.set_candidate_status(
+        company.id, candidate_id, ContactDiscoveryCandidateStatus.REVIEWED
+    )
+    contact = Contact(company_id=company.id, first_name="Ada", email="reviewed@example.com")
+    session.add(contact)
+    session.flush()
+    stored = repository.get_candidate(candidate_id)
+    assert stored is not None
+    snapshot = (
+        stored.company_id,
+        stored.name,
+        stored.title,
+        stored.email,
+        stored.normalized_email,
+        stored.phone,
+        stored.source_url,
+        stored.source_type,
+        stored.confidence,
+        stored.deduplication_key,
+        stored.notes,
+        stored.last_error,
+    )
+    contact_snapshot = (contact.company_id, contact.first_name, contact.email, contact.status)
+    monkeypatch.setattr(session, "commit", lambda: pytest.fail("unexpected commit"))
+    monkeypatch.setattr(session, "rollback", lambda: pytest.fail("unexpected rollback"))
+    monkeypatch.setattr(session, "close", lambda: pytest.fail("unexpected close"))
+    promoted = repository.link_promoted_contact(company.id, candidate_id, contact.id)
+    assert promoted.discovery_status == ContactDiscoveryCandidateStatus.PROMOTED
+    assert promoted.promoted_contact_id == contact.id
+    assert snapshot == (
+        promoted.company_id,
+        promoted.name,
+        promoted.title,
+        promoted.email,
+        promoted.normalized_email,
+        promoted.phone,
+        promoted.source_url,
+        promoted.source_type,
+        promoted.confidence,
+        promoted.deduplication_key,
+        promoted.notes,
+        promoted.last_error,
+    )
+    assert contact_snapshot == (
+        contact.company_id,
+        contact.first_name,
+        contact.email,
+        contact.status,
+    )
+    assert session.scalar(select(func.count()).select_from(Contact)) == 1
+
+
+def test_promotion_link_and_status_are_protected_from_review_and_upsert(
+    session: Session,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    incoming = candidate(
+        company.id,
+        name="Original",
+        email="protected@example.com",
+        notes="preserve",
+    )
+    candidate_id = repository.upsert_candidate(company.id, incoming).candidate.id
+    repository.set_candidate_status(
+        company.id, candidate_id, ContactDiscoveryCandidateStatus.REVIEWED
+    )
+    contact = Contact(company_id=company.id, first_name="Ada")
+    session.add(contact)
+    session.flush()
+    repository.link_promoted_contact(company.id, candidate_id, contact.id)
+    for target in (
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+    ):
+        with pytest.raises(ValueError, match="protected"):
+            repository.set_candidate_status(company.id, candidate_id, target)
+    result = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name="Replacement",
+            email="protected@example.com",
+            confidence=100,
+        ),
+    )
+    assert result.protected is True
+    assert result.candidate.discovery_status == ContactDiscoveryCandidateStatus.PROMOTED
+    assert result.candidate.promoted_contact_id == contact.id
+    assert result.candidate.name == "Original"
+    assert result.candidate.notes == "preserve"
+
+
+def test_reviewed_candidate_with_existing_link_is_ineligible(session: Session) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id, candidate(company.id, email="linked@example.com")
+    ).candidate.id
+    contact = Contact(company_id=company.id, first_name="Ada")
+    session.add(contact)
+    session.flush()
+    stored = repository.get_candidate(candidate_id)
+    assert stored is not None
+    stored.discovery_status = ContactDiscoveryCandidateStatus.REVIEWED
+    stored.promoted_contact_id = contact.id
+    session.flush()
+    with pytest.raises(ValueError, match="not eligible"):
+        repository.link_promoted_contact(company.id, candidate_id, contact.id)
+    with pytest.raises(ValueError, match="protected"):
+        repository.set_candidate_status(
+            company.id, candidate_id, ContactDiscoveryCandidateStatus.REJECTED
+        )

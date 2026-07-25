@@ -35,6 +35,8 @@ class ContactDiscoveryStateUpdate(BaseModel):
 
 
 class ContactDiscoveryCandidateCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     company_id: int = Field(gt=0)
     name: str | None = Field(default=None, max_length=255)
     title: str | None = Field(default=None, max_length=255)
@@ -62,6 +64,8 @@ class ContactDiscoveryCandidateCreate(BaseModel):
 
 
 class ContactDiscoveryCandidateUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, max_length=255)
     title: str | None = Field(default=None, max_length=255)
     email: str | None = Field(default=None, max_length=255)
@@ -84,6 +88,7 @@ class ContactDiscoveryCandidateRead(BaseModel):
 
     id: int
     company_id: int
+    promoted_contact_id: int | None = None
     name: str | None
     title: str | None
     email: str | None

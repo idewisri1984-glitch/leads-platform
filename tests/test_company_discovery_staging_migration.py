@@ -75,18 +75,18 @@ def test_f7b_migration_upgrade_downgrade_and_reupgrade(tmp_path: Path) -> None:
 
     alembic(database, "upgrade", "head")
     assert {_RUN_TABLE, _CANDIDATE_TABLE} <= table_names(database)
-    assert current_revision(database) == "7b4c5d6e7f80"
+    assert current_revision(database) == "8c5d6e7f8091"
     _assert_direct_sql_defaults(database)
 
 
 def test_full_migration_round_trip(tmp_path: Path) -> None:
     database = tmp_path / "f7b-full-round-trip.sqlite"
     alembic(database, "upgrade", "head")
-    assert current_revision(database) == "7b4c5d6e7f80"
+    assert current_revision(database) == "8c5d6e7f8091"
     alembic(database, "downgrade", "base")
     assert table_names(database) <= {"alembic_version"}
     alembic(database, "upgrade", "head")
-    assert current_revision(database) == "7b4c5d6e7f80"
+    assert current_revision(database) == "8c5d6e7f8091"
     assert {_RUN_TABLE, _CANDIDATE_TABLE} <= table_names(database)
 
 
