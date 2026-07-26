@@ -323,3 +323,79 @@ def test_review_and_reject_do_not_invoke_discovery_stack(
     assert service.mark_reviewed(first_company.id, first_candidate.id).changed is True
     assert service.reject(second_company.id, second_candidate.id).changed is True
     session.commit()
+
+
+def test_stale_reject_cannot_overwrite_committed_promotion(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    company, candidate = setup_candidate(session)
+    candidate.discovery_status = ContactDiscoveryCandidateStatus.REVIEWED
+    contact = Contact(
+        company_id=company.id,
+        first_name="Canonical",
+        email="canonical@example.com",
+        status="ACTIVE",
+    )
+    session.add(contact)
+    session.commit()
+    company_id = company.id
+    candidate_id = candidate.id
+    contact_id = contact.id
+    contact_snapshot = (
+        contact.company_id,
+        contact.first_name,
+        contact.email,
+        contact.status,
+    )
+
+    with SessionLocal() as promotion_session, SessionLocal() as reject_session:
+        stale = reject_session.get(ContactDiscoveryCandidate, candidate_id)
+        assert stale is not None
+        assert stale.discovery_status == ContactDiscoveryCandidateStatus.REVIEWED
+        assert stale.promoted_contact_id is None
+
+        promoted = ContactDiscoveryRepository(promotion_session).link_promoted_contact(
+            company_id,
+            candidate_id,
+            contact_id,
+        )
+        assert promoted.discovery_status == ContactDiscoveryCandidateStatus.PROMOTED
+        promotion_session.commit()
+
+        with monkeypatch.context() as context:
+            context.setattr(reject_session, "commit", lambda: pytest.fail("unexpected commit"))
+            context.setattr(reject_session, "rollback", lambda: pytest.fail("unexpected rollback"))
+            context.setattr(reject_session, "close", lambda: pytest.fail("unexpected close"))
+            with pytest.raises(
+                ValueError,
+                match=r"^Candidate promotion state is protected\.$",
+            ):
+                ContactDiscoveryRepository(reject_session).set_candidate_status(
+                    company_id,
+                    candidate_id,
+                    ContactDiscoveryCandidateStatus.REJECTED,
+                )
+        assert stale.discovery_status == ContactDiscoveryCandidateStatus.PROMOTED
+        assert stale.promoted_contact_id == contact_id
+        reject_session.rollback()
+
+    with SessionLocal() as verification:
+        stored = verification.get(ContactDiscoveryCandidate, candidate_id)
+        stored_contact = verification.get(Contact, contact_id)
+        assert stored is not None
+        assert stored.discovery_status == ContactDiscoveryCandidateStatus.PROMOTED
+        assert stored.promoted_contact_id == contact_id
+        assert stored_contact is not None
+        assert contact_snapshot == (
+            stored_contact.company_id,
+            stored_contact.first_name,
+            stored_contact.email,
+            stored_contact.status,
+        )
+        assert (
+            verification.scalar(
+                select(func.count()).select_from(Contact).where(Contact.company_id == company_id)
+            )
+            == 1
+        )

@@ -553,6 +553,54 @@ def test_status_update_preserves_actual_enum_type(
     assert isinstance(updated.discovery_status, ContactDiscoveryCandidateStatus)
 
 
+def test_status_mutation_uses_fresh_company_scoped_lock_and_flush_only() -> None:
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.candidate = ContactDiscoveryCandidate(
+                discovery_status=ContactDiscoveryCandidateStatus.DISCOVERED
+            )
+            self.statement: Any = None
+            self.added: object | None = None
+            self.flush_count = 0
+
+        def scalar(self, statement: Any) -> ContactDiscoveryCandidate:
+            self.statement = statement
+            return self.candidate
+
+        def add(self, value: object) -> None:
+            self.added = value
+
+        def flush(self) -> None:
+            self.flush_count += 1
+
+        def commit(self) -> None:
+            pytest.fail("unexpected commit")
+
+        def rollback(self) -> None:
+            pytest.fail("unexpected rollback")
+
+        def close(self) -> None:
+            pytest.fail("unexpected close")
+
+    recording = RecordingSession()
+    updated = ContactDiscoveryRepository(cast(Session, recording)).set_candidate_status(
+        2,
+        3,
+        ContactDiscoveryCandidateStatus.REVIEWED,
+    )
+
+    assert recording.statement is not None
+    assert recording.statement._execution_options["populate_existing"] is True
+    assert recording.statement._for_update_arg is not None
+    compiled = str(recording.statement)
+    assert "company_id" in compiled
+    assert "contact_discovery_candidates.id" in compiled
+    assert updated is recording.candidate
+    assert updated.discovery_status == ContactDiscoveryCandidateStatus.REVIEWED
+    assert recording.added is updated
+    assert recording.flush_count == 1
+
+
 @pytest.mark.parametrize("invalid_id", [0, -1, True, False, 1.5, "1", None])
 def test_promotion_lookup_and_link_reject_invalid_ids(session: Session, invalid_id: object) -> None:
     repository = ContactDiscoveryRepository(session)

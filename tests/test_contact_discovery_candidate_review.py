@@ -12,6 +12,10 @@ from app.modules.contact_discovery import (
     ContactDiscoveryCandidateTransitionError,
     ContactDiscoverySourceType,
 )
+from app.modules.contact_discovery.schemas import (
+    ContactDiscoveryCandidateCreate,
+    ContactDiscoveryCandidateUpdate,
+)
 
 
 def record(status: ContactDiscoveryCandidateStatus) -> SimpleNamespace:
@@ -196,3 +200,42 @@ def test_base_exception_from_repository_is_not_swallowed() -> None:
     )
     with pytest.raises(KeyboardInterrupt):
         service.mark_reviewed(3, 7)
+
+
+def test_candidate_create_schema_reserves_lifecycle_fields() -> None:
+    created = ContactDiscoveryCandidateCreate(
+        company_id=1,
+        name="Person",
+        source_type=ContactDiscoverySourceType.TEAM_PAGE,
+    )
+    assert "discovery_status" not in ContactDiscoveryCandidateCreate.model_fields
+    assert "discovery_status" not in created.model_dump()
+
+    for status in ContactDiscoveryCandidateStatus:
+        with pytest.raises(ValidationError):
+            ContactDiscoveryCandidateCreate(
+                company_id=1,
+                name="Person",
+                source_type=ContactDiscoverySourceType.TEAM_PAGE,
+                discovery_status=status,
+            )
+    with pytest.raises(ValidationError):
+        ContactDiscoveryCandidateCreate(
+            company_id=1,
+            name="Person",
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+            promoted_contact_id=9,
+        )
+
+
+def test_candidate_update_schema_reserves_lifecycle_fields() -> None:
+    updated = ContactDiscoveryCandidateUpdate(name="Updated", title="Director")
+    assert updated.name == "Updated"
+    assert updated.title == "Director"
+    assert "discovery_status" not in ContactDiscoveryCandidateUpdate.model_fields
+
+    for status in ContactDiscoveryCandidateStatus:
+        with pytest.raises(ValidationError):
+            ContactDiscoveryCandidateUpdate(discovery_status=status)
+    with pytest.raises(ValidationError):
+        ContactDiscoveryCandidateUpdate(promoted_contact_id=9)

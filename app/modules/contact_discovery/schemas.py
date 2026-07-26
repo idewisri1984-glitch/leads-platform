@@ -45,7 +45,6 @@ class ContactDiscoveryCandidateCreate(BaseModel):
     source_url: str | None = Field(default=None, max_length=500)
     source_type: ContactDiscoverySourceType
     confidence: int = Field(default=0, ge=0, le=100)
-    discovery_status: ContactDiscoveryCandidateStatus = ContactDiscoveryCandidateStatus.DISCOVERED
     notes: str | None = None
     last_error: str | None = None
 
@@ -73,7 +72,6 @@ class ContactDiscoveryCandidateUpdate(BaseModel):
     source_url: str | None = Field(default=None, max_length=500)
     source_type: ContactDiscoverySourceType | None = None
     confidence: int | None = Field(default=None, ge=0, le=100)
-    discovery_status: ContactDiscoveryCandidateStatus | None = None
     notes: str | None = None
     last_error: str | None = None
 

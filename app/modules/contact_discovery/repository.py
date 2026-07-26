@@ -101,6 +101,11 @@ class ContactDiscoveryRepository:
     def get_candidate_for_promotion(
         self, company_id: int, candidate_id: int
     ) -> ContactDiscoveryCandidate | None:
+        return self._get_candidate_for_status_mutation(company_id, candidate_id)
+
+    def _get_candidate_for_status_mutation(
+        self, company_id: int, candidate_id: int
+    ) -> ContactDiscoveryCandidate | None:
         self._validate_positive_id(company_id, "Company")
         self._validate_positive_id(candidate_id, "Candidate")
         statement = (
@@ -153,7 +158,7 @@ class ContactDiscoveryRepository:
             ContactDiscoveryCandidateStatus.REJECTED,
         ):
             raise ValueError("Candidate target status is not allowed.")
-        candidate = self.get_candidate_for_company(company_id, candidate_id)
+        candidate = self._get_candidate_for_status_mutation(company_id, candidate_id)
         if candidate is None:
             raise ValueError("Candidate was not found.")
         if (
