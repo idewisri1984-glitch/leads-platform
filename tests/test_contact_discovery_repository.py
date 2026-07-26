@@ -24,7 +24,11 @@ from app.modules.contact_discovery.normalization import (
     normalize_source_for_deduplication,
     normalize_title,
 )
-from app.modules.contact_discovery.repository import ContactDiscoveryRepository
+from app.modules.contact_discovery.repository import (
+    ContactDiscoveryCandidateRepositoryTransitionError,
+    ContactDiscoveryRepository,
+    _normalize_persisted_candidate_status,
+)
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.project.models import Project
 
@@ -384,7 +388,9 @@ def test_status_update_allows_only_reviewed_and_rejected(
         ContactDiscoveryCandidateStatus.REJECTED,
     ):
         assert (
-            repository.set_candidate_status(company.id, candidate_id, target).discovery_status
+            repository.set_candidate_status(
+                company.id, candidate_id, target
+            ).candidate.discovery_status
             == target
         )
     else:
@@ -547,10 +553,57 @@ def test_status_update_preserves_actual_enum_type(
         candidate(company.id, email="enum@example.com"),
     ).candidate.id
 
-    updated = repository.set_candidate_status(company.id, candidate_id, target)
+    outcome = repository.set_candidate_status(company.id, candidate_id, target)
 
-    assert updated.discovery_status is target
-    assert isinstance(updated.discovery_status, ContactDiscoveryCandidateStatus)
+    assert outcome.candidate.discovery_status is target
+    assert isinstance(outcome.candidate.discovery_status, ContactDiscoveryCandidateStatus)
+    assert outcome.previous_status is ContactDiscoveryCandidateStatus.DISCOVERED
+    assert outcome.current_status is target
+    assert outcome.changed is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("DISCOVERED", ContactDiscoveryCandidateStatus.DISCOVERED),
+        ("REVIEWED", ContactDiscoveryCandidateStatus.REVIEWED),
+        ("PROMOTED", ContactDiscoveryCandidateStatus.PROMOTED),
+        ("REJECTED", ContactDiscoveryCandidateStatus.REJECTED),
+        (
+            ContactDiscoveryCandidateStatus.DISCOVERED,
+            ContactDiscoveryCandidateStatus.DISCOVERED,
+        ),
+    ],
+)
+def test_persisted_candidate_status_normalization_returns_enum(
+    value: object,
+    expected: ContactDiscoveryCandidateStatus,
+) -> None:
+    assert _normalize_persisted_candidate_status(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "UNKNOWN",
+        "reviewed",
+        " REVIEWED ",
+        True,
+        1,
+        UnrelatedStatus.REVIEWED,
+        UnrelatedStringStatus.REVIEWED,
+        None,
+        object(),
+    ],
+)
+def test_invalid_persisted_candidate_status_fails_safely(value: object) -> None:
+    with pytest.raises(
+        ContactDiscoveryCandidateRepositoryTransitionError,
+        match=r"^Candidate status transition is not allowed\.$",
+    ) as exc_info:
+        _normalize_persisted_candidate_status(value)
+
+    assert str(value) not in str(exc_info.value)
 
 
 def test_status_mutation_uses_fresh_company_scoped_lock_and_flush_only() -> None:
@@ -583,7 +636,7 @@ def test_status_mutation_uses_fresh_company_scoped_lock_and_flush_only() -> None
             pytest.fail("unexpected close")
 
     recording = RecordingSession()
-    updated = ContactDiscoveryRepository(cast(Session, recording)).set_candidate_status(
+    outcome = ContactDiscoveryRepository(cast(Session, recording)).set_candidate_status(
         2,
         3,
         ContactDiscoveryCandidateStatus.REVIEWED,
@@ -595,10 +648,85 @@ def test_status_mutation_uses_fresh_company_scoped_lock_and_flush_only() -> None
     compiled = str(recording.statement)
     assert "company_id" in compiled
     assert "contact_discovery_candidates.id" in compiled
-    assert updated is recording.candidate
-    assert updated.discovery_status == ContactDiscoveryCandidateStatus.REVIEWED
-    assert recording.added is updated
+    assert outcome.candidate is recording.candidate
+    assert outcome.previous_status == ContactDiscoveryCandidateStatus.DISCOVERED
+    assert outcome.current_status == ContactDiscoveryCandidateStatus.REVIEWED
+    assert outcome.changed is True
+    assert outcome.candidate.discovery_status == ContactDiscoveryCandidateStatus.REVIEWED
+    assert recording.added is outcome.candidate
     assert recording.flush_count == 1
+
+
+@pytest.mark.parametrize(
+    ("start", "target", "changed", "forbidden"),
+    [
+        ("DISCOVERED", "REVIEWED", True, False),
+        ("DISCOVERED", "REJECTED", True, False),
+        ("REVIEWED", "REVIEWED", False, False),
+        ("REVIEWED", "REJECTED", True, False),
+        ("REJECTED", "REJECTED", False, False),
+        ("REJECTED", "REVIEWED", False, True),
+        ("PROMOTED", "REVIEWED", False, True),
+        ("PROMOTED", "REJECTED", False, True),
+    ],
+)
+def test_status_mutation_enforces_locked_transition_matrix(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str,
+    target: str,
+    changed: bool,
+    forbidden: bool,
+) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    candidate_id = repository.upsert_candidate(
+        company.id,
+        candidate(company.id, email=f"{start.lower()}-{target.lower()}@example.com"),
+    ).candidate.id
+    stored = repository.get_candidate(candidate_id)
+    assert stored is not None
+    stored.discovery_status = ContactDiscoveryCandidateStatus(start)
+    session.flush()
+    original_flush = session.flush
+    flush_count = 0
+
+    def tracked_flush() -> None:
+        nonlocal flush_count
+        flush_count += 1
+        original_flush()
+
+    monkeypatch.setattr(session, "flush", tracked_flush)
+    monkeypatch.setattr(session, "commit", lambda: pytest.fail("unexpected commit"))
+    monkeypatch.setattr(session, "rollback", lambda: pytest.fail("unexpected rollback"))
+    monkeypatch.setattr(session, "close", lambda: pytest.fail("unexpected close"))
+
+    if forbidden:
+        with pytest.raises(
+            ContactDiscoveryCandidateRepositoryTransitionError,
+            match=r"^Candidate status transition is not allowed\.$",
+        ):
+            repository.set_candidate_status(
+                company.id,
+                candidate_id,
+                ContactDiscoveryCandidateStatus(target),
+            )
+        assert stored.discovery_status == ContactDiscoveryCandidateStatus(start)
+        assert flush_count == 0
+        return
+
+    outcome = repository.set_candidate_status(
+        company.id,
+        candidate_id,
+        ContactDiscoveryCandidateStatus(target),
+    )
+    assert outcome.candidate is stored
+    assert outcome.previous_status == ContactDiscoveryCandidateStatus(start)
+    assert outcome.current_status == ContactDiscoveryCandidateStatus(target)
+    assert outcome.changed is changed
+    assert stored.discovery_status == ContactDiscoveryCandidateStatus(target)
+    assert flush_count == int(changed)
 
 
 @pytest.mark.parametrize("invalid_id", [0, -1, True, False, 1.5, "1", None])
@@ -777,7 +905,10 @@ def test_promotion_link_and_status_are_protected_from_review_and_upsert(
         ContactDiscoveryCandidateStatus.REVIEWED,
         ContactDiscoveryCandidateStatus.REJECTED,
     ):
-        with pytest.raises(ValueError, match="protected"):
+        with pytest.raises(
+            ContactDiscoveryCandidateRepositoryTransitionError,
+            match=r"^Candidate status transition is not allowed\.$",
+        ):
             repository.set_candidate_status(company.id, candidate_id, target)
     result = repository.upsert_candidate(
         company.id,
@@ -812,7 +943,10 @@ def test_reviewed_candidate_with_existing_link_is_ineligible(session: Session) -
     session.flush()
     with pytest.raises(ValueError, match="not eligible"):
         repository.link_promoted_contact(company.id, candidate_id, contact.id)
-    with pytest.raises(ValueError, match="protected"):
+    with pytest.raises(
+        ContactDiscoveryCandidateRepositoryTransitionError,
+        match=r"^Candidate status transition is not allowed\.$",
+    ):
         repository.set_candidate_status(
             company.id, candidate_id, ContactDiscoveryCandidateStatus.REJECTED
         )

@@ -5,6 +5,11 @@ from app.modules.contact_discovery.candidate_review_schemas import (
     ContactDiscoveryCandidateReviewResult,
 )
 from app.modules.contact_discovery.models import ContactDiscoveryCandidateStatus
+from app.modules.contact_discovery.repository import (
+    ContactDiscoveryCandidateRepositoryNotFoundError,
+    ContactDiscoveryCandidateRepositoryTransitionError,
+    ContactDiscoveryCandidateStatusTransitionResult,
+)
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateRead
 
 
@@ -38,7 +43,7 @@ class CandidateReviewRepository(Protocol):
         company_id: int,
         candidate_id: int,
         candidate_status: ContactDiscoveryCandidateStatus,
-    ) -> CandidateReviewRecord: ...
+    ) -> ContactDiscoveryCandidateStatusTransitionResult: ...
 
 
 class ContactDiscoveryCandidateReviewService:
@@ -97,39 +102,19 @@ class ContactDiscoveryCandidateReviewService:
     ) -> ContactDiscoveryCandidateReviewResult:
         self._validate_positive_id(company_id, "Company")
         self._validate_positive_id(candidate_id, "Candidate")
-        candidate = self.repository.get_candidate_for_company(company_id, candidate_id)
-        if candidate is None:
-            raise ContactDiscoveryCandidateReviewNotFoundError("Candidate was not found.")
-        previous = candidate.discovery_status
-        allowed = {
-            ContactDiscoveryCandidateStatus.DISCOVERED: (
-                ContactDiscoveryCandidateStatus.REVIEWED,
-                ContactDiscoveryCandidateStatus.REJECTED,
-            ),
-            ContactDiscoveryCandidateStatus.REVIEWED: (
-                ContactDiscoveryCandidateStatus.REVIEWED,
-                ContactDiscoveryCandidateStatus.REJECTED,
-            ),
-            ContactDiscoveryCandidateStatus.REJECTED: (ContactDiscoveryCandidateStatus.REJECTED,),
-            ContactDiscoveryCandidateStatus.PROMOTED: (),
-        }
-        if target not in allowed.get(previous, ()):
+        try:
+            outcome = self.repository.set_candidate_status(company_id, candidate_id, target)
+        except ContactDiscoveryCandidateRepositoryNotFoundError:
+            raise ContactDiscoveryCandidateReviewNotFoundError("Candidate was not found.") from None
+        except ContactDiscoveryCandidateRepositoryTransitionError:
             raise ContactDiscoveryCandidateTransitionError(
                 "Candidate status transition is not allowed."
-            )
-        changed = previous != target
-        if changed:
-            try:
-                candidate = self.repository.set_candidate_status(company_id, candidate_id, target)
-            except ValueError:
-                raise ContactDiscoveryCandidateReviewNotFoundError(
-                    "Candidate was not found."
-                ) from None
+            ) from None
         return ContactDiscoveryCandidateReviewResult(
-            candidate=ContactDiscoveryCandidateRead.model_validate(candidate),
-            previous_status=previous,
-            current_status=target,
-            changed=changed,
+            candidate=ContactDiscoveryCandidateRead.model_validate(outcome.candidate),
+            previous_status=outcome.previous_status,
+            current_status=outcome.current_status,
+            changed=outcome.changed,
         )
 
     @staticmethod

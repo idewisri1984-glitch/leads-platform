@@ -12,6 +12,7 @@ from app.modules.contact_discovery import (
     ContactDiscoveryCandidateReviewNotFoundError,
     ContactDiscoveryCandidateReviewService,
     ContactDiscoveryCandidateStatus,
+    ContactDiscoveryCandidateTransitionError,
     ContactDiscoveryRepository,
     ContactDiscoverySourceType,
 )
@@ -369,7 +370,7 @@ def test_stale_reject_cannot_overwrite_committed_promotion(
             context.setattr(reject_session, "close", lambda: pytest.fail("unexpected close"))
             with pytest.raises(
                 ValueError,
-                match=r"^Candidate promotion state is protected\.$",
+                match=r"^Candidate status transition is not allowed\.$",
             ):
                 ContactDiscoveryRepository(reject_session).set_candidate_status(
                     company_id,
@@ -399,3 +400,94 @@ def test_stale_reject_cannot_overwrite_committed_promotion(
             )
             == 1
         )
+
+
+def test_stale_review_cannot_overwrite_committed_rejection(session: Session) -> None:
+    company, candidate = setup_candidate(session)
+    session.commit()
+    company_id = company.id
+    candidate_id = candidate.id
+    company_snapshot = (company.project_id, company.name, company.status, company.notes)
+    candidate_snapshot = (
+        candidate.name,
+        candidate.title,
+        candidate.email,
+        candidate.phone,
+        candidate.source_url,
+        candidate.confidence,
+    )
+
+    with SessionLocal() as review_session, SessionLocal() as reject_session:
+        stale = review_session.get(ContactDiscoveryCandidate, candidate_id)
+        assert stale is not None
+        assert stale.discovery_status == ContactDiscoveryCandidateStatus.DISCOVERED
+
+        rejected = ContactDiscoveryCandidateReviewService(
+            ContactDiscoveryRepository(reject_session)
+        ).reject(company_id, candidate_id)
+        assert rejected.changed is True
+        reject_session.commit()
+
+        with pytest.raises(
+            ContactDiscoveryCandidateTransitionError,
+            match=r"^Candidate status transition is not allowed\.$",
+        ):
+            ContactDiscoveryCandidateReviewService(
+                ContactDiscoveryRepository(review_session)
+            ).mark_reviewed(company_id, candidate_id)
+        review_session.rollback()
+
+    with SessionLocal() as verification:
+        stored = verification.get(ContactDiscoveryCandidate, candidate_id)
+        stored_company = verification.get(Company, company_id)
+        assert stored is not None
+        assert stored.discovery_status == ContactDiscoveryCandidateStatus.REJECTED
+        assert stored.promoted_contact_id is None
+        assert candidate_snapshot == (
+            stored.name,
+            stored.title,
+            stored.email,
+            stored.phone,
+            stored.source_url,
+            stored.confidence,
+        )
+        assert stored_company is not None
+        assert company_snapshot == (
+            stored_company.project_id,
+            stored_company.name,
+            stored_company.status,
+            stored_company.notes,
+        )
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+
+
+def test_stale_review_reports_authoritative_idempotent_outcome(session: Session) -> None:
+    company, candidate = setup_candidate(session)
+    session.commit()
+    company_id = company.id
+    candidate_id = candidate.id
+
+    with SessionLocal() as first_session, SessionLocal() as second_session:
+        stale = first_session.get(ContactDiscoveryCandidate, candidate_id)
+        assert stale is not None
+        assert stale.discovery_status == ContactDiscoveryCandidateStatus.DISCOVERED
+
+        concurrent = ContactDiscoveryCandidateReviewService(
+            ContactDiscoveryRepository(second_session)
+        ).mark_reviewed(company_id, candidate_id)
+        assert concurrent.changed is True
+        second_session.commit()
+
+        result = ContactDiscoveryCandidateReviewService(
+            ContactDiscoveryRepository(first_session)
+        ).mark_reviewed(company_id, candidate_id)
+        assert result.previous_status == ContactDiscoveryCandidateStatus.REVIEWED
+        assert result.current_status == ContactDiscoveryCandidateStatus.REVIEWED
+        assert result.changed is False
+        assert result.candidate.discovery_status == ContactDiscoveryCandidateStatus.REVIEWED
+        first_session.rollback()
+
+    with SessionLocal() as verification:
+        stored = verification.get(ContactDiscoveryCandidate, candidate_id)
+        assert stored is not None
+        assert stored.discovery_status == ContactDiscoveryCandidateStatus.REVIEWED
