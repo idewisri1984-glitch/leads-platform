@@ -35,6 +35,8 @@ class ContactDiscoveryStateUpdate(BaseModel):
 
 
 class ContactDiscoveryCandidateCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     company_id: int = Field(gt=0)
     name: str | None = Field(default=None, max_length=255)
     title: str | None = Field(default=None, max_length=255)
@@ -43,7 +45,6 @@ class ContactDiscoveryCandidateCreate(BaseModel):
     source_url: str | None = Field(default=None, max_length=500)
     source_type: ContactDiscoverySourceType
     confidence: int = Field(default=0, ge=0, le=100)
-    discovery_status: ContactDiscoveryCandidateStatus = ContactDiscoveryCandidateStatus.DISCOVERED
     notes: str | None = None
     last_error: str | None = None
 
@@ -62,6 +63,8 @@ class ContactDiscoveryCandidateCreate(BaseModel):
 
 
 class ContactDiscoveryCandidateUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, max_length=255)
     title: str | None = Field(default=None, max_length=255)
     email: str | None = Field(default=None, max_length=255)
@@ -69,7 +72,6 @@ class ContactDiscoveryCandidateUpdate(BaseModel):
     source_url: str | None = Field(default=None, max_length=500)
     source_type: ContactDiscoverySourceType | None = None
     confidence: int | None = Field(default=None, ge=0, le=100)
-    discovery_status: ContactDiscoveryCandidateStatus | None = None
     notes: str | None = None
     last_error: str | None = None
 
@@ -84,6 +86,7 @@ class ContactDiscoveryCandidateRead(BaseModel):
 
     id: int
     company_id: int
+    promoted_contact_id: int | None = None
     name: str | None
     title: str | None
     email: str | None

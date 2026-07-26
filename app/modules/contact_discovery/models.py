@@ -97,6 +97,9 @@ class ContactDiscoveryCandidate(Base):
     company_id: Mapped[int] = mapped_column(
         ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    promoted_contact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str | None] = mapped_column(String(255))
     title: Mapped[str | None] = mapped_column(String(255))
     email: Mapped[str | None] = mapped_column(String(255))

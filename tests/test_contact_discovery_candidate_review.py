@@ -12,6 +12,15 @@ from app.modules.contact_discovery import (
     ContactDiscoveryCandidateTransitionError,
     ContactDiscoverySourceType,
 )
+from app.modules.contact_discovery.repository import (
+    ContactDiscoveryCandidateRepositoryNotFoundError,
+    ContactDiscoveryCandidateRepositoryTransitionError,
+    ContactDiscoveryCandidateStatusTransitionResult,
+)
+from app.modules.contact_discovery.schemas import (
+    ContactDiscoveryCandidateCreate,
+    ContactDiscoveryCandidateUpdate,
+)
 
 
 def record(status: ContactDiscoveryCandidateStatus) -> SimpleNamespace:
@@ -62,11 +71,35 @@ class FakeRepository:
         company_id: int,
         candidate_id: int,
         candidate_status: ContactDiscoveryCandidateStatus,
-    ) -> object:
+    ) -> ContactDiscoveryCandidateStatusTransitionResult:
         assert (company_id, candidate_id) == (3, 7)
-        self.mutations.append(candidate_status)
-        self.candidate.discovery_status = candidate_status
-        return self.candidate
+        previous = self.candidate.discovery_status
+        allowed = {
+            ContactDiscoveryCandidateStatus.DISCOVERED: (
+                ContactDiscoveryCandidateStatus.REVIEWED,
+                ContactDiscoveryCandidateStatus.REJECTED,
+            ),
+            ContactDiscoveryCandidateStatus.REVIEWED: (
+                ContactDiscoveryCandidateStatus.REVIEWED,
+                ContactDiscoveryCandidateStatus.REJECTED,
+            ),
+            ContactDiscoveryCandidateStatus.REJECTED: (ContactDiscoveryCandidateStatus.REJECTED,),
+            ContactDiscoveryCandidateStatus.PROMOTED: (),
+        }
+        if candidate_status not in allowed[previous]:
+            raise ContactDiscoveryCandidateRepositoryTransitionError(
+                "Candidate status transition is not allowed."
+            )
+        changed = previous != candidate_status
+        if changed:
+            self.mutations.append(candidate_status)
+            self.candidate.discovery_status = candidate_status
+        return ContactDiscoveryCandidateStatusTransitionResult(
+            candidate=self.candidate,
+            previous_status=previous,
+            current_status=candidate_status,
+            changed=changed,
+        )
 
 
 @pytest.mark.parametrize("value", [0, -1, True, False, 1.5, "1"])
@@ -188,7 +221,12 @@ def test_result_schema_is_frozen_and_enforces_changed_invariant() -> None:
 
 def test_base_exception_from_repository_is_not_swallowed() -> None:
     class InterruptingRepository(FakeRepository):
-        def get_candidate_for_company(self, company_id: int, candidate_id: int) -> object:
+        def set_candidate_status(
+            self,
+            company_id: int,
+            candidate_id: int,
+            candidate_status: ContactDiscoveryCandidateStatus,
+        ) -> ContactDiscoveryCandidateStatusTransitionResult:
             raise KeyboardInterrupt
 
     service = ContactDiscoveryCandidateReviewService(
@@ -196,3 +234,106 @@ def test_base_exception_from_repository_is_not_swallowed() -> None:
     )
     with pytest.raises(KeyboardInterrupt):
         service.mark_reviewed(3, 7)
+
+
+def test_service_uses_authoritative_transition_outcome_without_prelock_read() -> None:
+    class AuthoritativeRepository(FakeRepository):
+        def get_candidate_for_company(self, company_id: int, candidate_id: int) -> object:
+            pytest.fail("mutation used a pre-lock read")
+
+        def set_candidate_status(
+            self,
+            company_id: int,
+            candidate_id: int,
+            candidate_status: ContactDiscoveryCandidateStatus,
+        ) -> ContactDiscoveryCandidateStatusTransitionResult:
+            self.candidate.discovery_status = ContactDiscoveryCandidateStatus.REVIEWED
+            return ContactDiscoveryCandidateStatusTransitionResult(
+                candidate=self.candidate,
+                previous_status=ContactDiscoveryCandidateStatus.REVIEWED,
+                current_status=ContactDiscoveryCandidateStatus.REVIEWED,
+                changed=False,
+            )
+
+    result = ContactDiscoveryCandidateReviewService(
+        AuthoritativeRepository(ContactDiscoveryCandidateStatus.DISCOVERED)
+    ).mark_reviewed(3, 7)
+    assert result.previous_status == ContactDiscoveryCandidateStatus.REVIEWED
+    assert result.current_status == ContactDiscoveryCandidateStatus.REVIEWED
+    assert result.changed is False
+
+
+def test_service_maps_typed_repository_mutation_errors() -> None:
+    class NotFoundRepository(FakeRepository):
+        def set_candidate_status(
+            self,
+            company_id: int,
+            candidate_id: int,
+            candidate_status: ContactDiscoveryCandidateStatus,
+        ) -> ContactDiscoveryCandidateStatusTransitionResult:
+            raise ContactDiscoveryCandidateRepositoryNotFoundError("Candidate was not found.")
+
+    class TransitionRepository(FakeRepository):
+        def set_candidate_status(
+            self,
+            company_id: int,
+            candidate_id: int,
+            candidate_status: ContactDiscoveryCandidateStatus,
+        ) -> ContactDiscoveryCandidateStatusTransitionResult:
+            raise ContactDiscoveryCandidateRepositoryTransitionError(
+                "Candidate status transition is not allowed."
+            )
+
+    with pytest.raises(
+        ContactDiscoveryCandidateReviewNotFoundError,
+        match=r"^Candidate was not found\.$",
+    ):
+        ContactDiscoveryCandidateReviewService(
+            NotFoundRepository(ContactDiscoveryCandidateStatus.DISCOVERED)
+        ).mark_reviewed(3, 7)
+    with pytest.raises(
+        ContactDiscoveryCandidateTransitionError,
+        match=r"^Candidate status transition is not allowed\.$",
+    ):
+        ContactDiscoveryCandidateReviewService(
+            TransitionRepository(ContactDiscoveryCandidateStatus.DISCOVERED)
+        ).mark_reviewed(3, 7)
+
+
+def test_candidate_create_schema_reserves_lifecycle_fields() -> None:
+    created = ContactDiscoveryCandidateCreate(
+        company_id=1,
+        name="Person",
+        source_type=ContactDiscoverySourceType.TEAM_PAGE,
+    )
+    assert "discovery_status" not in ContactDiscoveryCandidateCreate.model_fields
+    assert "discovery_status" not in created.model_dump()
+
+    for status in ContactDiscoveryCandidateStatus:
+        with pytest.raises(ValidationError):
+            ContactDiscoveryCandidateCreate(
+                company_id=1,
+                name="Person",
+                source_type=ContactDiscoverySourceType.TEAM_PAGE,
+                discovery_status=status,
+            )
+    with pytest.raises(ValidationError):
+        ContactDiscoveryCandidateCreate(
+            company_id=1,
+            name="Person",
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+            promoted_contact_id=9,
+        )
+
+
+def test_candidate_update_schema_reserves_lifecycle_fields() -> None:
+    updated = ContactDiscoveryCandidateUpdate(name="Updated", title="Director")
+    assert updated.name == "Updated"
+    assert updated.title == "Director"
+    assert "discovery_status" not in ContactDiscoveryCandidateUpdate.model_fields
+
+    for status in ContactDiscoveryCandidateStatus:
+        with pytest.raises(ValidationError):
+            ContactDiscoveryCandidateUpdate(discovery_status=status)
+    with pytest.raises(ValidationError):
+        ContactDiscoveryCandidateUpdate(promoted_contact_id=9)

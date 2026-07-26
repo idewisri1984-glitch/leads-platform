@@ -1,7 +1,8 @@
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import Table, select
 from sqlalchemy.orm import Session
 
 from app.modules.company.models import Company
@@ -24,6 +25,39 @@ from app.modules.contact_discovery.schemas import (
 )
 
 _UNSET = object()
+
+
+class ContactDiscoveryCandidateRepositoryNotFoundError(ValueError):
+    pass
+
+
+class ContactDiscoveryCandidateRepositoryTransitionError(ValueError):
+    pass
+
+
+def _normalize_persisted_candidate_status(
+    value: object,
+) -> ContactDiscoveryCandidateStatus:
+    if isinstance(value, ContactDiscoveryCandidateStatus):
+        return value
+    if type(value) is not str:
+        raise ContactDiscoveryCandidateRepositoryTransitionError(
+            "Candidate status transition is not allowed."
+        )
+    try:
+        return ContactDiscoveryCandidateStatus(value)
+    except ValueError:
+        raise ContactDiscoveryCandidateRepositoryTransitionError(
+            "Candidate status transition is not allowed."
+        ) from None
+
+
+@dataclass(frozen=True)
+class ContactDiscoveryCandidateStatusTransitionResult:
+    candidate: ContactDiscoveryCandidate
+    previous_status: ContactDiscoveryCandidateStatus
+    current_status: ContactDiscoveryCandidateStatus
+    changed: bool
 
 
 class ContactDiscoveryRepository:
@@ -98,6 +132,27 @@ class ContactDiscoveryRepository:
             )
         )
 
+    def get_candidate_for_promotion(
+        self, company_id: int, candidate_id: int
+    ) -> ContactDiscoveryCandidate | None:
+        return self._get_candidate_for_status_mutation(company_id, candidate_id)
+
+    def _get_candidate_for_status_mutation(
+        self, company_id: int, candidate_id: int
+    ) -> ContactDiscoveryCandidate | None:
+        self._validate_positive_id(company_id, "Company")
+        self._validate_positive_id(candidate_id, "Candidate")
+        statement = (
+            select(ContactDiscoveryCandidate)
+            .where(
+                ContactDiscoveryCandidate.company_id == company_id,
+                ContactDiscoveryCandidate.id == candidate_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        return self.session.scalar(statement)
+
     def list_candidates_for_company(
         self,
         company_id: int,
@@ -127,7 +182,7 @@ class ContactDiscoveryRepository:
         company_id: int,
         candidate_id: int,
         candidate_status: ContactDiscoveryCandidateStatus,
-    ) -> ContactDiscoveryCandidate:
+    ) -> ContactDiscoveryCandidateStatusTransitionResult:
         self._validate_positive_id(company_id, "Company")
         self._validate_positive_id(candidate_id, "Candidate")
         if not isinstance(
@@ -137,10 +192,73 @@ class ContactDiscoveryRepository:
             ContactDiscoveryCandidateStatus.REJECTED,
         ):
             raise ValueError("Candidate target status is not allowed.")
-        candidate = self.get_candidate_for_company(company_id, candidate_id)
+        candidate = self._get_candidate_for_status_mutation(company_id, candidate_id)
+        if candidate is None:
+            raise ContactDiscoveryCandidateRepositoryNotFoundError("Candidate was not found.")
+        previous_status = _normalize_persisted_candidate_status(candidate.discovery_status)
+        allowed = {
+            ContactDiscoveryCandidateStatus.DISCOVERED: (
+                ContactDiscoveryCandidateStatus.REVIEWED,
+                ContactDiscoveryCandidateStatus.REJECTED,
+            ),
+            ContactDiscoveryCandidateStatus.REVIEWED: (
+                ContactDiscoveryCandidateStatus.REVIEWED,
+                ContactDiscoveryCandidateStatus.REJECTED,
+            ),
+            ContactDiscoveryCandidateStatus.REJECTED: (ContactDiscoveryCandidateStatus.REJECTED,),
+            ContactDiscoveryCandidateStatus.PROMOTED: (),
+        }
+        if candidate.promoted_contact_id is not None or candidate_status not in allowed.get(
+            previous_status, ()
+        ):
+            raise ContactDiscoveryCandidateRepositoryTransitionError(
+                "Candidate status transition is not allowed."
+            )
+        changed = previous_status != candidate_status
+        if changed:
+            candidate.discovery_status = candidate_status
+            self.session.add(candidate)
+            self.session.flush()
+        return ContactDiscoveryCandidateStatusTransitionResult(
+            candidate=candidate,
+            previous_status=previous_status,
+            current_status=candidate_status,
+            changed=changed,
+        )
+
+    def link_promoted_contact(
+        self,
+        company_id: int,
+        candidate_id: int,
+        contact_id: int,
+    ) -> ContactDiscoveryCandidate:
+        self._validate_positive_id(company_id, "Company")
+        self._validate_positive_id(candidate_id, "Candidate")
+        self._validate_positive_id(contact_id, "Contact")
+        candidate = self.get_candidate_for_promotion(company_id, candidate_id)
         if candidate is None:
             raise ValueError("Candidate was not found.")
-        candidate.discovery_status = candidate_status
+        if (
+            candidate.discovery_status != ContactDiscoveryCandidateStatus.REVIEWED
+            or candidate.promoted_contact_id is not None
+        ):
+            raise ValueError("Candidate is not eligible for promotion.")
+        candidate_table = cast(Table, ContactDiscoveryCandidate.__table__)
+        contacts = candidate_table.metadata.tables.get("contacts")
+        if contacts is None:
+            raise ValueError("Contact is not available for candidate promotion.")
+        available_contact_id = self.session.scalar(
+            select(contacts.c.id)
+            .where(
+                contacts.c.id == contact_id,
+                contacts.c.company_id == company_id,
+            )
+            .with_for_update()
+        )
+        if available_contact_id is None:
+            raise ValueError("Contact is not available for candidate promotion.")
+        candidate.discovery_status = ContactDiscoveryCandidateStatus.PROMOTED
+        candidate.promoted_contact_id = available_contact_id
         self.session.add(candidate)
         self.session.flush()
         return candidate
@@ -184,6 +302,7 @@ class ContactDiscoveryRepository:
         if existing is None:
             created = ContactDiscoveryCandidate(
                 company_id=company_id,
+                promoted_contact_id=None,
                 name=clean_discovered_text(candidate.name),
                 title=clean_discovered_text(candidate.title),
                 email=clean_discovered_text(candidate.email),
