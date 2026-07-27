@@ -30,6 +30,13 @@ from app.modules.contact_discovery.website_provider import (
 
 __all__ = [
     "CompanyContactDiscoveryState",
+    "ContactDiscoveryCandidateNotEligibleError",
+    "ContactDiscoveryCandidatePromotionConsistencyError",
+    "ContactDiscoveryCandidatePromotionError",
+    "ContactDiscoveryCandidatePromotionInvalidDataError",
+    "ContactDiscoveryCandidatePromotionNotFoundError",
+    "ContactDiscoveryCandidatePromotionResult",
+    "ContactDiscoveryCandidatePromotionService",
     "ContactDiscoveryCandidateReviewAction",
     "ContactDiscoveryCandidateReviewNotFoundError",
     "ContactDiscoveryCandidateReviewResult",
@@ -54,6 +61,17 @@ __all__ = [
     "WebsiteContactDiscoveryProviderResult",
     "parse_contact_discovery_candidates_from_html",
 ]
+from app.modules.contact_discovery.candidate_promotion import (
+    ContactDiscoveryCandidateNotEligibleError,
+    ContactDiscoveryCandidatePromotionConsistencyError,
+    ContactDiscoveryCandidatePromotionError,
+    ContactDiscoveryCandidatePromotionInvalidDataError,
+    ContactDiscoveryCandidatePromotionNotFoundError,
+    ContactDiscoveryCandidatePromotionService,
+)
+from app.modules.contact_discovery.candidate_promotion_schemas import (
+    ContactDiscoveryCandidatePromotionResult,
+)
 from app.modules.contact_discovery.candidate_review import (
     ContactDiscoveryCandidateReviewNotFoundError,
     ContactDiscoveryCandidateReviewService,
