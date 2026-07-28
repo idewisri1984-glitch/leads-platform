@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 
 from app.modules.lead.models import Lead
 
+_INVALID_CREATION_DATA = "Lead creation data is invalid."
+
 
 class LeadRepository:
     """
@@ -33,6 +35,39 @@ class LeadRepository:
         self.session.commit()
         self.session.refresh(lead)
 
+        return lead
+
+    def create_for_contact(
+        self,
+        *,
+        company_id: int,
+        contact_id: int,
+        status: str = "NEW",
+        source: str | None = None,
+    ) -> Lead:
+        if (
+            type(company_id) is not int
+            or company_id <= 0
+            or type(contact_id) is not int
+            or contact_id <= 0
+            or type(status) is not str
+            or not status.strip()
+            or len(status) > 50
+            or (
+                source is not None
+                and (type(source) is not str or not source.strip() or len(source) > 100)
+            )
+        ):
+            raise ValueError(_INVALID_CREATION_DATA)
+
+        lead = Lead(
+            company_id=company_id,
+            contact_id=contact_id,
+            status=status,
+            source=source,
+        )
+        self.session.add(lead)
+        self.session.flush()
         return lead
 
     def get(self, lead_id: int) -> Lead | None:
