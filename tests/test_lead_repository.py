@@ -1,8 +1,53 @@
+from typing import cast
+
+import pytest
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+
 from app.core.database.session import SessionLocal
 from app.modules.company.repository import CompanyRepository
 from app.modules.contact.repository import ContactRepository
+from app.modules.lead.models import Lead
 from app.modules.lead.repository import LeadRepository
 from app.modules.project.repository import ProjectRepository
+
+
+class StrictLeadCreationSession:
+    def __init__(self, flush_error: BaseException | None = None) -> None:
+        self.operations: list[str] = []
+        self.added: list[object] = []
+        self.flush_error = flush_error
+
+    def add(self, instance: object) -> None:
+        self.operations.append("add")
+        self.added.append(instance)
+
+    def flush(self) -> None:
+        self.operations.append("flush")
+        if self.flush_error is not None:
+            raise self.flush_error
+        added_lead = cast(Lead, self.added[-1])
+        added_lead.id = 731
+
+    def commit(self) -> None:
+        self.operations.append("commit")
+
+    def rollback(self) -> None:
+        self.operations.append("rollback")
+
+    def refresh(self, instance: object) -> None:
+        self.operations.append("refresh")
+
+    def close(self) -> None:
+        self.operations.append("close")
+
+
+def strict_creation_repository(
+    *,
+    flush_error: BaseException | None = None,
+) -> tuple[LeadRepository, StrictLeadCreationSession]:
+    session = StrictLeadCreationSession(flush_error)
+    return LeadRepository(cast(Session, session)), session
 
 
 def create_company_and_contact() -> tuple[int, int]:
@@ -171,3 +216,142 @@ def test_contact_id_becomes_none_when_contact_is_deleted() -> None:
 
         assert stored_lead is not None
         assert stored_lead.contact_id is None
+
+
+def test_create_for_contact_maps_fields_flushes_and_returns_same_instance() -> None:
+    repository, session = strict_creation_repository()
+
+    lead = repository.create_for_contact(
+        company_id=11,
+        contact_id=22,
+        status=" Qualified ",
+        source=" Internal  Referral ",
+    )
+
+    assert lead is session.added[0]
+    assert lead.id == 731
+    assert lead.company_id == 11
+    assert lead.contact_id == 22
+    assert lead.status == " Qualified "
+    assert lead.source == " Internal  Referral "
+    assert lead.notes is None
+    assert session.operations == ["add", "flush"]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("company_id", True),
+        ("company_id", 0),
+        ("company_id", -1),
+        ("company_id", "1"),
+        ("company_id", 1.0),
+        ("company_id", None),
+        ("company_id", object()),
+        ("company_id", type("IntSubclass", (int,), {})(1)),
+        ("contact_id", False),
+        ("contact_id", 0),
+        ("contact_id", -1),
+        ("contact_id", "1"),
+        ("contact_id", 1.0),
+        ("contact_id", None),
+        ("contact_id", object()),
+        ("contact_id", type("OtherIntSubclass", (int,), {})(1)),
+    ],
+)
+def test_create_for_contact_rejects_invalid_identifiers_before_session_use(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    repository, session = strict_creation_repository()
+    arguments: dict[str, object] = {"company_id": 1, "contact_id": 2}
+    arguments[field_name] = invalid_value
+
+    with pytest.raises(ValueError, match=r"^Lead creation data is invalid\.$"):
+        repository.create_for_contact(**arguments)  # type: ignore[arg-type]
+
+    assert session.operations == []
+    assert session.added == []
+
+
+@pytest.mark.parametrize("invalid_status", [None, True, 1, "", "   ", "x" * 51])
+def test_create_for_contact_rejects_invalid_status(
+    invalid_status: object,
+) -> None:
+    repository, session = strict_creation_repository()
+
+    with pytest.raises(ValueError, match=r"^Lead creation data is invalid\.$"):
+        repository.create_for_contact(
+            company_id=1,
+            contact_id=2,
+            status=invalid_status,  # type: ignore[arg-type]
+        )
+
+    assert session.operations == []
+
+
+def test_create_for_contact_accepts_status_boundary_without_normalizing() -> None:
+    repository, session = strict_creation_repository()
+    status = "MiXeD " + ("x" * 44)
+
+    lead = repository.create_for_contact(
+        company_id=1,
+        contact_id=2,
+        status=status,
+    )
+
+    assert len(status) == 50
+    assert lead.status == status
+    assert session.operations == ["add", "flush"]
+
+
+@pytest.mark.parametrize("invalid_source", [True, 1, "", "   ", "x" * 101])
+def test_create_for_contact_rejects_invalid_source(
+    invalid_source: object,
+) -> None:
+    repository, session = strict_creation_repository()
+
+    with pytest.raises(ValueError, match=r"^Lead creation data is invalid\.$"):
+        repository.create_for_contact(
+            company_id=1,
+            contact_id=2,
+            source=invalid_source,  # type: ignore[arg-type]
+        )
+
+    assert session.operations == []
+
+
+def test_create_for_contact_accepts_source_boundary_without_normalizing() -> None:
+    repository, session = strict_creation_repository()
+    source = " Mixed  Source " + ("x" * 85)
+
+    lead = repository.create_for_contact(
+        company_id=1,
+        contact_id=2,
+        source=source,
+    )
+
+    assert len(source) == 100
+    assert lead.source == source
+    assert session.operations == ["add", "flush"]
+
+
+@pytest.mark.parametrize(
+    "flush_error",
+    [
+        RuntimeError("ordinary flush failure"),
+        SQLAlchemyError("sqlalchemy flush failure"),
+        IntegrityError("insert", {}, RuntimeError("integrity failure")),
+    ],
+)
+def test_create_for_contact_propagates_flush_errors_unchanged(
+    flush_error: BaseException,
+) -> None:
+    repository, session = strict_creation_repository(flush_error=flush_error)
+
+    with pytest.raises(type(flush_error)) as captured:
+        repository.create_for_contact(company_id=1, contact_id=2)
+
+    assert captured.value is flush_error
+    assert session.operations == ["add", "flush"]
+    assert "commit" not in session.operations
