@@ -123,8 +123,10 @@ def test_candidate_commands_are_registered_without_changing_run() -> None:
     assert "candidate" in result.output
     assert "run" in result.output
     candidate_help = runner.invoke(app, ["contact-discovery", "candidate", "--help"])
-    assert all(command in candidate_help.output for command in ("list", "show", "review", "reject"))
-    assert "promote" not in candidate_help.output
+    assert all(
+        command in candidate_help.output
+        for command in ("list", "show", "review", "reject", "promote")
+    )
 
 
 @pytest.mark.parametrize(
