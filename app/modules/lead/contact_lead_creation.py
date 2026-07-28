@@ -73,13 +73,19 @@ class ContactLeadCreationService:
         self._validate_id(company_id)
         self._validate_id(contact_id)
 
+        contact: ContactLeadCreationContactRecord | None = None
+        contact_error: ContactLeadCreationConsistencyError | None = None
         try:
             contact = self.contact_repository.get_for_company(company_id, contact_id)
         except (TypeError, ValueError):
-            raise ContactLeadCreationConsistencyError(_INCONSISTENT_STATE) from None
+            contact_error = ContactLeadCreationConsistencyError(_INCONSISTENT_STATE)
+        if contact_error is not None:
+            raise contact_error from None
         if contact is None:
             raise ContactLeadCreationNotFoundError(_NOT_FOUND)
         self._validate_contact(contact, company_id, contact_id)
+        lead: ContactLeadCreationLeadRecord | None = None
+        lead_error: ContactLeadCreationConsistencyError | None = None
         try:
             lead = self.lead_repository.create_for_contact(
                 company_id=company_id,
@@ -88,7 +94,11 @@ class ContactLeadCreationService:
                 source=None,
             )
         except (TypeError, ValueError):
-            raise ContactLeadCreationConsistencyError(_INCONSISTENT_STATE) from None
+            lead_error = ContactLeadCreationConsistencyError(_INCONSISTENT_STATE)
+        if lead_error is not None:
+            raise lead_error from None
+        if lead is None:
+            raise ContactLeadCreationConsistencyError(_INCONSISTENT_STATE)
         self._validate_lead(lead, company_id, contact_id)
 
         return ContactLeadCreationResult(

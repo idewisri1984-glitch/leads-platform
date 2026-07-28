@@ -305,7 +305,12 @@ def test_malformed_or_mismatched_contact_is_inconsistent(
 
 
 @pytest.mark.parametrize(
-    "repository_error", [TypeError("private type"), ValueError("private value")]
+    "repository_error",
+    [
+        TypeError("repository secret: sqlite:///private.db"),
+        ValueError("contact_email@example.test company_id=731"),
+    ],
+    ids=["type-error", "value-error"],
 )
 def test_controlled_contact_repository_errors_are_sanitized(
     repository_error: Exception,
@@ -315,10 +320,14 @@ def test_controlled_contact_repository_errors_are_sanitized(
     with pytest.raises(ContactLeadCreationConsistencyError) as captured:
         service.create(1, 2)
 
-    rendered = "".join(traceback.format_exception(captured.value))
+    rendered = "".join(traceback.format_exception(captured.type, captured.value, captured.tb))
+    raw_message = str(repository_error)
     assert str(captured.value) == "Lead creation state is inconsistent."
     assert captured.value.__cause__ is None
-    assert str(repository_error) not in rendered
+    assert captured.value.__context__ is None
+    assert raw_message not in str(captured.value)
+    assert raw_message not in repr(captured.value)
+    assert raw_message not in rendered
     assert lead_repository.calls == []
 
 
@@ -343,7 +352,12 @@ def test_contact_infrastructure_errors_propagate_unchanged(
 
 
 @pytest.mark.parametrize(
-    "repository_error", [TypeError("private type"), ValueError("private value")]
+    "repository_error",
+    [
+        TypeError("repository secret: sqlite:///private.db"),
+        ValueError("contact_email@example.test company_id=731"),
+    ],
+    ids=["type-error", "value-error"],
 )
 def test_controlled_lead_repository_errors_are_sanitized(
     repository_error: Exception,
@@ -353,10 +367,14 @@ def test_controlled_lead_repository_errors_are_sanitized(
     with pytest.raises(ContactLeadCreationConsistencyError) as captured:
         service.create(1, 2)
 
-    rendered = "".join(traceback.format_exception(captured.value))
+    rendered = "".join(traceback.format_exception(captured.type, captured.value, captured.tb))
+    raw_message = str(repository_error)
     assert str(captured.value) == "Lead creation state is inconsistent."
     assert captured.value.__cause__ is None
-    assert str(repository_error) not in rendered
+    assert captured.value.__context__ is None
+    assert raw_message not in str(captured.value)
+    assert raw_message not in repr(captured.value)
+    assert raw_message not in rendered
 
 
 @pytest.mark.parametrize(
