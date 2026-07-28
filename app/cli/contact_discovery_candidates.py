@@ -7,7 +7,14 @@ from sqlalchemy.orm import Session
 
 from app.core.database.session import SessionLocal
 from app.modules.company.repository import CompanyRepository
+from app.modules.contact.repository import ContactRepository
 from app.modules.contact_discovery import (
+    ContactDiscoveryCandidateNotEligibleError,
+    ContactDiscoveryCandidatePromotionConsistencyError,
+    ContactDiscoveryCandidatePromotionInvalidDataError,
+    ContactDiscoveryCandidatePromotionNotFoundError,
+    ContactDiscoveryCandidatePromotionResult,
+    ContactDiscoveryCandidatePromotionService,
     ContactDiscoveryCandidateRead,
     ContactDiscoveryCandidateReviewNotFoundError,
     ContactDiscoveryCandidateReviewResult,
@@ -22,7 +29,12 @@ app = typer.Typer(help="Manual contact candidate review and rejection.")
 SessionFactory = Callable[[], Session]
 CompanyRepositoryFactory = Callable[[Session], CompanyRepository]
 RepositoryFactory = Callable[[Session], ContactDiscoveryRepository]
+ContactRepositoryFactory = Callable[[Session], ContactRepository]
 ServiceFactory = Callable[[ContactDiscoveryRepository], ContactDiscoveryCandidateReviewService]
+PromotionServiceFactory = Callable[
+    [ContactDiscoveryRepository, ContactRepository],
+    ContactDiscoveryCandidatePromotionService,
+]
 
 _MAX_LIST_LIMIT = 100
 _MAX_DISPLAY_LENGTH = 160
@@ -38,6 +50,11 @@ _CONFIRMATION_REQUIRED = "Candidate status change requires --yes."
 _LIST_FAILED = "Candidate list failed."
 _SHOW_FAILED = "Candidate show failed."
 _UPDATE_FAILED = "Candidate status update failed."
+_PROMOTION_CONFIRMATION_REQUIRED = "Candidate promotion requires --yes."
+_PROMOTION_INVALID_DATA = "Candidate promotion data is invalid."
+_PROMOTION_FAILED = "Candidate promotion failed."
+_PROMOTION_NOT_ELIGIBLE = "Candidate is not eligible for promotion."
+_PROMOTION_INCONSISTENT = "Candidate promotion state is inconsistent."
 
 
 @dataclass(frozen=True)
@@ -49,6 +66,13 @@ class CandidateCommandOutcome:
         | list[ContactDiscoveryCandidateRead]
         | None
     ) = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidatePromotionCommandOutcome:
+    exit_code: int
+    result: ContactDiscoveryCandidatePromotionResult | None = None
     error_message: str | None = None
 
 
@@ -103,6 +127,29 @@ def reject_candidate(
             transition="reject",
         )
     )
+
+
+@app.command("promote")
+def promote_candidate(
+    company_id: int = typer.Option(help="Company ID.", min=1),
+    candidate_id: int = typer.Option(help="Candidate ID.", min=1),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm promotion into a canonical Contact.",
+    ),
+) -> None:
+    """Promote one REVIEWED candidate into a canonical Contact."""
+    outcome = execute_promote_candidate(
+        company_id=company_id,
+        candidate_id=candidate_id,
+        yes=yes,
+    )
+    if outcome.error_message is not None:
+        typer.secho(outcome.error_message, fg=typer.colors.RED)
+    elif outcome.result is not None:
+        _print_promotion_result(outcome.result)
+    raise typer.Exit(outcome.exit_code)
 
 
 def execute_list_candidates(
@@ -209,6 +256,114 @@ def execute_status_change(
     return outcome
 
 
+def execute_promote_candidate(
+    *,
+    company_id: int,
+    candidate_id: int,
+    yes: bool,
+    session_factory: SessionFactory | None = None,
+    staging_repository_factory: RepositoryFactory | None = None,
+    contact_repository_factory: ContactRepositoryFactory | None = None,
+    promotion_service_factory: PromotionServiceFactory | None = None,
+) -> CandidatePromotionCommandOutcome:
+    if yes is not True:
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message=_PROMOTION_CONFIRMATION_REQUIRED,
+        )
+    if not _valid_id(company_id) or not _valid_id(candidate_id):
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message=_PROMOTION_INVALID_DATA,
+        )
+
+    try:
+        session = (session_factory or SessionLocal)()
+    except Exception:
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message=_PROMOTION_FAILED,
+        )
+
+    committed = False
+    rollback_attempted = False
+    outcome: CandidatePromotionCommandOutcome
+    try:
+        try:
+            staging_repository = (staging_repository_factory or ContactDiscoveryRepository)(session)
+            contact_repository = (contact_repository_factory or ContactRepository)(session)
+            service = (promotion_service_factory or ContactDiscoveryCandidatePromotionService)(
+                staging_repository, contact_repository
+            )
+            result = service.promote(company_id, candidate_id)
+            session.commit()
+            committed = True
+            outcome = CandidatePromotionCommandOutcome(exit_code=0, result=result)
+        except (
+            ContactDiscoveryCandidatePromotionNotFoundError,
+            ContactDiscoveryCandidateNotEligibleError,
+            ContactDiscoveryCandidatePromotionInvalidDataError,
+            ContactDiscoveryCandidatePromotionConsistencyError,
+        ) as error:
+            rollback_attempted = True
+            rollback_succeeded = _rollback_promotion_session(session)
+            if not rollback_succeeded:
+                outcome = CandidatePromotionCommandOutcome(
+                    exit_code=1,
+                    error_message=_PROMOTION_FAILED,
+                )
+            else:
+                outcome = CandidatePromotionCommandOutcome(
+                    exit_code=1,
+                    error_message=_promotion_error_message(error),
+                )
+        except Exception:
+            if not committed and not rollback_attempted:
+                rollback_attempted = True
+                _rollback_promotion_session(session)
+            outcome = CandidatePromotionCommandOutcome(
+                exit_code=1,
+                error_message=_PROMOTION_FAILED,
+            )
+    finally:
+        try:
+            session.close()
+        except Exception:
+            close_succeeded = False
+        else:
+            close_succeeded = True
+
+    if not close_succeeded:
+        return CandidatePromotionCommandOutcome(
+            exit_code=1,
+            error_message=_PROMOTION_FAILED,
+        )
+    return outcome
+
+
+def _rollback_promotion_session(session: Session) -> bool:
+    try:
+        session.rollback()
+    except Exception:
+        return False
+    return True
+
+
+def _promotion_error_message(
+    error: ContactDiscoveryCandidatePromotionNotFoundError
+    | ContactDiscoveryCandidateNotEligibleError
+    | ContactDiscoveryCandidatePromotionInvalidDataError
+    | ContactDiscoveryCandidatePromotionConsistencyError,
+) -> str:
+    if isinstance(error, ContactDiscoveryCandidatePromotionNotFoundError):
+        return _CANDIDATE_NOT_FOUND
+    if isinstance(error, ContactDiscoveryCandidateNotEligibleError):
+        return _PROMOTION_NOT_ELIGIBLE
+    if isinstance(error, ContactDiscoveryCandidatePromotionInvalidDataError):
+        return _PROMOTION_INVALID_DATA
+    return _PROMOTION_INCONSISTENT
+
+
 def _execute_read(
     *,
     company_id: int,
@@ -258,7 +413,7 @@ def _validate_list(company_id: int, status: str | None, limit: int, offset: int)
     return None
 
 
-def _valid_id(value: int) -> bool:
+def _valid_id(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value > 0
 
 
@@ -315,6 +470,16 @@ def _print_review_result(result: ContactDiscoveryCandidateReviewResult) -> None:
     typer.echo(f"Company ID: {result.candidate.company_id}")
     typer.echo(f"Previous Status: {result.previous_status.value}")
     typer.echo(f"Current Status: {result.current_status.value}")
+    typer.echo(f"Changed: {'yes' if result.changed else 'no'}")
+
+
+def _print_promotion_result(result: ContactDiscoveryCandidatePromotionResult) -> None:
+    typer.echo(f"Candidate ID: {result.candidate_id}")
+    typer.echo(f"Company ID: {result.company_id}")
+    typer.echo(f"Contact ID: {result.contact_id}")
+    typer.echo(f"Previous Status: {result.previous_status.value}")
+    typer.echo(f"Current Status: {result.current_status.value}")
+    typer.echo(f"Contact Created: {'yes' if result.created_contact else 'no'}")
     typer.echo(f"Changed: {'yes' if result.changed else 'no'}")
 
 
