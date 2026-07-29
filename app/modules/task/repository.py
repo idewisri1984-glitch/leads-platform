@@ -39,6 +39,35 @@ class TaskRepository:
 
         return task
 
+    def create_for_lead(
+        self,
+        *,
+        lead_id: int,
+        title: str,
+        description: str | None = None,
+    ) -> Task:
+        if (
+            type(lead_id) is not int
+            or lead_id <= 0
+            or type(title) is not str
+            or not title.strip()
+            or len(title) > 255
+            or (description is not None and type(description) is not str)
+        ):
+            raise ValueError("Task creation data is invalid.")
+
+        task = Task(
+            lead_id=lead_id,
+            title=title,
+            description=description,
+            status="TODO",
+            due_at=None,
+        )
+        self.session.add(task)
+        self.session.flush()
+
+        return task
+
     def get(self, task_id: int) -> Task | None:
         statement = select(Task).where(Task.id == task_id)
         return self.session.scalar(statement)
