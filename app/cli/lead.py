@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 
 import typer
@@ -75,49 +76,48 @@ def execute_create_lead_from_contact(
     outcome: ContactLeadCreationCommandOutcome
     try:
         try:
-            contact_repository = (contact_repository_factory or ContactRepository)(session)
-            lead_repository = (lead_repository_factory or LeadRepository)(session)
-            service = (service_factory or ContactLeadCreationService)(
-                contact_repository,
-                lead_repository,
-            )
-            result = service.create(company_id, contact_id)
-            session.commit()
-            committed = True
-            outcome = ContactLeadCreationCommandOutcome(exit_code=0, result=result)
-        except (
-            ContactLeadCreationInvalidDataError,
-            ContactLeadCreationNotFoundError,
-            ContactLeadCreationConsistencyError,
-        ) as error:
-            rollback_attempted = True
-            if _rollback_contact_lead_session(session):
-                outcome = ContactLeadCreationCommandOutcome(
-                    exit_code=1,
-                    error_message=_contact_lead_creation_error_message(error),
+            try:
+                contact_repository = (contact_repository_factory or ContactRepository)(session)
+                lead_repository = (lead_repository_factory or LeadRepository)(session)
+                service = (service_factory or ContactLeadCreationService)(
+                    contact_repository,
+                    lead_repository,
                 )
-            else:
+                result = service.create(company_id, contact_id)
+                session.commit()
+                committed = True
+                outcome = ContactLeadCreationCommandOutcome(exit_code=0, result=result)
+            except (
+                ContactLeadCreationInvalidDataError,
+                ContactLeadCreationNotFoundError,
+                ContactLeadCreationConsistencyError,
+            ) as error:
+                rollback_attempted = True
+                if _rollback_contact_lead_session(session):
+                    outcome = ContactLeadCreationCommandOutcome(
+                        exit_code=1,
+                        error_message=_contact_lead_creation_error_message(error),
+                    )
+                else:
+                    outcome = ContactLeadCreationCommandOutcome(
+                        exit_code=1,
+                        error_message=_CREATION_FAILED,
+                    )
+            except Exception:
+                if not committed and not rollback_attempted:
+                    rollback_attempted = True
+                    _rollback_contact_lead_session(session)
                 outcome = ContactLeadCreationCommandOutcome(
                     exit_code=1,
                     error_message=_CREATION_FAILED,
                 )
-        except Exception:
-            if not committed and not rollback_attempted:
-                rollback_attempted = True
-                _rollback_contact_lead_session(session)
-            outcome = ContactLeadCreationCommandOutcome(
-                exit_code=1,
-                error_message=_CREATION_FAILED,
-            )
-    finally:
-        try:
-            session.close()
-        except Exception:
-            close_succeeded = False
+        except BaseException:
+            with suppress(BaseException):
+                session.close()
+            raise
         else:
-            close_succeeded = True
-
-    if not close_succeeded:
+            session.close()
+    except Exception:
         return ContactLeadCreationCommandOutcome(
             exit_code=1,
             error_message=_CREATION_FAILED,

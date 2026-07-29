@@ -372,6 +372,103 @@ def test_keyboard_interrupt_propagates_and_closes_when_session_exists(operation:
     assert session.rollback_calls <= 1
 
 
+def test_service_primary_baseexception_survives_close_baseexception() -> None:
+    primary_error = KeyboardInterrupt("service interrupted")
+    secondary_error = SystemExit(22)
+    session = StrictSession(close_error=secondary_error)
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        execute_with(StrictService(error=primary_error), session=session)
+
+    assert captured.value is primary_error
+    assert captured.value.args == ("service interrupted",)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert (session.commit_calls, session.rollback_calls, session.close_calls) == (0, 0, 1)
+    assert session.operations == [
+        "contact_repository",
+        "lead_repository",
+        "service",
+        "service.create",
+        "close",
+    ]
+
+
+def test_rollback_primary_baseexception_survives_close_baseexception() -> None:
+    trigger_error = RuntimeError("trigger rollback")
+    primary_error = KeyboardInterrupt("rollback interrupted")
+    secondary_error = SystemExit(23)
+    session = StrictSession(
+        rollback_error=primary_error,
+        close_error=secondary_error,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        execute_with(StrictService(error=trigger_error), session=session)
+
+    assert captured.value is primary_error
+    assert captured.value.args == ("rollback interrupted",)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is trigger_error
+    assert (session.commit_calls, session.rollback_calls, session.close_calls) == (0, 1, 1)
+    assert session.operations == [
+        "contact_repository",
+        "lead_repository",
+        "service",
+        "service.create",
+        "rollback",
+        "close",
+    ]
+
+
+def test_commit_primary_baseexception_survives_close_baseexception() -> None:
+    primary_error = KeyboardInterrupt("commit interrupted")
+    secondary_error = SystemExit(24)
+    session = StrictSession(
+        commit_error=primary_error,
+        close_error=secondary_error,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        execute_with(session=session)
+
+    assert captured.value is primary_error
+    assert captured.value.args == ("commit interrupted",)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert (session.commit_calls, session.rollback_calls, session.close_calls) == (1, 0, 1)
+    assert session.operations == [
+        "contact_repository",
+        "lead_repository",
+        "service",
+        "service.create",
+        "commit",
+        "close",
+    ]
+
+
+def test_close_first_baseexception_propagates_exact_object() -> None:
+    close_error = KeyboardInterrupt("close interrupted")
+    session = StrictSession(close_error=close_error)
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        execute_with(session=session)
+
+    assert captured.value is close_error
+    assert captured.value.args == ("close interrupted",)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert (session.commit_calls, session.rollback_calls, session.close_calls) == (1, 0, 1)
+    assert session.operations == [
+        "contact_repository",
+        "lead_repository",
+        "service",
+        "service.create",
+        "commit",
+        "close",
+    ]
+
+
 def test_system_exit_is_not_swallowed() -> None:
     with pytest.raises(SystemExit) as captured:
         execute_with(StrictService(error=SystemExit(29)))
