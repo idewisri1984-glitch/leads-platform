@@ -42,11 +42,52 @@ class StrictLeadCreationSession:
         self.operations.append("close")
 
 
+class StrictLeadLookupSession:
+    def __init__(self, result: Lead | None = None) -> None:
+        self.result = result
+        self.operations: list[str] = []
+        self.statements: list[object] = []
+
+    def scalar(self, statement: object) -> Lead | None:
+        self.operations.append("scalar")
+        self.statements.append(statement)
+        return self.result
+
+    def _forbidden(self, name: str) -> None:
+        self.operations.append(name)
+        raise AssertionError(f"Forbidden Session operation: {name}")
+
+    def add(self, instance: object) -> None:
+        self._forbidden("add")
+
+    def flush(self) -> None:
+        self._forbidden("flush")
+
+    def commit(self) -> None:
+        self._forbidden("commit")
+
+    def rollback(self) -> None:
+        self._forbidden("rollback")
+
+    def refresh(self, instance: object) -> None:
+        self._forbidden("refresh")
+
+    def close(self) -> None:
+        self._forbidden("close")
+
+
 def strict_creation_repository(
     *,
     flush_error: BaseException | None = None,
 ) -> tuple[LeadRepository, StrictLeadCreationSession]:
     session = StrictLeadCreationSession(flush_error)
+    return LeadRepository(cast(Session, session)), session
+
+
+def strict_lookup_repository(
+    result: Lead | None = None,
+) -> tuple[LeadRepository, StrictLeadLookupSession]:
+    session = StrictLeadLookupSession(result)
     return LeadRepository(cast(Session, session)), session
 
 
@@ -195,6 +236,82 @@ def test_delete_lead() -> None:
         repository.delete(lead)
 
         assert repository.get(lead_id) is None
+
+
+def test_get_for_company_returns_exact_matching_lead() -> None:
+    company_id, _ = create_company_and_contact()
+
+    with SessionLocal() as session:
+        repository = LeadRepository(session)
+        lead = repository.create(company_id=company_id)
+
+        assert repository.get_for_company(company_id, lead.id) is lead
+
+
+def test_get_for_company_hides_cross_company_and_missing_records() -> None:
+    company_id, _ = create_company_and_contact()
+    other_company_id = create_second_company()
+
+    with SessionLocal() as session:
+        repository = LeadRepository(session)
+        lead = repository.create(company_id=company_id)
+
+        assert repository.get_for_company(other_company_id, lead.id) is None
+        assert repository.get_for_company(company_id, 2_147_483_647) is None
+        assert repository.get_for_company(2_147_483_647, lead.id) is None
+
+
+def test_get_for_company_uses_one_scoped_scalar_query_only() -> None:
+    expected = Lead(id=7, company_id=3)
+    repository, session = strict_lookup_repository(expected)
+
+    result = repository.get_for_company(3, 7)
+
+    assert result is expected
+    assert session.operations == ["scalar"]
+    assert len(session.statements) == 1
+    sql = str(session.statements[0])
+    assert "leads.company_id" in sql
+    assert "leads.id" in sql
+
+
+@pytest.mark.parametrize(
+    ("company_id", "lead_id"),
+    [
+        (True, 1),
+        (False, 1),
+        (0, 1),
+        (-1, 1),
+        ("1", 1),
+        (1.0, 1),
+        (None, 1),
+        (object(), 1),
+        (type("CompanyIdSubclass", (int,), {})(1), 1),
+        (1, True),
+        (1, False),
+        (1, 0),
+        (1, -1),
+        (1, "1"),
+        (1, 1.0),
+        (1, None),
+        (1, object()),
+        (1, type("LeadIdSubclass", (int,), {})(1)),
+    ],
+)
+def test_get_for_company_rejects_invalid_ids_before_query(
+    company_id: object,
+    lead_id: object,
+) -> None:
+    repository, session = strict_lookup_repository()
+
+    with pytest.raises(ValueError, match=r"^Lead lookup data is invalid\.$"):
+        repository.get_for_company(
+            company_id,  # type: ignore[arg-type]
+            lead_id,  # type: ignore[arg-type]
+        )
+
+    assert session.operations == []
+    assert session.statements == []
 
 
 def test_contact_id_becomes_none_when_contact_is_deleted() -> None:

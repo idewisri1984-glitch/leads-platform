@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.modules.lead.models import Lead
 
 _INVALID_CREATION_DATA = "Lead creation data is invalid."
+_INVALID_LOOKUP_DATA = "Lead lookup data is invalid."
 
 
 class LeadRepository:
@@ -72,6 +73,25 @@ class LeadRepository:
 
     def get(self, lead_id: int) -> Lead | None:
         statement = select(Lead).where(Lead.id == lead_id)
+        return self.session.scalar(statement)
+
+    def get_for_company(
+        self,
+        company_id: int,
+        lead_id: int,
+    ) -> Lead | None:
+        if (
+            type(company_id) is not int
+            or company_id <= 0
+            or type(lead_id) is not int
+            or lead_id <= 0
+        ):
+            raise ValueError(_INVALID_LOOKUP_DATA)
+
+        statement = select(Lead).where(
+            Lead.company_id == company_id,
+            Lead.id == lead_id,
+        )
         return self.session.scalar(statement)
 
     def get_all(self) -> list[Lead]:
