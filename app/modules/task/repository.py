@@ -1,9 +1,64 @@
+from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.task.models import Task
+from app.modules.lead.models import Lead
+from app.modules.task.models import Task, TaskLifecycleStatus
+
+_INVALID_LIFECYCLE_DATA = "Task lifecycle data is invalid."
+_TASK_NOT_FOUND = "Task was not found."
+_TRANSITION_NOT_ALLOWED = "Task status transition is not allowed."
+
+_ALLOWED_TRANSITIONS: dict[
+    TaskLifecycleStatus,
+    frozenset[TaskLifecycleStatus],
+] = {
+    TaskLifecycleStatus.TODO: frozenset(
+        {
+            TaskLifecycleStatus.TODO,
+            TaskLifecycleStatus.IN_PROGRESS,
+            TaskLifecycleStatus.CANCELLED,
+        }
+    ),
+    TaskLifecycleStatus.IN_PROGRESS: frozenset(
+        {
+            TaskLifecycleStatus.IN_PROGRESS,
+            TaskLifecycleStatus.DONE,
+            TaskLifecycleStatus.CANCELLED,
+        }
+    ),
+    TaskLifecycleStatus.DONE: frozenset({TaskLifecycleStatus.DONE}),
+    TaskLifecycleStatus.CANCELLED: frozenset({TaskLifecycleStatus.CANCELLED}),
+}
+
+
+class TaskLifecycleRepositoryNotFoundError(ValueError):
+    pass
+
+
+class TaskLifecycleRepositoryTransitionError(ValueError):
+    pass
+
+
+def _normalize_persisted_task_status(value: object) -> TaskLifecycleStatus:
+    if isinstance(value, TaskLifecycleStatus):
+        return value
+    if type(value) is str:
+        try:
+            return TaskLifecycleStatus(value)
+        except ValueError:
+            pass
+    raise TaskLifecycleRepositoryTransitionError(_TRANSITION_NOT_ALLOWED)
+
+
+@dataclass(frozen=True)
+class TaskStatusTransitionResult:
+    task: Task
+    previous_status: TaskLifecycleStatus
+    current_status: TaskLifecycleStatus
+    changed: bool
 
 
 class TaskRepository:
@@ -67,6 +122,52 @@ class TaskRepository:
         self.session.flush()
 
         return task
+
+    def set_status_for_company(
+        self,
+        company_id: int,
+        task_id: int,
+        target_status: TaskLifecycleStatus,
+    ) -> TaskStatusTransitionResult:
+        if (
+            type(company_id) is not int
+            or company_id <= 0
+            or type(task_id) is not int
+            or task_id <= 0
+            or type(target_status) is not TaskLifecycleStatus
+        ):
+            raise ValueError(_INVALID_LIFECYCLE_DATA)
+
+        statement = (
+            select(Task)
+            .join(Lead, Task.lead_id == Lead.id)
+            .where(
+                Lead.company_id == company_id,
+                Task.id == task_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        task = self.session.scalar(statement)
+        if task is None:
+            raise TaskLifecycleRepositoryNotFoundError(_TASK_NOT_FOUND)
+
+        previous_status = _normalize_persisted_task_status(task.status)
+        if target_status not in _ALLOWED_TRANSITIONS[previous_status]:
+            raise TaskLifecycleRepositoryTransitionError(_TRANSITION_NOT_ALLOWED)
+
+        changed = previous_status is not target_status
+        if changed:
+            task.status = target_status.value
+            self.session.add(task)
+            self.session.flush()
+
+        return TaskStatusTransitionResult(
+            task=task,
+            previous_status=previous_status,
+            current_status=target_status,
+            changed=changed,
+        )
 
     def get(self, task_id: int) -> Task | None:
         statement = select(Task).where(Task.id == task_id)
