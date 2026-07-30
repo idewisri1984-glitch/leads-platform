@@ -6,8 +6,13 @@ from app.modules.task.lead_task_creation import (
     LeadTaskCreationService,
 )
 from app.modules.task.lead_task_creation_schemas import LeadTaskCreationResult
-from app.modules.task.models import Task
-from app.modules.task.repository import TaskRepository
+from app.modules.task.models import Task, TaskLifecycleStatus
+from app.modules.task.repository import (
+    TaskLifecycleRepositoryNotFoundError,
+    TaskLifecycleRepositoryTransitionError,
+    TaskRepository,
+    TaskStatusTransitionResult,
+)
 from app.modules.task.schemas import TaskCreate, TaskRead
 from app.modules.task.service import TaskService
 
@@ -20,7 +25,11 @@ __all__ = [
     "LeadTaskCreationService",
     "Task",
     "TaskCreate",
+    "TaskLifecycleRepositoryNotFoundError",
+    "TaskLifecycleRepositoryTransitionError",
+    "TaskLifecycleStatus",
     "TaskRead",
     "TaskRepository",
     "TaskService",
+    "TaskStatusTransitionResult",
 ]
