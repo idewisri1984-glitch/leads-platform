@@ -163,7 +163,16 @@ def execute_with(
 
 def test_command_group_and_help_contract_are_exact() -> None:
     names = {command.name for command in task_cli.app.registered_commands}
-    assert names == {"create", "create-for-lead", "list", "show", "delete"}
+    assert names == {
+        "create",
+        "create-for-lead",
+        "list",
+        "show",
+        "delete",
+        "start",
+        "complete",
+        "cancel",
+    }
     result = runner.invoke(root_app, ["task", "create-for-lead", "--help"])
     assert result.exit_code == 0
     for option in ("--company-id", "--lead-id", "--title", "--description", "--yes"):
