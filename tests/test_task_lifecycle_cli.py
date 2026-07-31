@@ -200,6 +200,7 @@ def test_task_command_set_is_exact() -> None:
         "start",
         "complete",
         "cancel",
+        "queue",
     }
 
 

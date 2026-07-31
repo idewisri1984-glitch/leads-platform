@@ -1,7 +1,8 @@
+import json
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import typer
 from sqlalchemy.orm import Session
@@ -24,6 +25,10 @@ from app.modules.task import (
     TaskLifecycleTransitionError,
     TaskRepository,
     TaskService,
+    TaskWorkQueueConsistencyError,
+    TaskWorkQueueInvalidDataError,
+    TaskWorkQueueResult,
+    TaskWorkQueueService,
 )
 
 app = typer.Typer(help="Task management commands.")
@@ -31,6 +36,7 @@ app = typer.Typer(help="Task management commands.")
 SessionFactory = Callable[[], Session]
 LeadRepositoryFactory = Callable[[Session], LeadRepository]
 TaskRepositoryFactory = Callable[[Session], TaskRepository]
+TaskWorkQueueServiceFactory = Callable[[TaskRepository], TaskWorkQueueService]
 LeadTaskCreationServiceFactory = Callable[
     [LeadRepository, TaskRepository],
     LeadTaskCreationService,
@@ -65,6 +71,149 @@ class TaskLifecycleCommandOutcome:
     exit_code: int
     result: TaskLifecycleResult | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskWorkQueueCommandOutcome:
+    exit_code: int
+    result: TaskWorkQueueResult | None = None
+    error_message: str | None = None
+
+
+_WORK_QUEUE_INVALID_DATA = "Task work queue data is invalid."
+_WORK_QUEUE_INCONSISTENT_STATE = "Task work queue state is inconsistent."
+_WORK_QUEUE_FAILED = "Task work queue failed."
+
+
+def _valid_work_queue_input(
+    company_id: object,
+    as_of: object,
+    days: object,
+) -> bool:
+    if (
+        type(company_id) is not int
+        or company_id <= 0
+        or type(as_of) is not datetime
+        or as_of.tzinfo is not None
+        or type(days) is not int
+        or not 1 <= days <= 30
+    ):
+        return False
+    try:
+        as_of + timedelta(days=days)
+    except OverflowError:
+        return False
+    return True
+
+
+def execute_task_work_queue(
+    *,
+    company_id: int,
+    as_of: datetime,
+    days: int = 7,
+    session_factory: SessionFactory | None = None,
+    task_repository_factory: TaskRepositoryFactory | None = None,
+    service_factory: TaskWorkQueueServiceFactory | None = None,
+) -> TaskWorkQueueCommandOutcome:
+    if not _valid_work_queue_input(company_id, as_of, days):
+        return TaskWorkQueueCommandOutcome(
+            exit_code=1,
+            error_message=_WORK_QUEUE_INVALID_DATA,
+        )
+
+    session: Session | None = None
+    outcome: TaskWorkQueueCommandOutcome
+    try:
+        session = (session_factory or SessionLocal)()
+        repository = (task_repository_factory or TaskRepository)(session)
+        service = (service_factory or TaskWorkQueueService)(repository)
+        result = service.get_queue(company_id, as_of, days)
+        outcome = TaskWorkQueueCommandOutcome(exit_code=0, result=result)
+    except TaskWorkQueueInvalidDataError:
+        outcome = TaskWorkQueueCommandOutcome(
+            exit_code=1,
+            error_message=_WORK_QUEUE_INVALID_DATA,
+        )
+    except TaskWorkQueueConsistencyError:
+        outcome = TaskWorkQueueCommandOutcome(
+            exit_code=1,
+            error_message=_WORK_QUEUE_INCONSISTENT_STATE,
+        )
+    except Exception:
+        outcome = TaskWorkQueueCommandOutcome(
+            exit_code=1,
+            error_message=_WORK_QUEUE_FAILED,
+        )
+    except BaseException:
+        if session is not None:
+            with suppress(BaseException):
+                session.close()
+        raise
+
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            return TaskWorkQueueCommandOutcome(
+                exit_code=1,
+                error_message=_WORK_QUEUE_FAILED,
+            )
+    return outcome
+
+
+def _parse_work_queue_as_of(value: object) -> datetime | None:
+    if type(value) is not str or not value or value != value.strip() or "T" not in value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if type(parsed) is not datetime or parsed.tzinfo is not None:
+        return None
+    return parsed
+
+
+def _print_task_work_queue(result: TaskWorkQueueResult) -> None:
+    typer.echo(f"Company ID: {result.company_id}")
+    typer.echo(f"As Of: {result.as_of.isoformat(timespec='seconds')}")
+    typer.echo(f"Upcoming Through: {result.upcoming_until.isoformat(timespec='seconds')}")
+    typer.echo(f"Overdue: {result.overdue_count}")
+    typer.echo(f"Upcoming: {result.upcoming_count}")
+    typer.echo(f"Unscheduled: {result.unscheduled_count}")
+    if not result.items:
+        typer.echo("No active tasks in work queue.")
+        return
+    typer.echo("Tasks:")
+    for item in result.items:
+        due_at = item.due_at.isoformat(timespec="seconds") if item.due_at is not None else "-"
+        title = json.dumps(item.title, ensure_ascii=False)
+        typer.echo(
+            f"{item.bucket.value} | Task ID: {item.task_id} | "
+            f"Lead ID: {item.lead_id} | Status: {item.status.value} | "
+            f"Due At: {due_at} | Title: {title}"
+        )
+
+
+@app.command("queue")
+def task_work_queue(
+    company_id: int = typer.Option(help="Company ID."),
+    as_of: str = typer.Option(help="Naive ISO datetime."),
+    days: int = typer.Option(7, help="Upcoming window in days (1-30)."),
+) -> None:
+    parsed_as_of = _parse_work_queue_as_of(as_of)
+    if parsed_as_of is None:
+        typer.echo(_WORK_QUEUE_INVALID_DATA, err=True)
+        raise typer.Exit(1)
+    outcome = execute_task_work_queue(
+        company_id=company_id,
+        as_of=parsed_as_of,
+        days=days,
+    )
+    if outcome.error_message is not None:
+        typer.echo(outcome.error_message, err=True)
+    if outcome.result is not None:
+        _print_task_work_queue(outcome.result)
+    raise typer.Exit(outcome.exit_code)
 
 
 def execute_task_lifecycle_transition(
