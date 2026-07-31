@@ -15,6 +15,13 @@ from app.modules.task import (
     LeadTaskCreationResult,
     LeadTaskCreationService,
     TaskCreate,
+    TaskLifecycleConsistencyError,
+    TaskLifecycleInvalidDataError,
+    TaskLifecycleNotFoundError,
+    TaskLifecycleResult,
+    TaskLifecycleService,
+    TaskLifecycleStatus,
+    TaskLifecycleTransitionError,
     TaskRepository,
     TaskService,
 )
@@ -28,12 +35,22 @@ LeadTaskCreationServiceFactory = Callable[
     [LeadRepository, TaskRepository],
     LeadTaskCreationService,
 ]
+TaskLifecycleServiceFactory = Callable[
+    [TaskRepository],
+    TaskLifecycleService,
+]
 
 _CONFIRMATION_REQUIRED = "Task creation requires --yes."
 _INVALID_DATA = "Task creation data is invalid."
 _NOT_FOUND = "Lead was not found."
 _INCONSISTENT_STATE = "Task creation state is inconsistent."
 _CREATION_FAILED = "Task creation failed."
+_LIFECYCLE_CONFIRMATION_REQUIRED = "Task lifecycle transition requires --yes."
+_LIFECYCLE_INVALID_DATA = "Task lifecycle data is invalid."
+_LIFECYCLE_NOT_FOUND = "Task was not found."
+_LIFECYCLE_TRANSITION_NOT_ALLOWED = "Task status transition is not allowed."
+_LIFECYCLE_INCONSISTENT_STATE = "Task lifecycle state is inconsistent."
+_LIFECYCLE_FAILED = "Task lifecycle transition failed."
 
 
 @dataclass(frozen=True)
@@ -41,6 +58,196 @@ class LeadTaskCreationCommandOutcome:
     exit_code: int
     result: LeadTaskCreationResult | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskLifecycleCommandOutcome:
+    exit_code: int
+    result: TaskLifecycleResult | None = None
+    error_message: str | None = None
+
+
+def execute_task_lifecycle_transition(
+    *,
+    company_id: int,
+    task_id: int,
+    target_status: TaskLifecycleStatus,
+    yes: bool,
+    session_factory: SessionFactory | None = None,
+    task_repository_factory: TaskRepositoryFactory | None = None,
+    service_factory: TaskLifecycleServiceFactory | None = None,
+) -> TaskLifecycleCommandOutcome:
+    if yes is not True:
+        return TaskLifecycleCommandOutcome(
+            exit_code=1,
+            error_message=_LIFECYCLE_CONFIRMATION_REQUIRED,
+        )
+    if (
+        type(company_id) is not int
+        or company_id <= 0
+        or type(task_id) is not int
+        or task_id <= 0
+        or type(target_status) is not TaskLifecycleStatus
+    ):
+        return TaskLifecycleCommandOutcome(
+            exit_code=1,
+            error_message=_LIFECYCLE_INVALID_DATA,
+        )
+
+    try:
+        session = (session_factory or SessionLocal)()
+    except Exception:
+        return TaskLifecycleCommandOutcome(
+            exit_code=1,
+            error_message=_LIFECYCLE_FAILED,
+        )
+
+    committed = False
+    outcome: TaskLifecycleCommandOutcome
+    try:
+        try:
+            repository = (task_repository_factory or TaskRepository)(session)
+            service = (service_factory or TaskLifecycleService)(repository)
+            result = service.transition(company_id, task_id, target_status)
+            session.commit()
+            committed = True
+            outcome = TaskLifecycleCommandOutcome(exit_code=0, result=result)
+        except (
+            TaskLifecycleInvalidDataError,
+            TaskLifecycleNotFoundError,
+            TaskLifecycleTransitionError,
+            TaskLifecycleConsistencyError,
+        ) as error:
+            try:
+                session.rollback()
+            except Exception:
+                outcome = TaskLifecycleCommandOutcome(
+                    exit_code=1,
+                    error_message=_LIFECYCLE_FAILED,
+                )
+            else:
+                outcome = TaskLifecycleCommandOutcome(
+                    exit_code=1,
+                    error_message=_task_lifecycle_error_message(error),
+                )
+        except Exception:
+            if not committed:
+                with suppress(Exception):
+                    session.rollback()
+            outcome = TaskLifecycleCommandOutcome(
+                exit_code=1,
+                error_message=_LIFECYCLE_FAILED,
+            )
+    except BaseException:
+        with suppress(BaseException):
+            session.close()
+        raise
+
+    try:
+        session.close()
+    except Exception:
+        return TaskLifecycleCommandOutcome(
+            exit_code=1,
+            error_message=_LIFECYCLE_FAILED,
+        )
+    return outcome
+
+
+def _task_lifecycle_error_message(
+    error: TaskLifecycleInvalidDataError
+    | TaskLifecycleNotFoundError
+    | TaskLifecycleTransitionError
+    | TaskLifecycleConsistencyError,
+) -> str:
+    if isinstance(error, TaskLifecycleInvalidDataError):
+        return _LIFECYCLE_INVALID_DATA
+    if isinstance(error, TaskLifecycleNotFoundError):
+        return _LIFECYCLE_NOT_FOUND
+    if isinstance(error, TaskLifecycleTransitionError):
+        return _LIFECYCLE_TRANSITION_NOT_ALLOWED
+    return _LIFECYCLE_INCONSISTENT_STATE
+
+
+def _print_task_lifecycle_result(result: TaskLifecycleResult) -> None:
+    typer.echo(f"Task ID: {result.task_id}")
+    typer.echo(f"Company ID: {result.company_id}")
+    typer.echo(f"Previous Status: {result.previous_status.value}")
+    typer.echo(f"Current Status: {result.current_status.value}")
+    typer.echo(f"Changed: {'true' if result.changed else 'false'}")
+
+
+def _run_task_lifecycle_command(
+    *,
+    company_id: int,
+    task_id: int,
+    target_status: TaskLifecycleStatus,
+    yes: bool,
+) -> None:
+    outcome = execute_task_lifecycle_transition(
+        company_id=company_id,
+        task_id=task_id,
+        target_status=target_status,
+        yes=yes,
+    )
+    if outcome.error_message is not None:
+        typer.secho(outcome.error_message, fg=typer.colors.RED)
+    if outcome.result is not None:
+        _print_task_lifecycle_result(outcome.result)
+    raise typer.Exit(outcome.exit_code)
+
+
+@app.command("start")
+def start_task(
+    company_id: int = typer.Option(help="Company ID."),
+    task_id: int = typer.Option(help="Task ID."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm Task lifecycle transition.",
+    ),
+) -> None:
+    _run_task_lifecycle_command(
+        company_id=company_id,
+        task_id=task_id,
+        target_status=TaskLifecycleStatus.IN_PROGRESS,
+        yes=yes,
+    )
+
+
+@app.command("complete")
+def complete_task(
+    company_id: int = typer.Option(help="Company ID."),
+    task_id: int = typer.Option(help="Task ID."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm Task lifecycle transition.",
+    ),
+) -> None:
+    _run_task_lifecycle_command(
+        company_id=company_id,
+        task_id=task_id,
+        target_status=TaskLifecycleStatus.DONE,
+        yes=yes,
+    )
+
+
+@app.command("cancel")
+def cancel_task(
+    company_id: int = typer.Option(help="Company ID."),
+    task_id: int = typer.Option(help="Task ID."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm Task lifecycle transition.",
+    ),
+) -> None:
+    _run_task_lifecycle_command(
+        company_id=company_id,
+        task_id=task_id,
+        target_status=TaskLifecycleStatus.CANCELLED,
+        yes=yes,
+    )
 
 
 def execute_create_task_for_lead(
