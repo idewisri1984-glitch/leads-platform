@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database.base import Base
 from app.modules.company.models import Company
+from app.modules.contact.models import Contact
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
 from app.modules.task import TaskWorkQueueBucket, TaskWorkQueueService
@@ -18,10 +19,38 @@ AS_OF = datetime(2026, 7, 31, 9)
 
 class CountingSession(Session):
     execute_calls = 0
+    commit_calls = 0
+    rollback_calls = 0
+    add_calls = 0
+    flush_calls = 0
 
     def execute(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
         self.execute_calls += 1
         return super().execute(*args, **kwargs)
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+        super().commit()
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+        super().rollback()
+
+    def add(self, instance: object, *, _warn: bool = True) -> None:
+        self.add_calls += 1
+        super().add(instance, _warn=_warn)
+
+    def flush(self, objects: object = None) -> None:
+        if self.new or self.dirty or self.deleted:
+            self.flush_calls += 1
+        super().flush(objects)  # type: ignore[arg-type]
+
+    def reset_queue_tracking(self) -> None:
+        self.execute_calls = 0
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.add_calls = 0
+        self.flush_calls = 0
 
 
 @pytest.fixture
@@ -139,3 +168,231 @@ def test_direct_repository_validation_precedes_query(
             company_id, as_of, until
         )
     assert session.execute_calls == 0
+
+
+def test_complete_status_exclusion_and_window_matrix(session: CountingSession) -> None:
+    project = Project(name="Matrix project")
+    company = Company(project=project, name="Matrix company")
+    lead = Lead(company=company, status="NEW")
+    session.add(project)
+    session.flush()
+    eligible = [
+        Task(
+            lead=lead,
+            title="overdue todo",
+            status="TODO",
+            due_at=AS_OF - timedelta(microseconds=1),
+        ),
+        Task(
+            lead=lead,
+            title="overdue progress",
+            status="IN_PROGRESS",
+            due_at=AS_OF - timedelta(days=1),
+        ),
+        Task(lead=lead, title="as of", status="TODO", due_at=AS_OF),
+        Task(lead=lead, title="inside", status="IN_PROGRESS", due_at=AS_OF + timedelta(days=1)),
+        Task(lead=lead, title="horizon", status="TODO", due_at=AS_OF + timedelta(days=7)),
+        Task(lead=lead, title="unscheduled todo", status="TODO", due_at=None),
+        Task(lead=lead, title="unscheduled progress", status="IN_PROGRESS", due_at=None),
+    ]
+    excluded = [
+        Task(lead=lead, title=status, status=status, due_at=None)
+        for status in (
+            "DONE",
+            "CANCELLED",
+            "todo",
+            "in_progress",
+            " TODO",
+            "IN_PROGRESS ",
+            "",
+            "WAITING_CUSTOMER",
+        )
+    ]
+    excluded.append(
+        Task(
+            lead=lead,
+            title="after horizon",
+            status="TODO",
+            due_at=AS_OF + timedelta(days=7, microseconds=1),
+        )
+    )
+    session.add_all([*eligible, *excluded])
+    session.commit()
+    expected_ids = {task.id for task in eligible}
+    excluded_ids = {task.id for task in excluded}
+    company_id = company.id
+    session.reset_queue_tracking()
+    selected = TaskWorkQueueService(TaskRepository(session)).get_queue(company_id, AS_OF)
+    assert {item.task_id for item in selected.items} == expected_ids
+    assert not ({item.task_id for item in selected.items} & excluded_ids)
+    assert [item.title for item in selected.items] == [
+        "overdue progress",
+        "overdue todo",
+        "as of",
+        "inside",
+        "horizon",
+        "unscheduled progress",
+        "unscheduled todo",
+    ]
+    assert (session.execute_calls, session.commit_calls, session.rollback_calls) == (1, 0, 0)
+    assert (session.add_calls, session.flush_calls) == (0, 0)
+
+
+def test_equal_due_and_unscheduled_ordering_tiebreakers(session: CountingSession) -> None:
+    project = Project(name="Order project")
+    company = Company(project=project, name="Order company")
+    lead = Lead(company=company, status="NEW")
+    session.add(project)
+    session.flush()
+    due = AS_OF + timedelta(hours=1)
+    first_todo = Task(lead=lead, title="todo low", status="TODO", due_at=due)
+    second_todo = Task(lead=lead, title="todo high", status="TODO", due_at=due)
+    first_progress = Task(lead=lead, title="progress low", status="IN_PROGRESS", due_at=due)
+    second_progress = Task(lead=lead, title="progress high", status="IN_PROGRESS", due_at=due)
+    unscheduled_todo = Task(lead=lead, title="u todo", status="TODO", due_at=None)
+    unscheduled_progress = Task(lead=lead, title="u progress", status="IN_PROGRESS", due_at=None)
+    session.add_all(
+        [
+            first_todo,
+            second_todo,
+            first_progress,
+            second_progress,
+            unscheduled_todo,
+            unscheduled_progress,
+        ]
+    )
+    session.commit()
+    selected = TaskWorkQueueService(TaskRepository(session)).get_queue(company.id, AS_OF)
+    assert [item.task_id for item in selected.items] == [
+        first_progress.id,
+        second_progress.id,
+        first_todo.id,
+        second_todo.id,
+        unscheduled_progress.id,
+        unscheduled_todo.id,
+    ]
+
+
+def test_full_domain_immutability_and_read_only_sql(session: CountingSession) -> None:
+    project = Project(name="Immutable project")
+    company = Company(
+        project=project,
+        name="Immutable company",
+        website="https://example.test",
+        country="ID",
+        city="Denpasar",
+        industry="Travel",
+        status="ACTIVE",
+        notes="company notes",
+    )
+    contact = Contact(
+        company=company,
+        first_name="Queue",
+        last_name="Contact",
+        email="queue@example.test",
+        phone="+62123456789",
+        status="ACTIVE",
+        notes="contact notes",
+    )
+    lead = Lead(
+        company=company,
+        contact=contact,
+        status="QUALIFIED",
+        source="review",
+        notes="lead notes",
+    )
+    task = Task(
+        lead=lead,
+        title="Immutable task",
+        description="description",
+        status="TODO",
+        due_at=AS_OF,
+    )
+    session.add(project)
+    session.commit()
+    before = {
+        "project": (project.id, project.name),
+        "company": (
+            company.id,
+            company.project_id,
+            company.name,
+            company.website,
+            company.country,
+            company.city,
+            company.industry,
+            company.status,
+            company.notes,
+        ),
+        "contact": (
+            contact.id,
+            contact.company_id,
+            contact.first_name,
+            contact.last_name,
+            contact.email,
+            contact.phone,
+            contact.status,
+            contact.notes,
+        ),
+        "lead": (lead.id, lead.company_id, lead.contact_id, lead.status, lead.source, lead.notes),
+        "task": (task.id, task.lead_id, task.title, task.description, task.status, task.due_at),
+    }
+    statements: list[str] = []
+    engine = session.get_bind()
+
+    def capture_sql(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    company_id = company.id
+    session.reset_queue_tracking()
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        result = TaskWorkQueueService(TaskRepository(session)).get_queue(company_id, AS_OF)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+    assert [item.task_id for item in result.items] == [task.id]
+    after = {
+        "project": (project.id, project.name),
+        "company": (
+            company.id,
+            company.project_id,
+            company.name,
+            company.website,
+            company.country,
+            company.city,
+            company.industry,
+            company.status,
+            company.notes,
+        ),
+        "contact": (
+            contact.id,
+            contact.company_id,
+            contact.first_name,
+            contact.last_name,
+            contact.email,
+            contact.phone,
+            contact.status,
+            contact.notes,
+        ),
+        "lead": (lead.id, lead.company_id, lead.contact_id, lead.status, lead.source, lead.notes),
+        "task": (task.id, task.lead_id, task.title, task.description, task.status, task.due_at),
+    }
+    assert after == before
+    assert len(statements) == 1
+    sql = statements[0].upper()
+    assert sql.lstrip().startswith("SELECT")
+    assert " JOIN LEADS " in sql
+    assert " JOIN COMPANIES " not in sql
+    assert " JOIN CONTACTS " not in sql
+    assert " JOIN PROJECTS " not in sql
+    assert "FOR UPDATE" not in sql
+    for verb in ("INSERT", "UPDATE", "DELETE"):
+        assert not sql.lstrip().startswith(verb)
+    assert (session.execute_calls, session.commit_calls, session.rollback_calls) == (1, 0, 0)
+    assert (session.add_calls, session.flush_calls) == (0, 0)

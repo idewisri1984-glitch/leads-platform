@@ -6,6 +6,7 @@ from typing import cast
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 import app.modules.task as task_module
 from app.modules.task import (
@@ -23,6 +24,35 @@ from app.modules.task.work_queue import (
 )
 
 AS_OF = datetime(2026, 7, 31, 9)
+
+
+class IntSubclass(int):
+    pass
+
+
+class StringSubclass(str):
+    pass
+
+
+class DateTimeSubclass(datetime):
+    pass
+
+
+class TupleSubclass(tuple[TaskWorkQueueItem, ...]):
+    pass
+
+
+class ListSubclass(list[TaskWorkQueueRecord]):
+    pass
+
+
+class CustomIterable:
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(())
+
+
+class CustomBaseException(BaseException):
+    pass
 
 
 def item(
@@ -303,3 +333,221 @@ def test_repository_value_error_is_sanitized() -> None:
     assert str(raised.value) == "Task work queue state is inconsistent."
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_id", IntSubclass(1)),
+        ("lead_id", IntSubclass(7)),
+        ("title", StringSubclass("title")),
+        ("due_at", DateTimeSubclass(2026, 7, 31, 9)),
+    ],
+)
+@pytest.mark.parametrize("validation", ["direct", "model_validate"])
+def test_safe_item_rejects_strict_subclasses(
+    field: str,
+    value: object,
+    validation: str,
+) -> None:
+    values = {
+        "task_id": 1,
+        "lead_id": 7,
+        "title": "title",
+        "status": TaskLifecycleStatus.TODO,
+        "due_at": None,
+        "bucket": TaskWorkQueueBucket.UNSCHEDULED,
+    }
+    values[field] = value
+    with pytest.raises(ValidationError):
+        if validation == "direct":
+            TaskWorkQueueItem(**values)  # type: ignore[arg-type]
+        else:
+            TaskWorkQueueItem.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("company_id", IntSubclass(3)),
+        ("as_of", DateTimeSubclass(2026, 7, 31, 9)),
+        ("upcoming_until", DateTimeSubclass(2026, 8, 7, 9)),
+    ],
+)
+@pytest.mark.parametrize("validation", ["direct", "model_validate"])
+def test_safe_result_rejects_strict_subclasses(
+    field: str,
+    value: object,
+    validation: str,
+) -> None:
+    values = {
+        "company_id": 3,
+        "as_of": AS_OF,
+        "upcoming_until": AS_OF + timedelta(days=7),
+        "overdue_count": 0,
+        "upcoming_count": 0,
+        "unscheduled_count": 0,
+        "items": (),
+    }
+    values[field] = value
+    with pytest.raises(ValidationError):
+        if validation == "direct":
+            TaskWorkQueueResult(**values)  # type: ignore[arg-type]
+        else:
+            TaskWorkQueueResult.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", "TODO"),
+        ("status", "IN_PROGRESS"),
+        ("status", StringSubclass("TODO")),
+        ("status", TaskWorkQueueBucket.OVERDUE),
+        ("status", 1),
+        ("status", True),
+        ("status", None),
+        ("status", object()),
+        ("bucket", "OVERDUE"),
+        ("bucket", "UPCOMING"),
+        ("bucket", "UNSCHEDULED"),
+        ("bucket", StringSubclass("OVERDUE")),
+        ("bucket", TaskLifecycleStatus.TODO),
+        ("bucket", 1),
+        ("bucket", True),
+        ("bucket", None),
+        ("bucket", object()),
+    ],
+)
+@pytest.mark.parametrize("validation", ["direct", "model_validate"])
+def test_safe_item_rejects_raw_and_unrelated_enum_values(
+    field: str,
+    value: object,
+    validation: str,
+) -> None:
+    values = {
+        "task_id": 1,
+        "lead_id": 7,
+        "title": "title",
+        "status": TaskLifecycleStatus.TODO,
+        "due_at": None,
+        "bucket": TaskWorkQueueBucket.UNSCHEDULED,
+    }
+    values[field] = value
+    with pytest.raises(ValidationError):
+        if validation == "direct":
+            TaskWorkQueueItem(**values)  # type: ignore[arg-type]
+        else:
+            TaskWorkQueueItem.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [],
+        set(),
+        frozenset(),
+        (item for item in ()),
+        CustomIterable(),
+        TupleSubclass(),
+        1,
+        None,
+    ],
+)
+def test_safe_result_accepts_only_exact_tuple(items: object) -> None:
+    with pytest.raises(ValidationError):
+        TaskWorkQueueResult(
+            company_id=3,
+            as_of=AS_OF,
+            upcoming_until=AS_OF + timedelta(days=7),
+            overdue_count=0,
+            upcoming_count=0,
+            unscheduled_count=0,
+            items=cast(tuple[TaskWorkQueueItem, ...], items),
+        )
+
+
+@pytest.mark.parametrize(
+    "outer",
+    [
+        None,
+        (),
+        TupleSubclass(),
+        (record for record in ()),
+        iter(()),
+        set(),
+        frozenset(),
+        {},
+        {}.values(),
+        "records",
+        b"records",
+        ListSubclass(),
+        CustomIterable(),
+        SimpleNamespace(all=lambda: []),
+        1,
+        object(),
+    ],
+)
+def test_service_rejects_every_non_exact_list_outer_result(outer: object) -> None:
+    repository = RecordingRepository(outer)
+    with pytest.raises(TaskWorkQueueConsistencyError) as raised:
+        TaskWorkQueueService(repository).get_queue(3, AS_OF)
+    assert str(raised.value) == "Task work queue state is inconsistent."
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert repository.calls == [(3, AS_OF, AS_OF + timedelta(days=7))]
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        SimpleNamespace(lead_id=7, title="x", status="TODO", due_at=None),
+        SimpleNamespace(task_id=1, title="x", status="TODO", due_at=None),
+        SimpleNamespace(task_id=1, lead_id=7, status="TODO", due_at=None),
+        SimpleNamespace(task_id=1, lead_id=7, title="x", due_at=None),
+        SimpleNamespace(task_id=1, lead_id=7, title="x", status="TODO"),
+        TaskWorkQueueRecord(True, 7, "x", "TODO", None),
+        TaskWorkQueueRecord(0, 7, "x", "TODO", None),
+        TaskWorkQueueRecord(-1, 7, "x", "TODO", None),
+        TaskWorkQueueRecord(IntSubclass(1), 7, "x", "TODO", None),
+        TaskWorkQueueRecord(1, 7, StringSubclass("x"), "TODO", None),
+        TaskWorkQueueRecord(1, 7, "x" * 256, "TODO", None),
+        TaskWorkQueueRecord(1, 7, "x", "todo", None),
+        TaskWorkQueueRecord(1, 7, "x", " TODO", None),
+        TaskWorkQueueRecord(1, 7, "x", "DONE", None),
+        TaskWorkQueueRecord(1, 7, "x", "CANCELLED", None),
+        TaskWorkQueueRecord(1, 7, "x", "WAITING_CUSTOMER", None),
+        TaskWorkQueueRecord(1, 7, "x", "TODO", datetime.now(UTC)),
+        TaskWorkQueueRecord(1, 7, "x", "TODO", DateTimeSubclass(2026, 7, 31, 9)),
+        TaskWorkQueueRecord(1, 7, "x", "TODO", AS_OF + timedelta(days=8)),
+    ],
+)
+def test_service_rejects_complete_malformed_record_matrix(record: object) -> None:
+    repository = RecordingRepository([record])
+    with pytest.raises(TaskWorkQueueConsistencyError) as raised:
+        TaskWorkQueueService(repository).get_queue(3, AS_OF)
+    assert str(raised.value) == "Task work queue state is inconsistent."
+    assert repository.calls == [(3, AS_OF, AS_OF + timedelta(days=7))]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SQLAlchemyError("sqlalchemy"),
+        IntegrityError("statement", {}, Exception("driver")),
+        KeyboardInterrupt(),
+        SystemExit(),
+        GeneratorExit(),
+        CustomBaseException(),
+    ],
+)
+def test_all_infrastructure_baseexceptions_preserve_identity(error: BaseException) -> None:
+    class FailingRepository(RecordingRepository):
+        def list_work_queue_for_company(
+            self, company_id: int, as_of: datetime, upcoming_until: datetime
+        ) -> list[TaskWorkQueueRecord]:
+            raise error
+
+    with pytest.raises(type(error)) as raised:
+        TaskWorkQueueService(FailingRepository([])).get_queue(3, AS_OF)
+    assert raised.value is error

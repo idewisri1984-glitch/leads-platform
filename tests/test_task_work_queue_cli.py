@@ -11,12 +11,17 @@ from app.modules.task import (
     TaskLifecycleStatus,
     TaskWorkQueueBucket,
     TaskWorkQueueConsistencyError,
+    TaskWorkQueueInvalidDataError,
     TaskWorkQueueItem,
     TaskWorkQueueResult,
 )
 
 runner = CliRunner()
 AS_OF = datetime(2026, 7, 31, 9)
+
+
+class CustomBaseException(BaseException):
+    pass
 
 
 def queue_result(title: str = "Call buyer") -> TaskWorkQueueResult:
@@ -276,3 +281,175 @@ def test_empty_output_is_exact(monkeypatch: pytest.MonkeyPatch) -> None:
         "Unscheduled: 0\n"
         "No active tasks in work queue.\n"
     )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(), GeneratorExit(), CustomBaseException()],
+)
+def test_session_factory_baseexception_matrix_preserves_identity(
+    error: BaseException,
+) -> None:
+    operations: list[str] = []
+
+    def fail_session() -> StrictSession:
+        operations.append("session.factory")
+        raise error
+
+    with pytest.raises(type(error)) as raised:
+        task_cli.execute_task_work_queue(
+            company_id=3,
+            as_of=AS_OF,
+            session_factory=cast(task_cli.SessionFactory, fail_session),
+            task_repository_factory=cast(
+                task_cli.TaskRepositoryFactory,
+                lambda session: operations.append("repository.factory"),
+            ),
+        )
+    assert raised.value is error
+    assert operations == ["session.factory"]
+
+
+def test_session_factory_ordinary_failure_is_safe_without_cleanup() -> None:
+    error = RuntimeError("session secret")
+    outcome = task_cli.execute_task_work_queue(
+        company_id=3,
+        as_of=AS_OF,
+        session_factory=cast(task_cli.SessionFactory, lambda: (_ for _ in ()).throw(error)),
+    )
+    assert outcome == task_cli.TaskWorkQueueCommandOutcome(
+        exit_code=1,
+        error_message="Task work queue failed.",
+    )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["repository", "service_factory"],
+)
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("ordinary"),
+        KeyboardInterrupt(),
+        SystemExit(),
+        GeneratorExit(),
+        CustomBaseException(),
+    ],
+)
+def test_post_session_factory_failure_matrix(
+    stage: str,
+    error: BaseException,
+) -> None:
+    session = (
+        StrictSession(SystemExit("cleanup"))
+        if not isinstance(error, Exception)
+        else StrictSession()
+    )
+    operations: list[str] = []
+    repository = object()
+
+    def make_repository(selected: object) -> object:
+        assert selected is session
+        operations.append("repository.factory")
+        if stage == "repository":
+            raise error
+        return repository
+
+    def make_service(selected: object) -> Service:
+        assert selected is repository
+        operations.append("service.factory")
+        raise error
+
+    def call() -> task_cli.TaskWorkQueueCommandOutcome:
+        return task_cli.execute_task_work_queue(
+            company_id=3,
+            as_of=AS_OF,
+            session_factory=cast(task_cli.SessionFactory, lambda: session),
+            task_repository_factory=cast(task_cli.TaskRepositoryFactory, make_repository),
+            service_factory=cast(task_cli.TaskWorkQueueServiceFactory, make_service),
+        )
+
+    if isinstance(error, Exception):
+        assert call() == task_cli.TaskWorkQueueCommandOutcome(
+            exit_code=1,
+            error_message="Task work queue failed.",
+        )
+    else:
+        with pytest.raises(type(error)) as raised:
+            call()
+        assert raised.value is error
+    expected = ["repository.factory"]
+    if stage == "service_factory":
+        expected.append("service.factory")
+    assert operations == expected
+    assert session.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (TaskWorkQueueInvalidDataError("raw"), "Task work queue data is invalid."),
+        (TaskWorkQueueConsistencyError("raw"), "Task work queue state is inconsistent."),
+        (RuntimeError("raw"), "Task work queue failed."),
+    ],
+)
+def test_complete_service_call_ordinary_matrix(
+    error: BaseException,
+    message: str,
+) -> None:
+    outcome, session, service = execute_with(error)
+    assert outcome == task_cli.TaskWorkQueueCommandOutcome(exit_code=1, error_message=message)
+    assert service.calls == [(3, AS_OF, 7)]
+    assert session.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(), GeneratorExit(), CustomBaseException()],
+)
+def test_complete_service_call_baseexception_matrix(error: BaseException) -> None:
+    session = StrictSession(SystemExit("secondary cleanup"))
+    service = Service(error)
+    with pytest.raises(type(error)) as raised:
+        task_cli.execute_task_work_queue(
+            company_id=3,
+            as_of=AS_OF,
+            session_factory=cast(task_cli.SessionFactory, lambda: session),
+            task_repository_factory=cast(task_cli.TaskRepositoryFactory, lambda selected: object()),
+            service_factory=cast(task_cli.TaskWorkQueueServiceFactory, lambda repository: service),
+        )
+    assert raised.value is error
+    assert service.calls == [(3, AS_OF, 7)]
+    assert session.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "service_value",
+    [
+        queue_result(),
+        TaskWorkQueueInvalidDataError("controlled"),
+        RuntimeError("ordinary"),
+    ],
+)
+def test_close_ordinary_failure_matrix_hides_every_outcome(
+    service_value: TaskWorkQueueResult | BaseException,
+) -> None:
+    outcome, session, _ = execute_with(
+        service_value,
+        session=StrictSession(RuntimeError("close secret")),
+    )
+    assert outcome == task_cli.TaskWorkQueueCommandOutcome(
+        exit_code=1,
+        error_message="Task work queue failed.",
+    )
+    assert session.close_calls == 1
+
+
+def test_close_baseexception_is_primary_after_success() -> None:
+    error = CustomBaseException()
+    session = StrictSession(error)
+    with pytest.raises(CustomBaseException) as raised:
+        execute_with(queue_result(), session=session)
+    assert raised.value is error
+    assert session.close_calls == 1
