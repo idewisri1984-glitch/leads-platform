@@ -163,6 +163,83 @@ def test_result_schema_is_exact_strict_frozen_and_forbids_extra() -> None:
     assert result.changed is True
 
 
+@pytest.mark.parametrize("field", ["previous_status", "current_status"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        *(status.value for status in TaskLifecycleStatus),
+        "todo",
+        " TODO",
+        "TODO ",
+        "",
+        "UNKNOWN",
+        StrSubclass("TODO"),
+        OtherStatus.TODO,
+        True,
+        1,
+        None,
+        object(),
+    ],
+)
+def test_result_schema_rejects_non_lifecycle_status_members(
+    field: str,
+    value: object,
+) -> None:
+    values: dict[str, object] = {
+        "task_id": 2,
+        "company_id": 1,
+        "previous_status": TaskLifecycleStatus.TODO,
+        "current_status": TaskLifecycleStatus.TODO,
+        "changed": False,
+    }
+    values[field] = value
+    with pytest.raises(ValidationError):
+        TaskLifecycleResult(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["previous_status", "current_status"])
+@pytest.mark.parametrize("value", [status.value for status in TaskLifecycleStatus])
+def test_result_schema_model_validate_rejects_raw_status_strings(
+    field: str,
+    value: str,
+) -> None:
+    values: dict[str, object] = {
+        "task_id": 2,
+        "company_id": 1,
+        "previous_status": TaskLifecycleStatus.TODO,
+        "current_status": TaskLifecycleStatus.TODO,
+        "changed": False,
+    }
+    values[field] = value
+    with pytest.raises(ValidationError):
+        TaskLifecycleResult.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("previous", "current"),
+    [
+        (TaskLifecycleStatus.TODO, TaskLifecycleStatus.TODO),
+        (TaskLifecycleStatus.TODO, TaskLifecycleStatus.IN_PROGRESS),
+        (TaskLifecycleStatus.IN_PROGRESS, TaskLifecycleStatus.DONE),
+        (TaskLifecycleStatus.DONE, TaskLifecycleStatus.DONE),
+        (TaskLifecycleStatus.CANCELLED, TaskLifecycleStatus.CANCELLED),
+    ],
+)
+def test_result_schema_accepts_actual_lifecycle_status_members(
+    previous: TaskLifecycleStatus,
+    current: TaskLifecycleStatus,
+) -> None:
+    result = TaskLifecycleResult(
+        task_id=2,
+        company_id=1,
+        previous_status=previous,
+        current_status=current,
+        changed=previous is not current,
+    )
+    assert result.previous_status is previous
+    assert result.current_status is current
+
+
 def test_public_exports_preserve_persistence_and_add_exact_service_symbols() -> None:
     required = {
         "TaskLifecycleConsistencyError",

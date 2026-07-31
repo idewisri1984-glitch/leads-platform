@@ -1,6 +1,14 @@
 from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from app.modules.task.models import TaskLifecycleStatus
 
@@ -30,6 +38,13 @@ class TaskLifecycleResult(BaseModel):
     previous_status: TaskLifecycleStatus
     current_status: TaskLifecycleStatus
     changed: StrictBool
+
+    @field_validator("previous_status", "current_status", mode="before")
+    @classmethod
+    def require_lifecycle_status(cls, value: object) -> TaskLifecycleStatus:
+        if type(value) is not TaskLifecycleStatus:
+            raise ValueError("Task lifecycle status is invalid.")
+        return value
 
     @model_validator(mode="after")
     def validate_transition(self) -> Self:
