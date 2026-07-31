@@ -1,6 +1,7 @@
 import inspect
 from dataclasses import FrozenInstanceError, fields
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -708,10 +709,173 @@ def test_direct_executor_is_silent(
 def test_existing_commands_do_not_construct_lifecycle_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def forbidden(_repository: object) -> None:
-        pytest.fail("legacy command constructed TaskLifecycleService")
+    operations: list[str] = []
+    task = SimpleNamespace(
+        id=12,
+        lead_id=7,
+        title="Legacy task",
+        description="Legacy description",
+        status="WAITING_CUSTOMER",
+        due_at=None,
+    )
 
-    monkeypatch.setattr(task_cli, "TaskLifecycleService", forbidden)
+    class ForbiddenTaskLifecycleService:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("Legacy Task command constructed TaskLifecycleService.")
+
+    class LegacySession:
+        def __enter__(self) -> "LegacySession":
+            operations.append("session.enter")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            operations.append("session.exit")
+
+        def commit(self) -> None:
+            operations.append("session.commit")
+
+        def rollback(self) -> None:
+            pytest.fail("successful legacy command rolled back")
+
+        def close(self) -> None:
+            operations.append("session.close")
+
+    class LegacyTaskRepository:
+        def __init__(self, session: object) -> None:
+            assert isinstance(session, LegacySession)
+            operations.append("task.repository")
+
+        def get(self, task_id: int) -> object:
+            assert task_id == 12
+            operations.append("task.repository.get")
+            return task
+
+        def set_status_for_company(self, *_args: object) -> None:
+            pytest.fail("legacy command called lifecycle repository method")
+
+    class LegacyLeadRepository:
+        def __init__(self, session: object) -> None:
+            assert isinstance(session, LegacySession)
+            operations.append("lead.repository")
+
+    class LegacyTaskService:
+        def __init__(self, repository: object) -> None:
+            assert isinstance(repository, LegacyTaskRepository)
+            operations.append("task.service")
+
+        def create(self, data: object) -> object:
+            assert cast(Any, data).status == "WAITING_CUSTOMER"
+            operations.append("task.service.create")
+            return task
+
+        def get_all(self) -> list[object]:
+            operations.append("task.service.get_all")
+            return []
+
+        def get(self, task_id: int) -> object:
+            assert task_id == 12
+            operations.append("task.service.get")
+            return task
+
+        def delete(self, candidate: object) -> None:
+            assert candidate is task
+            operations.append("task.service.delete")
+
+    class LegacyLeadTaskCreationService:
+        def __init__(self, lead_repository: object, task_repository: object) -> None:
+            assert isinstance(lead_repository, LegacyLeadRepository)
+            assert isinstance(task_repository, LegacyTaskRepository)
+            operations.append("lead.task.creation.service")
+
+        def create(
+            self,
+            company_id: int,
+            lead_id: int,
+            title: str,
+            description: str | None,
+        ) -> object:
+            assert (company_id, lead_id, title, description) == (
+                3,
+                7,
+                "Confirmed task",
+                None,
+            )
+            operations.append("lead.task.creation.service.create")
+            return task_cli.LeadTaskCreationResult(
+                task_id=13,
+                company_id=3,
+                lead_id=7,
+                status="TODO",
+            )
+
+    monkeypatch.setattr(
+        task_cli,
+        "TaskLifecycleService",
+        ForbiddenTaskLifecycleService,
+    )
+    monkeypatch.setattr(task_cli, "SessionLocal", LegacySession)
+    monkeypatch.setattr(task_cli, "TaskRepository", LegacyTaskRepository)
+    monkeypatch.setattr(task_cli, "LeadRepository", LegacyLeadRepository)
+    monkeypatch.setattr(task_cli, "TaskService", LegacyTaskService)
+    monkeypatch.setattr(
+        task_cli,
+        "LeadTaskCreationService",
+        LegacyLeadTaskCreationService,
+    )
+
     for command in ("create", "create-for-lead", "list", "show", "delete"):
-        result = runner.invoke(root_app, ["task", command, "--help"])
-        assert result.exit_code == 0
+        help_result = runner.invoke(root_app, ["task", command, "--help"])
+        assert help_result.exit_code == 0
+
+    created = runner.invoke(
+        root_app,
+        [
+            "task",
+            "create",
+            "7",
+            "Legacy task",
+            "--status",
+            "WAITING_CUSTOMER",
+        ],
+    )
+    confirmed = runner.invoke(
+        root_app,
+        [
+            "task",
+            "create-for-lead",
+            "--company-id",
+            "3",
+            "--lead-id",
+            "7",
+            "--title",
+            "Confirmed task",
+            "--yes",
+        ],
+    )
+    listed = runner.invoke(root_app, ["task", "list"])
+    shown = runner.invoke(root_app, ["task", "show", "12"])
+    deleted = runner.invoke(root_app, ["task", "delete", "12"])
+
+    assert created.exit_code == 0
+    assert "Task created" in created.output
+    assert "Status: WAITING_CUSTOMER" in created.output
+    assert confirmed.exit_code == 0
+    assert confirmed.output.splitlines() == [
+        "Task ID: 13",
+        "Company ID: 3",
+        "Lead ID: 7",
+        "Status: TODO",
+    ]
+    assert listed.exit_code == 0
+    assert listed.output.strip() == "No tasks found."
+    assert shown.exit_code == 0
+    assert "Title:       Legacy task" in shown.output
+    assert "Status:      WAITING_CUSTOMER" in shown.output
+    assert deleted.exit_code == 0
+    assert deleted.output.strip() == "Task deleted"
+    assert operations.count("task.service.create") == 1
+    assert operations.count("lead.task.creation.service.create") == 1
+    assert operations.count("task.service.get_all") == 1
+    assert operations.count("task.service.get") == 1
+    assert operations.count("task.repository.get") == 1
+    assert operations.count("task.service.delete") == 1

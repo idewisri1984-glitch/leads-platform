@@ -3,6 +3,7 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 
+import httpx
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -17,6 +18,16 @@ from app.core.database.engine import engine
 from app.core.database.session import SessionLocal
 from app.modules.company.models import Company
 from app.modules.company.repository import CompanyRepository
+from app.modules.company_discovery.profile_execution import (
+    SearchProfileDiscoveryService,
+)
+from app.modules.company_discovery.profile_persistence import (
+    SearchProfileDiscoveryPersistenceService,
+)
+from app.modules.company_discovery.service import CompanyDiscoveryService
+from app.modules.company_discovery.staging_orchestration import (
+    CompanyDiscoveryStagingService,
+)
 from app.modules.contact.models import Contact
 from app.modules.contact.repository import ContactRepository
 from app.modules.lead.models import Lead
@@ -26,6 +37,7 @@ from app.modules.project.repository import ProjectRepository
 from app.modules.task import TaskLifecycleStatus
 from app.modules.task.models import Task
 from app.modules.task.repository import TaskRepository
+from app.providers.serpapi.client import SerpApiClient
 
 runner = CliRunner()
 
@@ -370,14 +382,73 @@ def test_lifecycle_command_does_not_use_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, company_id, _, _, task_id = seed_task()
+    before = persisted_task(task_id)
 
-    def forbidden(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("network operation attempted")
+    def forbidden_network(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("network boundary called")
 
-    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
-    monkeypatch.setattr(urllib.request, "urlopen", forbidden)
+    def forbidden_provider(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("provider boundary called")
+
+    def forbidden_parser(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("parser boundary called")
+
+    def forbidden_fetcher(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("fetcher boundary called")
+
+    def forbidden_discovery(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("discovery boundary called")
+
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_network)
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden_network)
+    monkeypatch.setattr(SerpApiClient, "search_companies", forbidden_provider)
+    monkeypatch.setattr(SerpApiClient, "_parse_company_result", forbidden_parser)
+    monkeypatch.setattr(httpx.Client, "stream", forbidden_fetcher)
+    monkeypatch.setattr(
+        SearchProfileDiscoveryService,
+        "run_dry",
+        forbidden_discovery,
+    )
+    monkeypatch.setattr(
+        SearchProfileDiscoveryPersistenceService,
+        "run_persist",
+        forbidden_discovery,
+    )
+    monkeypatch.setattr(
+        CompanyDiscoveryService,
+        "discover_from_serpapi",
+        forbidden_discovery,
+    )
+    monkeypatch.setattr(
+        CompanyDiscoveryStagingService,
+        "run",
+        forbidden_discovery,
+    )
+
     result = invoke("start", company_id, task_id)
     assert result.exit_code == 0
+    assert result.output.splitlines() == [
+        f"Task ID: {task_id}",
+        f"Company ID: {company_id}",
+        "Previous Status: TODO",
+        "Current Status: IN_PROGRESS",
+        "Changed: true",
+    ]
+    after = persisted_task(task_id)
+    assert after.status == "IN_PROGRESS"
+    assert (
+        after.id,
+        after.lead_id,
+        after.title,
+        after.description,
+        after.due_at,
+    ) == (
+        before.id,
+        before.lead_id,
+        before.title,
+        before.description,
+        before.due_at,
+    )
 
 
 def test_legacy_task_commands_and_confirmed_creation_remain_operational() -> None:
