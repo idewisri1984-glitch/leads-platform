@@ -165,7 +165,14 @@ def test_public_exports_preserve_existing_symbols_and_add_only_public_contract()
         "TaskService",
     }
     expected_new = {
+        "TaskLifecycleConsistencyError",
+        "TaskLifecycleError",
+        "TaskLifecycleInvalidDataError",
+        "TaskLifecycleNotFoundError",
+        "TaskLifecycleResult",
+        "TaskLifecycleService",
         "TaskLifecycleStatus",
+        "TaskLifecycleTransitionError",
         "TaskLifecycleRepositoryNotFoundError",
         "TaskLifecycleRepositoryTransitionError",
         "TaskStatusTransitionResult",
