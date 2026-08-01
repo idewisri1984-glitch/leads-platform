@@ -2,6 +2,7 @@ import inspect
 import json
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -111,7 +112,7 @@ class FakeSDK:
 
 
 def client(fake: FakeSDK | None = None, **changes: object) -> tuple[OpenAIDecisionClient, FakeSDK]:
-    sdk = fake or FakeSDK()
+    sdk = fake if fake is not None else FakeSDK()
     values: dict[str, object] = {
         "api_key": "test-key",
         "model": "test-model",
@@ -273,6 +274,20 @@ def test_selected_index_must_exist_in_submitted_request() -> None:
         wrapper.decide(request())
 
 
+def test_integer_confidence_is_rejected_without_retry_or_context() -> None:
+    wrapper, fake = client(FakeSDK(response(SELECT | {"confidence": 1})))
+
+    with pytest.raises(
+        OpenAIDecisionResponseError, match=r"^OpenAI decision response was invalid\.$"
+    ) as raised:
+        wrapper.decide(request())
+
+    assert len(fake.responses.calls) == 1
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "confidence" not in str(raised.value)
+
+
 def sdk_error(error_type: type[BaseException], status: int = 500) -> BaseException:
     req = httpx.Request("POST", "https://example.test/v1/responses")
     if error_type in {APIConnectionError, APITimeoutError}:
@@ -312,6 +327,16 @@ class InfrastructureFailure(BaseException):
     pass
 
 
+class FalseyFakeSDK(FakeSDK):
+    def __bool__(self) -> bool:
+        return False
+
+
+class TruthinessGuardFakeSDK(FakeSDK):
+    def __bool__(self) -> bool:
+        raise AssertionError("Injected client truthiness must not be evaluated.")
+
+
 @pytest.mark.parametrize(
     "source", [KeyboardInterrupt(), SystemExit(), GeneratorExit(), InfrastructureFailure()]
 )
@@ -339,13 +364,58 @@ def test_client_ownership_close_and_context_manager() -> None:
     assert owned.close_calls == 1
 
 
-def test_close_failures_propagate_unchanged_and_close_is_at_most_once() -> None:
-    failure = RuntimeError("close failed")
+def test_falsy_injected_client_is_preserved_used_and_never_closed() -> None:
+    injected = FalseyFakeSDK()
+    with patch("app.providers.openai_decision.client.OpenAI") as constructor:
+        wrapper, _ = client(injected)
+        with wrapper as entered:
+            result = entered.decide(request())
+        wrapper.close()
+
+    assert result.decision is OpenAIDecisionKind.SELECT
+    assert wrapper._client is injected
+    assert wrapper._owns_client is False
+    assert len(injected.responses.calls) == 1
+    assert injected.close_calls == 0
+    constructor.assert_not_called()
+
+
+def test_injected_client_truthiness_is_never_evaluated() -> None:
+    injected = TruthinessGuardFakeSDK()
+    with patch("app.providers.openai_decision.client.OpenAI") as constructor:
+        wrapper, _ = client(injected)
+        assert wrapper.decide(request()).decision is OpenAIDecisionKind.SELECT
+        wrapper.close()
+
+    assert wrapper._client is injected
+    assert injected.close_calls == 0
+    constructor.assert_not_called()
+
+
+def test_absent_injected_client_constructs_and_closes_one_owned_client() -> None:
+    owned = FakeSDK()
+    with patch(
+        "app.providers.openai_decision.client.OpenAI", return_value=cast(OpenAI, owned)
+    ) as constructor:
+        wrapper = OpenAIDecisionClient(api_key="test-key", model="test-model")
+        wrapper.close()
+        wrapper.close()
+
+    constructor.assert_called_once_with(api_key="test-key", timeout=30.0, max_retries=0)
+    assert wrapper._client is owned
+    assert wrapper._owns_client is True
+    assert owned.close_calls == 1
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("close failed"), InfrastructureFailure()])
+def test_close_failures_propagate_unchanged_and_close_is_at_most_once(
+    failure: BaseException,
+) -> None:
     owned = FakeSDK()
     owned.close_error = failure
     wrapper, _ = client(owned)
     wrapper._owns_client = True
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(BaseException) as raised:
         wrapper.close()
     assert raised.value is failure
     wrapper.close()

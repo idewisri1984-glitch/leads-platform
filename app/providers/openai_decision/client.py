@@ -98,10 +98,14 @@ class OpenAIDecisionClient:
         self._max_output_tokens = max_output_tokens
         self._owns_client = openai_client is None
         self._closed = False
-        self._client = openai_client or OpenAI(
-            api_key=api_key,
-            timeout=timeout_seconds,
-            max_retries=0,
+        self._client = (
+            openai_client
+            if openai_client is not None
+            else OpenAI(
+                api_key=api_key,
+                timeout=timeout_seconds,
+                max_retries=0,
+            )
         )
 
     def decide(self, request: OpenAIDecisionRequest) -> OpenAIDecisionResult:

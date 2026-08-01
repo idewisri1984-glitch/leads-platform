@@ -216,6 +216,13 @@ class _OpenAIDecisionWireResult(BaseModel):
     next_action_description: _WireString1000 | None
     human_review_required: Literal[True]
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def validate_exact_confidence(cls, value: object) -> object:
+        if type(value) is not float:
+            raise ValueError("Wire confidence must be an exact float.")
+        return value
+
     @field_validator("rationale", "next_action_title", "next_action_description")
     @classmethod
     def reject_blank_wire_strings(cls, value: str | None) -> str | None:

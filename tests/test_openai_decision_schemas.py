@@ -1,4 +1,4 @@
-from types import MappingProxyType
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -11,6 +11,7 @@ from app.providers.openai_decision import (
     OpenAIDecisionRequest,
     OpenAIDecisionResult,
 )
+from app.providers.openai_decision.schemas import _OpenAIDecisionWireResult
 
 
 def candidate(index: int = 1, **changes: object) -> OpenAIDecisionCandidate:
@@ -53,6 +54,20 @@ def no_selection_result(**changes: object) -> OpenAIDecisionResult:
         "human_review_required": True,
     }
     return OpenAIDecisionResult(**(values | changes))
+
+
+def wire_result(**changes: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "decision": "SELECT",
+        "selected_candidate_index": 1,
+        "confidence": 0.5,
+        "company_fit": "HIGH",
+        "rationale": "Strong public evidence.",
+        "next_action_title": "Review candidate",
+        "next_action_description": "Confirm before CRM processing.",
+        "human_review_required": True,
+    }
+    return values | changes
 
 
 def test_exact_public_exports_and_enums() -> None:
@@ -239,5 +254,48 @@ def test_no_selection_invariants(changes: dict[str, object]) -> None:
         no_selection_result(**changes)
 
 
-def test_models_have_immutable_field_mappings() -> None:
-    assert isinstance(MappingProxyType(dict(OpenAIDecisionResult.model_fields)), MappingProxyType)
+class FloatSubclass(float):
+    pass
+
+
+@pytest.mark.parametrize(
+    "value",
+    [1, 0, True, IntSubclass(1), FloatSubclass(0.5), "0.5", Decimal("0.5"), None, object()],
+)
+def test_wire_confidence_requires_exact_float_during_direct_construction(value: object) -> None:
+    with pytest.raises(ValidationError):
+        _OpenAIDecisionWireResult(**wire_result(confidence=value))
+
+
+@pytest.mark.parametrize("value", [0.0, 0.5, 1.0])
+def test_wire_confidence_accepts_builtin_float_during_direct_construction(value: float) -> None:
+    assert _OpenAIDecisionWireResult(**wire_result(confidence=value)).confidence == value
+
+
+@pytest.mark.parametrize("value", [0, 1, True, FloatSubclass(0.5), "0.5", Decimal("0.5")])
+def test_wire_confidence_requires_exact_float_during_model_validation(value: object) -> None:
+    with pytest.raises(ValidationError):
+        _OpenAIDecisionWireResult.model_validate(wire_result(confidence=value))
+
+
+@pytest.mark.parametrize("value", [0.0, 0.25, 1.0])
+def test_wire_confidence_accepts_builtin_float_during_model_validation(value: float) -> None:
+    assert (
+        _OpenAIDecisionWireResult.model_validate(wire_result(confidence=value)).confidence == value
+    )
+
+
+def test_frozen_models_reject_assignment_and_preserve_original_values() -> None:
+    item = candidate()
+    request = OpenAIDecisionRequest(goal="Find a fit", candidates=(item,))
+    result = select_result()
+
+    for model, field, replacement in (
+        (item, "name", "Changed"),
+        (request, "candidates", (candidate(), candidate(2))),
+        (result, "confidence", 0.1),
+    ):
+        original = getattr(model, field)
+        with pytest.raises(ValidationError):
+            setattr(model, field, replacement)
+        assert getattr(model, field) == original

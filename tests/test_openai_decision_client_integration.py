@@ -176,6 +176,29 @@ def test_real_sdk_transport_timeout_has_zero_retries() -> None:
     assert calls == 1
 
 
+def test_real_sdk_rejects_integer_confidence_without_retry_or_disclosure() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST" and request.url.path == "/v1/responses"
+        return httpx.Response(
+            200,
+            json=response_payload(SELECT | {"confidence": 1}),
+            request=request,
+        )
+
+    with pytest.raises(
+        OpenAIDecisionResponseError, match=r"^OpenAI decision response was invalid\.$"
+    ) as raised:
+        wrapper(handler).decide(decision_request())
+
+    assert len(requests) == 1
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "confidence" not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     "payload,error",
     [
