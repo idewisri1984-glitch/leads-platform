@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,10 +40,49 @@ class Settings(BaseSettings):
         alias="SERPAPI_TIMEOUT_SECONDS",
     )
 
+    openai_api_key: str | None = Field(
+        default=None,
+        alias="OPENAI_API_KEY",
+        repr=False,
+    )
+
+    openai_model: str | None = Field(
+        default=None,
+        alias="OPENAI_MODEL",
+    )
+
+    openai_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=120,
+        alias="OPENAI_TIMEOUT_SECONDS",
+    )
+
+    openai_max_output_tokens: int = Field(
+        default=600,
+        ge=100,
+        le=2000,
+        alias="OPENAI_MAX_OUTPUT_TOKENS",
+    )
+
     debug: bool = Field(
         default=False,
         alias="DEBUG",
     )
+
+    @field_validator("openai_timeout_seconds", mode="before")
+    @classmethod
+    def reject_boolean_openai_timeout(cls, value: object) -> object:
+        if type(value) is bool:
+            raise ValueError("OpenAI timeout must be numeric.")
+        return value
+
+    @field_validator("openai_max_output_tokens", mode="before")
+    @classmethod
+    def reject_non_integer_openai_tokens(cls, value: object) -> object:
+        if type(value) not in {int, str}:
+            raise ValueError("OpenAI maximum output tokens must be an integer.")
+        return value
 
 
 @lru_cache
