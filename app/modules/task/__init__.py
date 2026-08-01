@@ -24,6 +24,17 @@ from app.modules.task.repository import (
 )
 from app.modules.task.schemas import TaskCreate, TaskRead
 from app.modules.task.service import TaskService
+from app.modules.task.work_queue import (
+    TaskWorkQueueConsistencyError,
+    TaskWorkQueueError,
+    TaskWorkQueueInvalidDataError,
+    TaskWorkQueueService,
+)
+from app.modules.task.work_queue_schemas import (
+    TaskWorkQueueBucket,
+    TaskWorkQueueItem,
+    TaskWorkQueueResult,
+)
 
 __all__ = [
     "LeadTaskCreationConsistencyError",
@@ -48,4 +59,11 @@ __all__ = [
     "TaskRepository",
     "TaskService",
     "TaskStatusTransitionResult",
+    "TaskWorkQueueBucket",
+    "TaskWorkQueueConsistencyError",
+    "TaskWorkQueueError",
+    "TaskWorkQueueInvalidDataError",
+    "TaskWorkQueueItem",
+    "TaskWorkQueueResult",
+    "TaskWorkQueueService",
 ]

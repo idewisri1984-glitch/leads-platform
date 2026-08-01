@@ -172,6 +172,7 @@ def test_command_group_and_help_contract_are_exact() -> None:
         "start",
         "complete",
         "cancel",
+        "queue",
     }
     result = runner.invoke(root_app, ["task", "create-for-lead", "--help"])
     assert result.exit_code == 0

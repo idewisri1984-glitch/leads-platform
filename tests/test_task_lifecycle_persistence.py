@@ -176,6 +176,13 @@ def test_public_exports_preserve_existing_symbols_and_add_only_public_contract()
         "TaskLifecycleRepositoryNotFoundError",
         "TaskLifecycleRepositoryTransitionError",
         "TaskStatusTransitionResult",
+        "TaskWorkQueueBucket",
+        "TaskWorkQueueConsistencyError",
+        "TaskWorkQueueError",
+        "TaskWorkQueueInvalidDataError",
+        "TaskWorkQueueItem",
+        "TaskWorkQueueResult",
+        "TaskWorkQueueService",
     }
     assert set(task_module.__all__) == expected_existing | expected_new
     assert not hasattr(task_module, "_normalize_persisted_task_status")

@@ -1,11 +1,12 @@
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.modules.lead.models import Lead
 from app.modules.task.models import Task, TaskLifecycleStatus
+from app.modules.task.work_queue import TaskWorkQueueRecord
 
 _INVALID_LIFECYCLE_DATA = "Task lifecycle data is invalid."
 _TASK_NOT_FOUND = "Task was not found."
@@ -168,6 +169,50 @@ class TaskRepository:
             current_status=target_status,
             changed=changed,
         )
+
+    def list_work_queue_for_company(
+        self,
+        company_id: int,
+        as_of: datetime,
+        upcoming_until: datetime,
+    ) -> list[TaskWorkQueueRecord]:
+        if (
+            type(company_id) is not int
+            or company_id <= 0
+            or type(as_of) is not datetime
+            or as_of.tzinfo is not None
+            or type(upcoming_until) is not datetime
+            or upcoming_until.tzinfo is not None
+            or upcoming_until <= as_of
+        ):
+            raise ValueError("Task work queue data is invalid.")
+
+        statement = (
+            select(Task.id, Task.lead_id, Task.title, Task.status, Task.due_at)
+            .join(Lead, Task.lead_id == Lead.id)
+            .where(
+                Lead.company_id == company_id,
+                Task.status.in_(
+                    (
+                        TaskLifecycleStatus.TODO.value,
+                        TaskLifecycleStatus.IN_PROGRESS.value,
+                    )
+                ),
+                or_(Task.due_at.is_(None), Task.due_at <= upcoming_until),
+            )
+            .order_by(Task.id)
+        )
+        rows = self.session.execute(statement).all()
+        return [
+            TaskWorkQueueRecord(
+                task_id=row.id,
+                lead_id=row.lead_id,
+                title=row.title,
+                status=row.status,
+                due_at=row.due_at,
+            )
+            for row in rows
+        ]
 
     def get(self, task_id: int) -> Task | None:
         statement = select(Task).where(Task.id == task_id)
