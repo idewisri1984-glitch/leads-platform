@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -15,6 +16,32 @@ from app.modules.task.models import Task
 from app.modules.task.repository import TaskRepository
 
 AS_OF = datetime(2026, 7, 31, 9)
+
+
+def mapped_scalar_snapshot(instance: object) -> tuple[tuple[str, object], ...]:
+    mapper = sqlalchemy_inspect(type(instance))
+    keys = tuple(attribute.key for attribute in mapper.column_attrs)
+    return tuple((key, getattr(instance, key)) for key in keys)
+
+
+def domain_snapshot(session: Session) -> dict[str, tuple[tuple[tuple[str, object], ...], ...]]:
+    return {
+        "projects": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Project).order_by(Project.id)
+        ),
+        "companies": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Company).order_by(Company.id)
+        ),
+        "contacts": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Contact).order_by(Contact.id)
+        ),
+        "leads": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Lead).order_by(Lead.id)
+        ),
+        "tasks": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Task).order_by(Task.id)
+        ),
+    }
 
 
 class CountingSession(Session):
@@ -289,8 +316,14 @@ def test_full_domain_immutability_and_read_only_sql(session: CountingSession) ->
         company=company,
         first_name="Queue",
         last_name="Contact",
+        job_title="Queue reviewer",
         email="queue@example.test",
         phone="+62123456789",
+        linkedin_url="https://www.linkedin.com/in/queue-contact",
+        country="ID",
+        city="Denpasar",
+        source="manual-review",
+        external_id="queue-contact-1",
         status="ACTIVE",
         notes="contact notes",
     )
@@ -310,32 +343,9 @@ def test_full_domain_immutability_and_read_only_sql(session: CountingSession) ->
     )
     session.add(project)
     session.commit()
-    before = {
-        "project": (project.id, project.name),
-        "company": (
-            company.id,
-            company.project_id,
-            company.name,
-            company.website,
-            company.country,
-            company.city,
-            company.industry,
-            company.status,
-            company.notes,
-        ),
-        "contact": (
-            contact.id,
-            contact.company_id,
-            contact.first_name,
-            contact.last_name,
-            contact.email,
-            contact.phone,
-            contact.status,
-            contact.notes,
-        ),
-        "lead": (lead.id, lead.company_id, lead.contact_id, lead.status, lead.source, lead.notes),
-        "task": (task.id, task.lead_id, task.title, task.description, task.status, task.due_at),
-    }
+    before = domain_snapshot(session)
+    before_counts = {name: len(rows) for name, rows in before.items()}
+    task_id = task.id
     statements: list[str] = []
     engine = session.get_bind()
 
@@ -356,34 +366,11 @@ def test_full_domain_immutability_and_read_only_sql(session: CountingSession) ->
         result = TaskWorkQueueService(TaskRepository(session)).get_queue(company_id, AS_OF)
     finally:
         event.remove(engine, "before_cursor_execute", capture_sql)
-    assert [item.task_id for item in result.items] == [task.id]
-    after = {
-        "project": (project.id, project.name),
-        "company": (
-            company.id,
-            company.project_id,
-            company.name,
-            company.website,
-            company.country,
-            company.city,
-            company.industry,
-            company.status,
-            company.notes,
-        ),
-        "contact": (
-            contact.id,
-            contact.company_id,
-            contact.first_name,
-            contact.last_name,
-            contact.email,
-            contact.phone,
-            contact.status,
-            contact.notes,
-        ),
-        "lead": (lead.id, lead.company_id, lead.contact_id, lead.status, lead.source, lead.notes),
-        "task": (task.id, task.lead_id, task.title, task.description, task.status, task.due_at),
-    }
+    assert [item.task_id for item in result.items] == [task_id]
+    with Session(engine) as verification_session:
+        after = domain_snapshot(verification_session)
     assert after == before
+    assert {name: len(rows) for name, rows in after.items()} == before_counts
     assert len(statements) == 1
     sql = statements[0].upper()
     assert sql.lstrip().startswith("SELECT")

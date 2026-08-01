@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import httpx
 import pytest
 from sqlalchemy import create_engine, event
+from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from typer.testing import CliRunner
@@ -29,6 +30,32 @@ from app.providers.serpapi.client import SerpApiClient
 
 runner = CliRunner()
 AS_OF = datetime(2026, 7, 31, 9)
+
+
+def mapped_scalar_snapshot(instance: object) -> tuple[tuple[str, object], ...]:
+    mapper = sqlalchemy_inspect(type(instance))
+    keys = tuple(attribute.key for attribute in mapper.column_attrs)
+    return tuple((key, getattr(instance, key)) for key in keys)
+
+
+def domain_snapshot(session: Session) -> dict[str, tuple[tuple[tuple[str, object], ...], ...]]:
+    return {
+        "projects": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Project).order_by(Project.id)
+        ),
+        "companies": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Company).order_by(Company.id)
+        ),
+        "contacts": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Contact).order_by(Contact.id)
+        ),
+        "leads": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Lead).order_by(Lead.id)
+        ),
+        "tasks": tuple(
+            mapped_scalar_snapshot(value) for value in session.query(Task).order_by(Task.id)
+        ),
+    }
 
 
 @pytest.fixture
@@ -165,12 +192,29 @@ def test_real_queue_succeeds_with_all_runtime_boundary_guards(
     with Session(engine) as session:  # type: ignore[arg-type]
         company = session.get(Company, company_id)
         assert company is not None
+        company.website = "https://guarded.example.test"
+        company.country = "ID"
+        company.city = "Ubud"
+        company.industry = "Hospitality"
+        company.status = "ACTIVE"
+        company.notes = "guarded company notes"
         lead = session.query(Lead).filter(Lead.company_id == company_id).one()
+        lead.source = "guarded-review"
+        lead.notes = "guarded lead notes"
         contact = Contact(
             company=company,
             first_name="Guarded",
+            last_name="Contact",
+            job_title="Buyer",
             email="guarded@example.test",
+            phone="+62123450000",
+            linkedin_url="https://www.linkedin.com/in/guarded-contact",
+            country="ID",
+            city="Ubud",
+            source="manual-review",
+            external_id="guarded-contact-1",
             status="ACTIVE",
+            notes="guarded contact notes",
         )
         lead.contact = contact
         session.add(contact)
@@ -179,20 +223,8 @@ def test_real_queue_succeeds_with_all_runtime_boundary_guards(
             (task.id, task.lead_id, task.title, task.description, task.status, task.due_at)
             for task in session.query(Task).order_by(Task.id)
         ]
-        before_domain = (
-            company.id,
-            company.project_id,
-            company.name,
-            contact.id,
-            contact.company_id,
-            contact.first_name,
-            lead.id,
-            lead.company_id,
-            lead.contact_id,
-            lead.status,
-            lead.source,
-            lead.notes,
-        )
+        before_domain = domain_snapshot(session)
+        before_counts = {name: len(rows) for name, rows in before_domain.items()}
 
     def forbidden(category: str):  # type: ignore[no-untyped-def]
         def fail(*_args: object, **_kwargs: object) -> None:
@@ -241,23 +273,7 @@ def test_real_queue_succeeds_with_all_runtime_boundary_guards(
             (task.id, task.lead_id, task.title, task.description, task.status, task.due_at)
             for task in session.query(Task).order_by(Task.id)
         ]
-        company = session.get(Company, company_id)
-        contact = session.query(Contact).filter(Contact.company_id == company_id).one()
-        lead = session.query(Lead).filter(Lead.company_id == company_id).one()
-        assert company is not None
-        after_domain = (
-            company.id,
-            company.project_id,
-            company.name,
-            contact.id,
-            contact.company_id,
-            contact.first_name,
-            lead.id,
-            lead.company_id,
-            lead.contact_id,
-            lead.status,
-            lead.source,
-            lead.notes,
-        )
+        after_domain = domain_snapshot(session)
     assert after_tasks == before_tasks
     assert after_domain == before_domain
+    assert {name: len(rows) for name, rows in after_domain.items()} == before_counts

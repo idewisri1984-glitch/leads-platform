@@ -445,6 +445,7 @@ def test_safe_item_rejects_raw_and_unrelated_enum_values(
     "items",
     [
         [],
+        ListSubclass([item()]),
         set(),
         frozenset(),
         (item for item in ()),
@@ -454,17 +455,26 @@ def test_safe_item_rejects_raw_and_unrelated_enum_values(
         None,
     ],
 )
-def test_safe_result_accepts_only_exact_tuple(items: object) -> None:
+@pytest.mark.parametrize("validation", ["direct", "model_validate"])
+def test_safe_result_accepts_only_exact_tuple(items: object, validation: str) -> None:
+    before_type = type(items)
+    before_repr = repr(items)
+    values = {
+        "company_id": 3,
+        "as_of": AS_OF,
+        "upcoming_until": AS_OF + timedelta(days=7),
+        "overdue_count": 0,
+        "upcoming_count": 0,
+        "unscheduled_count": 0,
+        "items": items,
+    }
     with pytest.raises(ValidationError):
-        TaskWorkQueueResult(
-            company_id=3,
-            as_of=AS_OF,
-            upcoming_until=AS_OF + timedelta(days=7),
-            overdue_count=0,
-            upcoming_count=0,
-            unscheduled_count=0,
-            items=cast(tuple[TaskWorkQueueItem, ...], items),
-        )
+        if validation == "direct":
+            TaskWorkQueueResult(**values)  # type: ignore[arg-type]
+        else:
+            TaskWorkQueueResult.model_validate(values)
+    assert type(items) is before_type
+    assert repr(items) == before_repr
 
 
 @pytest.mark.parametrize(
