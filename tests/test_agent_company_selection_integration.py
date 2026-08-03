@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database.base import Base
 from app.modules.agent import (
+    AgentCompanySelectionInvalidDataError,
     AgentCompanySelectionNoCandidatesError,
     AgentCompanySelectionRunNotFoundError,
     AgentCompanySelectionRunNotReadyError,
@@ -288,3 +289,109 @@ def test_real_sqlite_cross_project_run_is_not_disclosed(session: Session) -> Non
         AgentCompanySelectionService(cast(AgentCompanySelectionRepository, repository)).prepare(
             project_id=second.id, run_id=run.id, goal="Choose"
         )
+
+
+def test_corrective_oversized_persisted_values_are_rejected_without_session_mutation(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, profile = project_and_profile(session, "Oversized")
+    repository = CompanyDiscoveryStagingRepository(session)
+    oversized_run = create_run(
+        repository,
+        project,
+        profile,
+        CompanyDiscoveryRunStatus.SUCCEEDED,
+    )
+    oversized_candidates = [
+        create_candidate(repository, project.id, oversized_run.id, number, position=number)
+        for number in range(1, 6)
+    ]
+    for candidate in oversized_candidates:
+        candidate.website = "\x01" * 700
+
+    ordinary_run = create_run(
+        repository,
+        project,
+        profile,
+        CompanyDiscoveryRunStatus.SUCCEEDED,
+    )
+    ordinary_candidate = create_candidate(
+        repository,
+        project.id,
+        ordinary_run.id,
+        99,
+        position=1,
+    )
+    session.commit()
+
+    run_snapshot = {
+        row.id: (str(row.run_status), row.candidate_count, row.updated_at.replace(tzinfo=None))
+        for row in session.scalars(select(CompanyDiscoveryRun))
+    }
+    candidate_snapshot = {
+        row.id: (
+            row.name,
+            row.website,
+            str(row.candidate_status),
+            row.last_seen_run_id,
+            row.promoted_company_id,
+        )
+        for row in session.scalars(select(CompanyDiscoveryCandidate))
+    }
+    install_network_guards(monkeypatch)
+    selection_service = AgentCompanySelectionService(
+        cast(AgentCompanySelectionRepository, repository)
+    )
+
+    with pytest.raises(
+        AgentCompanySelectionInvalidDataError,
+        match="^Agent company selection data is invalid\\.$",
+    ):
+        selection_service.prepare(
+            project_id=project.id,
+            run_id=oversized_run.id,
+            goal="Choose",
+            max_candidates=5,
+        )
+
+    ordinary_selection = selection_service.prepare(
+        project_id=project.id,
+        run_id=ordinary_run.id,
+        goal="Choose",
+        max_candidates=5,
+    )
+    assert (
+        selection_service.resolve_selected_candidate_id(
+            ordinary_selection,
+            select_decision(1),
+        )
+        == ordinary_candidate.id
+    )
+
+    session.rollback()
+    session.commit()
+    bind = session.get_bind()
+    with Session(bind, expire_on_commit=False) as verification:
+        assert {
+            row.id: (
+                str(row.run_status),
+                row.candidate_count,
+                row.updated_at.replace(tzinfo=None),
+            )
+            for row in verification.scalars(select(CompanyDiscoveryRun))
+        } == run_snapshot
+        assert {
+            row.id: (
+                row.name,
+                row.website,
+                str(row.candidate_status),
+                row.last_seen_run_id,
+                row.promoted_company_id,
+            )
+            for row in verification.scalars(select(CompanyDiscoveryCandidate))
+        } == candidate_snapshot
+        assert verification.scalar(select(func.count()).select_from(Company)) == 0
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+        assert verification.scalar(select(func.count()).select_from(Lead)) == 0
+        assert verification.scalar(select(func.count()).select_from(Task)) == 0

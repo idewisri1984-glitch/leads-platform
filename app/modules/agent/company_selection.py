@@ -1,5 +1,6 @@
-from collections.abc import Sequence
-from contextlib import suppress
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Protocol, cast
 
 from pydantic import ValidationError
@@ -70,6 +71,30 @@ class AgentCompanySelectionCandidateRecord(Protocol):
     promoted_company_id: object
 
 
+@dataclass(frozen=True, slots=True)
+class _RunSnapshot:
+    id: object
+    project_id: object
+    run_status: object
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateSnapshot:
+    id: object
+    project_id: object
+    last_seen_run_id: object
+    name: object
+    website: object
+    country_code: object
+    identity_key: object
+    best_position: object
+    candidate_status: object
+    promoted_company_id: object
+
+
+_MAX_OPENAI_REQUEST_BYTES = 20_000
+
+
 class AgentCompanySelectionRepository(Protocol):
     def get_run(self, run_id: int) -> AgentCompanySelectionRunRecord | None: ...
 
@@ -99,7 +124,8 @@ class AgentCompanySelectionService:
         run = self.repository.get_run(run_id)
         if run is None:
             raise AgentCompanySelectionRunNotFoundError(_RUN_NOT_FOUND_MESSAGE)
-        run_status = self._validate_run(run, project_id, run_id)
+        run_snapshot = self._snapshot_run(run)
+        run_status = self._validate_run(run_snapshot, project_id, run_id)
         if run_status is CompanyDiscoveryRunStatus.NOT_FOUND:
             raise AgentCompanySelectionNoCandidatesError(_NO_CANDIDATES_MESSAGE)
         if run_status in (CompanyDiscoveryRunStatus.PENDING, CompanyDiscoveryRunStatus.FAILED):
@@ -111,13 +137,20 @@ class AgentCompanySelectionService:
             max_candidates,
             CompanyDiscoveryCandidateStatus.DISCOVERED,
         )
-        validated = self._validate_candidates(candidates, project_id, run_id, max_candidates)
+        candidate_snapshots = self._snapshot_candidate_collection(candidates)
+        validated = self._validate_candidates(
+            candidate_snapshots,
+            project_id,
+            run_id,
+            max_candidates,
+        )
         if not validated:
             raise AgentCompanySelectionNoCandidatesError(_NO_CANDIDATES_MESSAGE)
 
         ordered = sorted(validated, key=self._candidate_sort_key)[:max_candidates]
         openai_candidates: list[OpenAIDecisionCandidate] = []
         bindings: list[AgentCompanySelectionBinding] = []
+        request: OpenAIDecisionRequest | None = None
         construction_failed = False
         try:
             for index, candidate in enumerate(ordered, start=1):
@@ -140,6 +173,23 @@ class AgentCompanySelectionService:
                     )
                 )
             request = OpenAIDecisionRequest(goal=goal, candidates=tuple(openai_candidates))
+        except (TypeError, ValueError, ValidationError):
+            construction_failed = True
+        if construction_failed or request is None:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+
+        serialized_request = json.dumps(
+            request.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(serialized_request.encode("utf-8")) > _MAX_OPENAI_REQUEST_BYTES:
+            raise AgentCompanySelectionInvalidDataError(_INVALID_DATA_MESSAGE)
+
+        result: AgentCompanySelectionInput | None = None
+        input_construction_failed = False
+        try:
             result = AgentCompanySelectionInput(
                 project_id=project_id,
                 run_id=run_id,
@@ -147,8 +197,8 @@ class AgentCompanySelectionService:
                 bindings=tuple(bindings),
             )
         except (TypeError, ValueError, ValidationError):
-            construction_failed = True
-        if construction_failed:
+            input_construction_failed = True
+        if input_construction_failed or result is None:
             raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
         return result
 
@@ -163,28 +213,8 @@ class AgentCompanySelectionService:
         ):
             raise AgentCompanySelectionInvalidDataError(_INVALID_DATA_MESSAGE)
 
-        validation_failed = False
-        try:
-            validated_selection = AgentCompanySelectionInput(
-                project_id=selection.project_id,
-                run_id=selection.run_id,
-                request=selection.request,
-                bindings=selection.bindings,
-            )
-            validated_decision = OpenAIDecisionResult(
-                decision=decision.decision,
-                selected_candidate_index=decision.selected_candidate_index,
-                confidence=decision.confidence,
-                company_fit=decision.company_fit,
-                rationale=decision.rationale,
-                next_action_title=decision.next_action_title,
-                next_action_description=decision.next_action_description,
-                human_review_required=decision.human_review_required,
-            )
-        except (AttributeError, TypeError, ValueError, ValidationError):
-            validation_failed = True
-        if validation_failed:
-            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        validated_selection = self._deep_validate_selection(selection)
+        validated_decision = self._deep_validate_decision(decision)
 
         if validated_decision.decision is OpenAIDecisionKind.NO_SELECTION:
             return None
@@ -219,10 +249,25 @@ class AgentCompanySelectionService:
         ):
             raise AgentCompanySelectionInvalidDataError(_INVALID_DATA_MESSAGE)
 
+    @staticmethod
+    def _snapshot_run(run: AgentCompanySelectionRunRecord) -> _RunSnapshot:
+        snapshot_failed = False
+        try:
+            snapshot = _RunSnapshot(
+                id=run.id,
+                project_id=run.project_id,
+                run_status=run.run_status,
+            )
+        except AttributeError:
+            snapshot_failed = True
+        if snapshot_failed:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        return snapshot
+
     @classmethod
     def _validate_run(
         cls,
-        run: AgentCompanySelectionRunRecord,
+        run: _RunSnapshot,
         project_id: int,
         run_id: int,
     ) -> CompanyDiscoveryRunStatus:
@@ -257,51 +302,70 @@ class AgentCompanySelectionService:
     @classmethod
     def _validate_candidates(
         cls,
-        candidates: object,
+        candidates: tuple[_CandidateSnapshot, ...],
         project_id: int,
         run_id: int,
         max_candidates: int,
-    ) -> list[AgentCompanySelectionCandidateRecord]:
-        if isinstance(candidates, str | bytes | bytearray) or not isinstance(candidates, Sequence):
-            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+    ) -> list[_CandidateSnapshot]:
         if len(candidates) > max_candidates:
             raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
 
-        validated: list[AgentCompanySelectionCandidateRecord] = []
+        validated: list[_CandidateSnapshot] = []
         candidate_ids: set[int] = set()
         identity_keys: set[str] = set()
         for candidate in candidates:
             cls._validate_candidate(candidate, project_id, run_id)
-            if candidate.id in candidate_ids or candidate.identity_key in identity_keys:
+            candidate_id = cast(int, candidate.id)
+            identity_key = cast(str, candidate.identity_key)
+            if candidate_id in candidate_ids or identity_key in identity_keys:
                 raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
-            candidate_ids.add(candidate.id)
-            identity_keys.add(candidate.identity_key)
+            candidate_ids.add(candidate_id)
+            identity_keys.add(identity_key)
             validated.append(candidate)
         return validated
 
     @classmethod
+    def _snapshot_candidate_collection(
+        cls,
+        candidates: object,
+    ) -> tuple[_CandidateSnapshot, ...]:
+        if isinstance(candidates, str | bytes | bytearray | Mapping) or not isinstance(
+            candidates, Sequence
+        ):
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        records = tuple(candidates)
+        return tuple(cls._snapshot_candidate(candidate) for candidate in records)
+
+    @staticmethod
+    def _snapshot_candidate(candidate: object) -> _CandidateSnapshot:
+        snapshot_failed = False
+        try:
+            record = cast(AgentCompanySelectionCandidateRecord, candidate)
+            snapshot = _CandidateSnapshot(
+                id=record.id,
+                project_id=record.project_id,
+                last_seen_run_id=record.last_seen_run_id,
+                name=record.name,
+                website=record.website,
+                country_code=record.country_code,
+                identity_key=record.identity_key,
+                best_position=record.best_position,
+                candidate_status=record.candidate_status,
+                promoted_company_id=record.promoted_company_id,
+            )
+        except AttributeError:
+            snapshot_failed = True
+        if snapshot_failed:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        return snapshot
+
+    @classmethod
     def _validate_candidate(
         cls,
-        candidate: AgentCompanySelectionCandidateRecord,
+        candidate: _CandidateSnapshot,
         project_id: int,
         run_id: int,
     ) -> None:
-        candidate_values: tuple[object, ...] | None = None
-        with suppress(AttributeError):
-            candidate_values = (
-                candidate.id,
-                candidate.project_id,
-                candidate.last_seen_run_id,
-                candidate.name,
-                candidate.website,
-                candidate.country_code,
-                candidate.identity_key,
-                candidate.best_position,
-                candidate.candidate_status,
-                candidate.promoted_company_id,
-            )
-        if candidate_values is None:
-            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
         (
             candidate_id,
             candidate_project_id,
@@ -313,7 +377,18 @@ class AgentCompanySelectionService:
             best_position,
             candidate_status,
             promoted_company_id,
-        ) = candidate_values
+        ) = (
+            candidate.id,
+            candidate.project_id,
+            candidate.last_seen_run_id,
+            candidate.name,
+            candidate.website,
+            candidate.country_code,
+            candidate.identity_key,
+            candidate.best_position,
+            candidate.candidate_status,
+            candidate.promoted_company_id,
+        )
 
         valid_country = country_code is None or (
             type(country_code) is str
@@ -372,7 +447,7 @@ class AgentCompanySelectionService:
 
     @staticmethod
     def _candidate_sort_key(
-        candidate: AgentCompanySelectionCandidateRecord,
+        candidate: _CandidateSnapshot,
     ) -> tuple[bool, int, str, int]:
         position = cast(int | None, candidate.best_position)
         return (
@@ -381,3 +456,85 @@ class AgentCompanySelectionService:
             cast(str, candidate.identity_key),
             cast(int, candidate.id),
         )
+
+    @staticmethod
+    def _deep_validate_selection(
+        selection: AgentCompanySelectionInput,
+    ) -> AgentCompanySelectionInput:
+        validation_failed = False
+        try:
+            project_id = selection.project_id
+            run_id = selection.run_id
+            request = selection.request
+            bindings = selection.bindings
+            if type(request) is not OpenAIDecisionRequest or type(bindings) is not tuple:
+                raise TypeError
+
+            goal = request.goal
+            request_candidates = request.candidates
+            if type(request_candidates) is not tuple:
+                raise TypeError
+            validated_candidates: list[OpenAIDecisionCandidate] = []
+            for candidate in request_candidates:
+                if type(candidate) is not OpenAIDecisionCandidate:
+                    raise TypeError
+                validated_candidates.append(
+                    OpenAIDecisionCandidate(
+                        index=candidate.index,
+                        name=candidate.name,
+                        website=candidate.website,
+                        country=candidate.country,
+                        city=candidate.city,
+                        industry=candidate.industry,
+                        snippet=candidate.snippet,
+                        website_summary=candidate.website_summary,
+                    )
+                )
+            validated_request = OpenAIDecisionRequest(
+                goal=goal,
+                candidates=tuple(validated_candidates),
+            )
+
+            validated_bindings: list[AgentCompanySelectionBinding] = []
+            for binding in bindings:
+                if type(binding) is not AgentCompanySelectionBinding:
+                    raise TypeError
+                validated_bindings.append(
+                    AgentCompanySelectionBinding(
+                        index=binding.index,
+                        candidate_id=binding.candidate_id,
+                    )
+                )
+            validated = AgentCompanySelectionInput(
+                project_id=project_id,
+                run_id=run_id,
+                request=validated_request,
+                bindings=tuple(validated_bindings),
+            )
+        except (AttributeError, TypeError, ValueError, ValidationError):
+            validation_failed = True
+        if validation_failed:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        return validated
+
+    @staticmethod
+    def _deep_validate_decision(
+        decision: OpenAIDecisionResult,
+    ) -> OpenAIDecisionResult:
+        validation_failed = False
+        try:
+            validated = OpenAIDecisionResult(
+                decision=decision.decision,
+                selected_candidate_index=decision.selected_candidate_index,
+                confidence=decision.confidence,
+                company_fit=decision.company_fit,
+                rationale=decision.rationale,
+                next_action_title=decision.next_action_title,
+                next_action_description=decision.next_action_description,
+                human_review_required=decision.human_review_required,
+            )
+        except (AttributeError, TypeError, ValueError, ValidationError):
+            validation_failed = True
+        if validation_failed:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        return validated
