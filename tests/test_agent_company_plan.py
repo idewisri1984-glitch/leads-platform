@@ -1,3 +1,4 @@
+import traceback
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import cast
@@ -286,6 +287,22 @@ class Selection:
                 )
                 for binding in selection.bindings
             ),
+        )
+
+
+@dataclass
+class ControlledSelection(Selection):
+    project_id: object = 3
+    run_id: object = 13
+
+    def prepare(self, **kwargs: object) -> AgentCompanySelectionInput:
+        prepared = super().prepare(**kwargs)
+        request = prepared.request.model_copy(update={"goal": "sensitive-selection-sentinel"})
+        return AgentCompanySelectionInput.model_construct(
+            project_id=self.project_id,
+            run_id=self.run_id,
+            request=request,
+            bindings=prepared.bindings,
         )
 
 
@@ -580,3 +597,93 @@ def test_malformed_selection_prevents_decision_factory_and_call() -> None:
     assert caught.value.__cause__ is caught.value.__context__ is None
     assert events == ["commit", "prepare", "revalidate"]
     assert factory_calls == decision.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("foreign_project_id", "foreign_run_id"),
+    [(991, 13), (3, 992), (991, 992)],
+)
+def test_foreign_deeply_valid_selection_is_rejected_before_decision_and_binding(
+    foreign_project_id: int,
+    foreign_run_id: int,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, _, decision, events = make_service()
+    factory_calls = 0
+
+    def factory() -> DecisionBoundary:
+        nonlocal factory_calls
+        factory_calls += 1
+        return decision
+
+    service.selection = cast(
+        SelectionBoundary,
+        ControlledSelection(events, project_id=foreign_project_id, run_id=foreign_run_id),
+    )
+    service.decision_factory = factory
+
+    with pytest.raises(AgentCompanyPlanSelectionError) as caught:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    rendered = "".join(traceback.format_exception(caught.value))
+    captured = capsys.readouterr()
+    assert str(caught.value) == "Agent company selection failed."
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert events == ["commit", "prepare", "revalidate"]
+    assert factory_calls == decision.calls == 0
+    assert captured.out == captured.err == ""
+    assert caplog.records == []
+    for forbidden in ("991", "992", "sensitive-selection-sentinel"):
+        assert forbidden not in str(caught.value)
+        assert forbidden not in repr(caught.value)
+        assert forbidden not in rendered
+
+
+@pytest.mark.parametrize(
+    ("project_id", "run_id"),
+    [(0, 13), (True, 13), ("3", 13), (3, 0), (3, True), (3, "13")],
+)
+def test_malformed_selection_scope_is_rejected_by_deep_revalidation(
+    project_id: object,
+    run_id: object,
+) -> None:
+    service, _, decision, events = make_service()
+    factory_calls = 0
+
+    def factory() -> DecisionBoundary:
+        nonlocal factory_calls
+        factory_calls += 1
+        return decision
+
+    service.selection = cast(
+        SelectionBoundary,
+        ControlledSelection(events, project_id=project_id, run_id=run_id),
+    )
+    service.decision_factory = factory
+
+    with pytest.raises(AgentCompanyPlanSelectionError, match="^Agent company selection failed\\.$"):
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert events == ["commit", "prepare", "revalidate"]
+    assert factory_calls == decision.calls == 0
+
+
+def test_valid_matching_no_selection_constructs_decision_and_resolves_once() -> None:
+    service, _, decision, events = make_service()
+    decision.value = OpenAIDecisionResult(
+        decision=OpenAIDecisionKind.NO_SELECTION,
+        selected_candidate_index=None,
+        confidence=0.9,
+        company_fit=OpenAICompanyFit.NOT_SUITABLE,
+        rationale="No suitable company",
+        next_action_title=None,
+        next_action_description=None,
+        human_review_required=True,
+    )
+
+    result = service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert events == ["commit", "prepare", "revalidate", "factory", "decide", "resolve"]
+    assert decision.calls == result.openai_call_count == 1
+    assert result.selected_candidate_id is result.selected_candidate_index is None

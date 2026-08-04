@@ -10,9 +10,12 @@ from app.core.database.base import Base
 from app.modules.agent import (
     AgentCompanyPlanDecisionError,
     AgentCompanyPlanInput,
+    AgentCompanyPlanSelectionError,
     AgentCompanyPlanService,
+    AgentCompanySelectionInput,
     AgentCompanySelectionService,
 )
+from app.modules.agent.company_plan import DecisionBoundary, SelectionBoundary
 from app.modules.agent.company_selection import AgentCompanySelectionRepository
 from app.modules.company.models import Company
 from app.modules.company_discovery.models import (
@@ -145,6 +148,54 @@ class Decision:
         )
 
 
+class ForeignSelection:
+    def __init__(
+        self,
+        delegate: AgentCompanySelectionService,
+        *,
+        project_id: int | None,
+        run_id: int | None,
+    ) -> None:
+        self.delegate = delegate
+        self.project_id = project_id
+        self.run_id = run_id
+        self.revalidation_calls = 0
+        self.resolver_calls = 0
+
+    def prepare(self, **kwargs: object) -> AgentCompanySelectionInput:
+        prepared = self.delegate.prepare(**kwargs)
+        return AgentCompanySelectionInput.model_construct(
+            project_id=(prepared.project_id if self.project_id is None else self.project_id),
+            run_id=prepared.run_id if self.run_id is None else self.run_id,
+            request=prepared.request,
+            bindings=prepared.bindings,
+        )
+
+    def revalidate_selection_input(
+        self, selection: AgentCompanySelectionInput
+    ) -> AgentCompanySelectionInput:
+        self.revalidation_calls += 1
+        return self.delegate.revalidate_selection_input(selection)
+
+    def resolve_selected_candidate_id(
+        self,
+        selection: AgentCompanySelectionInput,
+        decision: OpenAIDecisionResult,
+    ) -> int | None:
+        self.resolver_calls += 1
+        return self.delegate.resolve_selected_candidate_id(selection, decision)
+
+
+class DecisionFactory:
+    def __init__(self, decision: Decision) -> None:
+        self.decision = decision
+        self.calls = 0
+
+    def __call__(self) -> DecisionBoundary:
+        self.calls += 1
+        return self.decision
+
+
 def seed(session: Session) -> tuple[Project, SearchProfile]:
     project = Project(name="Stage 2B")
     session.add(project)
@@ -272,3 +323,83 @@ def test_openai_failure_preserves_committed_discovery(session: Session) -> None:
         assert run is not None
         assert run.run_status == CompanyDiscoveryRunStatus.SUCCEEDED
         assert verification.scalar(select(func.count()).select_from(CompanyDiscoveryCandidate)) == 1
+
+
+@pytest.mark.parametrize(
+    ("foreign_project_id", "foreign_run_id"),
+    [(991, None), (None, 992), (991, 992)],
+)
+def test_foreign_selection_scope_preserves_committed_discovery_and_crm_state(
+    session: Session,
+    foreign_project_id: int | None,
+    foreign_run_id: int | None,
+) -> None:
+    project, profile = seed(session)
+    project_snapshot = (project.id, project.name)
+    profile_snapshot = (profile.id, profile.project_id, profile.name, profile.enabled)
+    provider = Provider([provider_result()])
+    decision = Decision(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    generator = RecordingQueryGenerator()
+    committer = Committer(session)
+    selection = ForeignSelection(
+        AgentCompanySelectionService(cast(AgentCompanySelectionRepository, repository)),
+        project_id=foreign_project_id,
+        run_id=foreign_run_id,
+    )
+    factory = DecisionFactory(decision)
+    service = AgentCompanyPlanService(
+        projects=ProjectRepository(session),
+        profiles=SearchProfileService(SearchProfileRepository(session)),
+        staging=CompanyDiscoveryStagingService(
+            repository=repository,
+            query_generator=generator,
+        ),
+        staging_provider=provider,
+        staging_repository=repository,
+        provider_telemetry=provider,
+        committer=committer,
+        selection=cast(SelectionBoundary, selection),
+        decision_factory=factory,
+    )
+
+    with pytest.raises(
+        AgentCompanyPlanSelectionError,
+        match="^Agent company selection failed\\.$",
+    ) as caught:
+        service.plan(
+            AgentCompanyPlanInput(
+                project_id=project.id,
+                search_profile_id=profile.id,
+                goal="Choose",
+            )
+        )
+
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert len(provider.calls) == committer.calls == selection.revalidation_calls == 1
+    assert factory.calls == decision.calls == selection.resolver_calls == 0
+
+    session.close()
+    with Session(session.bind) as verification:
+        run = verification.scalar(select(CompanyDiscoveryRun))
+        candidates = verification.scalars(select(CompanyDiscoveryCandidate)).all()
+        persisted_project = verification.get(Project, project_snapshot[0])
+        persisted_profile = verification.get(SearchProfile, profile_snapshot[0])
+        assert run is not None
+        assert run.run_status == CompanyDiscoveryRunStatus.SUCCEEDED
+        assert len(candidates) == 1
+        assert candidates[0].candidate_status == "DISCOVERED"
+        assert candidates[0].promoted_company_id is None
+        assert persisted_project is not None
+        assert (persisted_project.id, persisted_project.name) == project_snapshot
+        assert persisted_profile is not None
+        assert (
+            persisted_profile.id,
+            persisted_profile.project_id,
+            persisted_profile.name,
+            persisted_profile.enabled,
+        ) == profile_snapshot
+        assert verification.scalar(select(func.count()).select_from(Company)) == 0
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+        assert verification.scalar(select(func.count()).select_from(Lead)) == 0
+        assert verification.scalar(select(func.count()).select_from(Task)) == 0

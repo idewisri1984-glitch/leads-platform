@@ -304,6 +304,11 @@ class AgentCompanyPlanService:
             AgentCompanyPlanSelectionError,
             _SELECTION_FAILED,
         )
+        if (
+            validated_selection.project_id != data.project_id
+            or validated_selection.run_id != staging.run_id
+        ):
+            raise AgentCompanyPlanSelectionError(_SELECTION_FAILED)
         eligible_count = len(validated_selection.request.candidates)
         if not 1 <= eligible_count <= 5:
             raise AgentCompanyPlanSelectionError(_SELECTION_FAILED)
