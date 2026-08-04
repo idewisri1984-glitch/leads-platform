@@ -400,6 +400,8 @@ class AgentCompanySelectionService:
             candidate.promoted_company_id,
         )
 
+        cls._validate_request_text_encodability(name, website, country_code)
+
         valid_country = country_code is None or (
             type(country_code) is str
             and len(country_code) == 2
@@ -434,6 +436,18 @@ class AgentCompanySelectionService:
             )
         ):
             raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+
+    @staticmethod
+    def _validate_request_text_encodability(*values: object) -> None:
+        encoding_failed = False
+        try:
+            for value in values:
+                if type(value) is str:
+                    value.encode("utf-8")
+        except UnicodeEncodeError:
+            encoding_failed = True
+        if encoding_failed:
+            raise AgentCompanySelectionInvalidDataError(_INVALID_DATA_MESSAGE)
 
     @staticmethod
     def _normalize_candidate_status(value: object) -> CompanyDiscoveryCandidateStatus:

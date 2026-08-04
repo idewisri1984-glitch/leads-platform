@@ -341,6 +341,7 @@ def test_prepare_rejects_empty_and_too_many_candidates() -> None:
         {"website": ""},
         {"country_code": "USA"},
         {"country_code": "us"},
+        {"country_code": object()},
         {"identity_key": ""},
         {"identity_key": "key\x00"},
         {"best_position": 0},
@@ -1002,14 +1003,60 @@ def test_prepare_sanitizes_unpaired_surrogate_encoding_failures(
     assert caplog.records == []
 
 
-def test_prepare_rejects_surrogate_country_without_raw_unicode_error() -> None:
+@pytest.mark.parametrize(
+    "country_code",
+    ["U\ud800", "\udc00S", "US\ud800", "U\udc00S"],
+    ids=["high", "low", "mixed-high", "mixed-low"],
+)
+def test_prepare_rejects_surrogate_country_without_raw_unicode_error(
+    country_code: str,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     candidate = _CorrectiveCandidate()
-    candidate.country_code = "U\ud800"
-    with pytest.raises(AgentCompanySelectionConsistencyError) as exc_info:
-        _corrective_prepare((candidate,))
-    assert str(exc_info.value) == INCONSISTENT
+    candidate.country_code = country_code
+    repository = _CorrectiveRepository((candidate,))
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(
+            AgentCompanySelectionInvalidDataError,
+            match="^Agent company selection data is invalid\\.$",
+        ) as exc_info,
+    ):
+        AgentCompanySelectionService(repository).prepare(
+            project_id=3,
+            run_id=7,
+            goal="Choose one",
+            max_candidates=5,
+        )
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert str(exc_info.value) == "Agent company selection data is invalid."
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
+    assert country_code not in str(exc_info.value)
+    assert country_code not in repr(exc_info.value)
+    assert country_code not in rendered
+    assert "UnicodeEncodeError" not in rendered
+    assert "surrogates not allowed" not in rendered
+    assert capsys.readouterr() == ("", "")
+    assert caplog.records == []
+    assert repository.get_calls == 1
+    assert repository.list_calls == 1
+
+
+@pytest.mark.parametrize("country_code", ["USA", "us", object()])
+def test_prepare_preserves_country_consistency_validation(country_code: object) -> None:
+    candidate = _CorrectiveCandidate()
+    candidate.country_code = country_code
+    with pytest.raises(AgentCompanySelectionConsistencyError, match=f"^{INCONSISTENT}$"):
+        _corrective_prepare((candidate,))
+
+
+def test_prepare_accepts_valid_country_after_encoding_validation() -> None:
+    selection = _corrective_prepare((_CorrectiveCandidate(),))
+    assert selection.request.candidates[0].country == "US"
 
 
 def test_prepare_accepts_valid_multibyte_unicode() -> None:
