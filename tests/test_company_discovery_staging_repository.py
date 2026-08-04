@@ -1,3 +1,4 @@
+import inspect
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from typing import cast
@@ -661,3 +662,199 @@ def test_link_promoted_company_propagates_flush_failures(
     monkeypatch.setattr(session, "flush", fail_flush)
     with pytest.raises(type(failure)):
         repository.link_promoted_company(project.id, candidate.id, company.id)
+
+
+def test_list_candidates_for_run_has_exact_signature() -> None:
+    signature = inspect.signature(CompanyDiscoveryStagingRepository.list_candidates_for_run)
+    assert tuple(signature.parameters) == (
+        "self",
+        "project_id",
+        "run_id",
+        "limit",
+        "candidate_status",
+    )
+    assert signature.parameters["candidate_status"].default is None
+
+
+def test_list_candidates_for_run_scopes_by_project_and_last_seen_run(
+    session: Session,
+) -> None:
+    first_project = make_project(session, "First")
+    second_project = make_project(session, "Second")
+    repository = CompanyDiscoveryStagingRepository(session)
+    old_run = repository.create_run(run_data(first_project.id))
+    current_run = repository.create_run(run_data(first_project.id))
+    later_run = repository.create_run(run_data(first_project.id))
+    other_run = repository.create_run(run_data(second_project.id))
+
+    repeated = repository.upsert_candidate(
+        first_project.id,
+        old_run.id,
+        candidate_data(first_project.id, old_run.id, website="https://repeat.example"),
+    )
+    repository.upsert_candidate(
+        first_project.id,
+        current_run.id,
+        candidate_data(first_project.id, current_run.id, website="https://repeat.example"),
+    )
+    moved_later = repository.upsert_candidate(
+        first_project.id,
+        current_run.id,
+        candidate_data(first_project.id, current_run.id, website="https://later.example"),
+    )
+    repository.upsert_candidate(
+        first_project.id,
+        later_run.id,
+        candidate_data(first_project.id, later_run.id, website="https://later.example"),
+    )
+    repository.upsert_candidate(
+        second_project.id,
+        other_run.id,
+        candidate_data(second_project.id, other_run.id, website="https://other.example"),
+    )
+
+    result = repository.list_candidates_for_run(first_project.id, current_run.id, 100)
+
+    assert [candidate.id for candidate in result] == [repeated.candidate.id]
+    assert result[0].first_seen_run_id == old_run.id
+    assert result[0].last_seen_run_id == current_run.id
+    assert moved_later.candidate.id not in {candidate.id for candidate in result}
+
+
+def test_list_candidates_for_run_filters_status_and_orders_deterministically(
+    session: Session,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+
+    def create(identity: str, position: int | None) -> CompanyDiscoveryCandidate:
+        row = CompanyDiscoveryCandidate(
+            project_id=project.id,
+            first_seen_run_id=run.id,
+            last_seen_run_id=run.id,
+            provider="serpapi",
+            name=identity,
+            normalized_name=identity.lower(),
+            website=None,
+            website_identity=None,
+            country_code="US",
+            identity_key=identity,
+            best_position=position,
+            candidate_status=CompanyDiscoveryCandidateStatus.DISCOVERED,
+        )
+        session.add(row)
+        session.flush()
+        return row
+
+    tie_first = create("a", 2)
+    tie_second = create("a-2", 2)
+    first = create("z", 1)
+    null = create("null", None)
+    reviewed = create("reviewed", 1)
+    rejected = create("rejected", 1)
+    promoted = create("promoted", 1)
+    reviewed.candidate_status = CompanyDiscoveryCandidateStatus.REVIEWED
+    rejected.candidate_status = CompanyDiscoveryCandidateStatus.REJECTED
+    promoted.candidate_status = CompanyDiscoveryCandidateStatus.PROMOTED
+    session.flush()
+
+    discovered = repository.list_candidates_for_run(
+        project.id,
+        run.id,
+        100,
+        CompanyDiscoveryCandidateStatus.DISCOVERED,
+    )
+    all_statuses = repository.list_candidates_for_run(project.id, run.id, 2)
+
+    assert [row.id for row in discovered] == [
+        first.id,
+        tie_first.id,
+        tie_second.id,
+        null.id,
+    ]
+    assert [row.id for row in all_statuses] == [promoted.id, rejected.id]
+    assert {row.id for row in discovered}.isdisjoint({reviewed.id, rejected.id, promoted.id})
+
+
+@pytest.mark.parametrize("project_id,run_id", [(0, 1), (1, 0), (True, 1), (1, False)])
+def test_list_candidates_for_run_rejects_invalid_ids(
+    session: Session,
+    project_id: object,
+    run_id: object,
+) -> None:
+    repository = CompanyDiscoveryStagingRepository(session)
+    with pytest.raises(ValueError):
+        repository.list_candidates_for_run(
+            cast(int, project_id),
+            cast(int, run_id),
+            5,
+        )
+
+
+@pytest.mark.parametrize("limit", [0, 101, True, 1.0, "5"])
+def test_list_candidates_for_run_rejects_invalid_limit(
+    session: Session,
+    limit: object,
+) -> None:
+    repository = CompanyDiscoveryStagingRepository(session)
+    with pytest.raises(ValueError):
+        repository.list_candidates_for_run(1, 1, cast(int, limit))
+
+
+def test_list_candidates_for_run_rejects_invalid_status(session: Session) -> None:
+    repository = CompanyDiscoveryStagingRepository(session)
+    with pytest.raises(ValueError):
+        repository.list_candidates_for_run(
+            1,
+            1,
+            5,
+            cast(CompanyDiscoveryCandidateStatus, "DISCOVERED"),
+        )
+
+
+def test_list_candidates_for_run_executes_one_select_without_lifecycle_or_mutation(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(session)
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = repository.create_run(run_data(project.id))
+    created = repository.upsert_candidate(
+        project.id,
+        run.id,
+        candidate_data(project.id, run.id),
+    )
+    candidate_before = created.candidate.model_dump()
+    run_before = {
+        "status": run.run_status,
+        "candidate_count": run.candidate_count,
+        "updated_at": run.updated_at,
+    }
+    calls = {name: 0 for name in ("add", "flush", "commit", "rollback", "refresh")}
+    for name in calls:
+        monkeypatch.setattr(
+            session,
+            name,
+            lambda *_args, _name=name, **_kwargs: calls.__setitem__(_name, calls[_name] + 1),
+        )
+    selects = 0
+    original_scalars = session.scalars
+
+    def counting_scalars(*args: object, **kwargs: object) -> object:
+        nonlocal selects
+        selects += 1
+        statement = args[0]
+        assert "FOR UPDATE" not in str(statement).upper()
+        return original_scalars(*args, **kwargs)
+
+    monkeypatch.setattr(session, "scalars", counting_scalars)
+    result = repository.list_candidates_for_run(project.id, run.id, 5)
+
+    assert result == [session.get_one(CompanyDiscoveryCandidate, created.candidate.id)]
+    assert selects == 1
+    assert calls == {name: 0 for name in calls}
+    assert created.candidate.model_dump() == candidate_before
+    assert run.run_status == run_before["status"]
+    assert run.candidate_count == run_before["candidate_count"]
+    assert run.updated_at == run_before["updated_at"]

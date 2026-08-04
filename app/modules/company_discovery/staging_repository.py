@@ -202,6 +202,39 @@ class CompanyDiscoveryStagingRepository:
             )
         )
 
+    def list_candidates_for_run(
+        self,
+        project_id: int,
+        run_id: int,
+        limit: int,
+        candidate_status: CompanyDiscoveryCandidateStatus | None = None,
+    ) -> list[CompanyDiscoveryCandidate]:
+        self._validate_positive_id(project_id, "Project")
+        self._validate_positive_id(run_id, "Discovery run")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Limit must be between one and one hundred.")
+        if (
+            candidate_status is not None
+            and type(candidate_status) is not CompanyDiscoveryCandidateStatus
+        ):
+            raise ValueError("Candidate status is invalid.")
+
+        statement = select(CompanyDiscoveryCandidate).where(
+            CompanyDiscoveryCandidate.project_id == project_id,
+            CompanyDiscoveryCandidate.last_seen_run_id == run_id,
+        )
+        if candidate_status is not None:
+            statement = statement.where(
+                CompanyDiscoveryCandidate.candidate_status == candidate_status
+            )
+        statement = statement.order_by(
+            CompanyDiscoveryCandidate.best_position.is_(None).asc(),
+            CompanyDiscoveryCandidate.best_position.asc(),
+            CompanyDiscoveryCandidate.identity_key.asc(),
+            CompanyDiscoveryCandidate.id.asc(),
+        )
+        return list(self.session.scalars(statement.limit(limit)))
+
     def upsert_candidate(
         self,
         project_id: int,
