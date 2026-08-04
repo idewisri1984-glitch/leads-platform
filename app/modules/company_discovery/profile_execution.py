@@ -1,3 +1,5 @@
+from pydantic import ValidationError
+
 from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProvider,
     DiscoveryProviderAuthenticationError,
@@ -63,6 +65,8 @@ class SearchProfileDiscoveryService:
         profile: SearchProfileRead,
         provider: DiscoveryProvider,
         options: SearchProfileRunOptions | None = None,
+        *,
+        precomputed_preview: SearchQueryPreview | None = None,
     ) -> SearchProfileDiscoveryDryRunResult:
         if not profile.enabled:
             raise SearchProfileDiscoveryExecutionError("Search profile is disabled.")
@@ -73,7 +77,11 @@ class SearchProfileDiscoveryService:
             raise SearchProfileDiscoveryExecutionError("Discovery provider name is invalid.")
 
         provider_name = provider_name_value.strip()
-        preview = self.query_generator.generate_preview(profile, options)
+        preview = (
+            self.query_generator.generate_preview(profile, options)
+            if precomputed_preview is None
+            else self.revalidate_query_preview(profile, precomputed_preview)
+        )
         query_results: list[SearchProfileDiscoveryQueryResult] = []
         stopped_early = False
         stop_reason: StopReason | None = None
@@ -173,6 +181,50 @@ class SearchProfileDiscoveryService:
             stopped_early=stopped_early,
             stop_reason=stop_reason,
         )
+
+    @staticmethod
+    def revalidate_query_preview(
+        profile: SearchProfileRead,
+        preview: SearchQueryPreview,
+    ) -> SearchQueryPreview:
+        validation_failed = False
+        validated: SearchQueryPreview | None = None
+        try:
+            if type(preview) is not SearchQueryPreview:
+                raise TypeError
+            queries: list[SearchQuery] = []
+            for query in preview.queries:
+                if type(query) is not SearchQuery:
+                    raise TypeError
+                queries.append(
+                    SearchQuery(
+                        text=query.text,
+                        profile_id=query.profile_id,
+                        profile_name=query.profile_name,
+                        language=query.language,
+                        country=query.country,
+                        city=query.city,
+                        source_template=query.source_template,
+                        country_code=query.country_code,
+                        limit=query.limit,
+                    )
+                )
+            validated = SearchQueryPreview(
+                profile_id=preview.profile_id,
+                profile_name=preview.profile_name,
+                query_count=preview.query_count,
+                estimated_provider_requests=preview.estimated_provider_requests,
+                result_limit_per_query=preview.result_limit_per_query,
+                total_result_ceiling=preview.total_result_ceiling,
+                queries=queries,
+            )
+            if validated.profile_id != profile.id or validated.profile_name != profile.name:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError, ValidationError):
+            validation_failed = True
+        if validation_failed or validated is None:
+            raise SearchProfileDiscoveryExecutionError("Precomputed query preview is invalid.")
+        return validated
 
     def _provider_error_result(
         self,

@@ -58,6 +58,21 @@ from .company_selection_schemas import (
 )
 
 __all__ = [
+    "AgentCompanyPlanBindingError",
+    "AgentCompanyPlanDecisionError",
+    "AgentCompanyPlanDiscoveryDataError",
+    "AgentCompanyPlanError",
+    "AgentCompanyPlanInput",
+    "AgentCompanyPlanInternalError",
+    "AgentCompanyPlanInvalidDataError",
+    "AgentCompanyPlanPersistenceError",
+    "AgentCompanyPlanProjectNotFoundError",
+    "AgentCompanyPlanResult",
+    "AgentCompanyPlanSearchProfileNotFoundError",
+    "AgentCompanyPlanSearchProfileNotReadyError",
+    "AgentCompanyPlanSearchProviderError",
+    "AgentCompanyPlanSelectionError",
+    "AgentCompanyPlanService",
     "AgentCompanySelectionBinding",
     "AgentCompanySelectionConsistencyError",
     "AgentCompanySelectionError",

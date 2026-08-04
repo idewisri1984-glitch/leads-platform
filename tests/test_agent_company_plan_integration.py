@@ -40,7 +40,12 @@ from app.modules.search_profile import (
     SearchProfileService,
 )
 from app.modules.search_profile.models import SearchProfile
-from app.modules.search_profile.schemas import SearchQuery
+from app.modules.search_profile.schemas import (
+    SearchProfileRead,
+    SearchProfileRunOptions,
+    SearchQuery,
+    SearchQueryPreview,
+)
 from app.modules.task.models import Task
 from app.providers.openai_decision import (
     OpenAICompanyFit,
@@ -86,6 +91,12 @@ class Provider:
             total_results=len(self.results),
         )
 
+    def snapshot_call_count(self) -> int:
+        return len(self.calls)
+
+    def last_query(self) -> str | None:
+        return self.calls[-1].text if self.calls else None
+
 
 class Committer:
     def __init__(self, session: Session) -> None:
@@ -95,6 +106,20 @@ class Committer:
     def commit_discovery(self) -> None:
         self.calls += 1
         self.session.commit()
+
+
+class RecordingQueryGenerator(SearchProfileQueryGenerator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def generate_preview(
+        self,
+        profile: SearchProfileRead,
+        options: SearchProfileRunOptions | None = None,
+    ) -> SearchQueryPreview:
+        self.calls += 1
+        return super().generate_preview(profile, options)
 
 
 class Decision:
@@ -144,27 +169,25 @@ def seed(session: Session) -> tuple[Project, SearchProfile]:
 
 def build_service(
     session: Session, provider: Provider, decision: Decision
-) -> tuple[AgentCompanyPlanService, Committer]:
+) -> tuple[AgentCompanyPlanService, Committer, RecordingQueryGenerator]:
     repository = CompanyDiscoveryStagingRepository(session)
-    generator = SearchProfileQueryGenerator()
+    generator = RecordingQueryGenerator()
     committer = Committer(session)
+    service = AgentCompanyPlanService(
+        projects=ProjectRepository(session),
+        profiles=SearchProfileService(SearchProfileRepository(session)),
+        staging=CompanyDiscoveryStagingService(repository=repository, query_generator=generator),
+        staging_provider=provider,
+        staging_repository=repository,
+        provider_telemetry=provider,
+        committer=committer,
+        selection=AgentCompanySelectionService(cast(AgentCompanySelectionRepository, repository)),
+        decision_factory=lambda: decision,
+    )
     return (
-        AgentCompanyPlanService(
-            projects=ProjectRepository(session),
-            profiles=SearchProfileService(SearchProfileRepository(session)),
-            query_generator=generator,
-            staging=CompanyDiscoveryStagingService(
-                repository=repository, query_generator=generator
-            ),
-            staging_provider=provider,
-            staging_repository=repository,
-            committer=committer,
-            selection=AgentCompanySelectionService(
-                cast(AgentCompanySelectionRepository, repository)
-            ),
-            decision=decision,
-        ),
+        service,
         committer,
+        generator,
     )
 
 
@@ -183,7 +206,7 @@ def test_real_staging_selection_and_transaction_boundary(session: Session) -> No
     project, profile = seed(session)
     provider = Provider([provider_result(), provider_result()])
     decision = Decision(session)
-    service, committer = build_service(session, provider, decision)
+    service, committer, generator = build_service(session, provider, decision)
 
     result = service.plan(
         AgentCompanyPlanInput(
@@ -197,6 +220,8 @@ def test_real_staging_selection_and_transaction_boundary(session: Session) -> No
     assert result.selected_candidate_id == session.scalar(select(CompanyDiscoveryCandidate.id))
     assert result.staged_candidate_count == result.eligible_candidate_count == 1
     assert len(provider.calls) == committer.calls == decision.calls == 1
+    assert generator.calls == result.serpapi_call_count == 1
+    assert result.query == provider.calls[0].text
     assert provider.calls[0].limit == 5
     assert session.scalar(select(func.count()).select_from(CompanyDiscoveryRun)) == 1
     assert session.scalar(select(func.count()).select_from(Company)) == 0
@@ -209,7 +234,7 @@ def test_zero_results_skips_openai_and_creates_new_run(session: Session) -> None
     project, profile = seed(session)
     provider = Provider([])
     decision = Decision(session)
-    service, _ = build_service(session, provider, decision)
+    service, _, generator = build_service(session, provider, decision)
     data = AgentCompanyPlanInput(project_id=project.id, search_profile_id=profile.id, goal="Choose")
 
     first = service.plan(data)
@@ -218,6 +243,10 @@ def test_zero_results_skips_openai_and_creates_new_run(session: Session) -> None
     assert first.decision is second.decision is None
     assert first.discovery_run_id != second.discovery_run_id
     assert len(provider.calls) == 2
+    assert generator.calls == 2
+    assert first.serpapi_call_count == second.serpapi_call_count == 1
+    assert first.query == provider.calls[0].text
+    assert second.query == provider.calls[1].text
     assert decision.calls == 0
     assert session.scalar(select(func.count()).select_from(CompanyDiscoveryRun)) == 2
 
@@ -226,7 +255,7 @@ def test_openai_failure_preserves_committed_discovery(session: Session) -> None:
     project, profile = seed(session)
     provider = Provider([provider_result()])
     decision = Decision(session, fail=True)
-    service, _ = build_service(session, provider, decision)
+    service, _, _ = build_service(session, provider, decision)
 
     with pytest.raises(AgentCompanyPlanDecisionError) as caught:
         service.plan(

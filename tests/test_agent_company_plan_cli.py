@@ -9,6 +9,7 @@ from app.modules.agent import (
     AgentCompanyPlanBindingError,
     AgentCompanyPlanDecisionError,
     AgentCompanyPlanDiscoveryDataError,
+    AgentCompanyPlanInput,
     AgentCompanyPlanInternalError,
     AgentCompanyPlanPersistenceError,
     AgentCompanyPlanProjectNotFoundError,
@@ -225,3 +226,189 @@ def test_unexpected_exception_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> N
     assert outcome.exit_code == 1
     assert outcome.stdout == ""
     assert outcome.stderr == "Agent company plan failed.\n"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("agent", "company-select", "plan"),
+        ("agent", "company-select", "plan", "--project-id", "1"),
+        (
+            "agent",
+            "company-select",
+            "plan",
+            "--project-id",
+            "1",
+            "--search-profile-id",
+            "2",
+        ),
+        (*("agent", "company-select", "plan"), "--unknown"),
+        (*("agent", "company-select", "plan"), "unexpected"),
+        (*("agent", "company-select", "plan"), "--project-id"),
+        (
+            "agent",
+            "company-select",
+            "plan",
+            "--project-id",
+            "1",
+            "--project-id",
+            "2",
+            "--search-profile-id",
+            "2",
+            "--goal",
+            "Choose",
+        ),
+        (
+            "agent",
+            "company-select",
+            "plan",
+            "--project-id",
+            "1",
+            "--search-profile-id",
+            "2",
+            "--search-profile-id",
+            "3",
+            "--goal",
+            "Choose",
+        ),
+        (
+            "agent",
+            "company-select",
+            "plan",
+            "--project-id",
+            "1",
+            "--search-profile-id",
+            "2",
+            "--goal",
+            "Choose",
+            "--goal",
+            "Again",
+        ),
+        (
+            "agent",
+            "company-select",
+            "plan",
+            "--project-id",
+            "1",
+            "--search-profile-id",
+            "2",
+            "--goal",
+            "Choose",
+            "--output",
+            "text",
+            "--output=json",
+        ),
+    ],
+)
+def test_framework_parse_errors_are_command_local_and_sanitized(
+    arguments: tuple[str, ...],
+) -> None:
+    outcome = runner.invoke(app, list(arguments))
+
+    assert outcome.exit_code == 2
+    assert outcome.stdout == ""
+    assert outcome.stderr == "Agent company plan data is invalid.\n"
+    assert "Usage:" not in outcome.stderr
+    assert "Traceback" not in outcome.stderr
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"crm_mutated": True},
+        {"candidate_promoted": True},
+        {"serpapi_call_count": 99},
+        {"openai_call_count": 2},
+        {"query": "unsafe\ud800"},
+        {"human_review_required": False},
+    ],
+)
+def test_renderer_deeply_rejects_model_construct_bypass(changes: dict[str, object]) -> None:
+    values = result().model_dump()
+    values.update(changes)
+    bypassed = AgentCompanyPlanResult.model_construct(**values)
+
+    with pytest.raises(AgentCompanyPlanInternalError) as caught:
+        agent_cli.render_agent_company_plan(bypassed, "json")
+
+    assert str(caught.value) == "Agent company plan failed."
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+class _SessionSpy:
+    def __init__(self) -> None:
+        self.rollbacks = 0
+        self.closes = 0
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+def _patch_execute_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_cli, "CompanyDiscoveryStagingRepository", lambda session: object())
+    monkeypatch.setattr(agent_cli, "SearchProfileQueryGenerator", lambda: object())
+    monkeypatch.setattr(agent_cli, "ProjectRepository", lambda session: object())
+    monkeypatch.setattr(agent_cli, "SearchProfileRepository", lambda session: object())
+    monkeypatch.setattr(agent_cli, "SearchProfileService", lambda repository: object())
+    monkeypatch.setattr(agent_cli, "CompanyDiscoveryStagingService", lambda **kwargs: object())
+    monkeypatch.setattr(agent_cli, "AgentCompanySelectionService", lambda repository: object())
+
+
+def test_provider_factory_failure_rolls_back_and_closes_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _SessionSpy()
+    _patch_execute_construction(monkeypatch)
+
+    def fail_provider(**kwargs: object) -> object:
+        raise RuntimeError("secret provider configuration")
+
+    with pytest.raises(AgentCompanyPlanSearchProviderError) as caught:
+        agent_cli.execute_agent_company_plan(
+            AgentCompanyPlanInput(project_id=1, search_profile_id=2, goal="Choose"),
+            session_factory=lambda: session,  # type: ignore[arg-type]
+            serpapi_client_factory=fail_provider,  # type: ignore[arg-type]
+        )
+
+    assert str(caught.value) == "Company search provider failed."
+    assert session.rollbacks == session.closes == 1
+
+
+def test_decision_factory_is_lazy_and_failure_closes_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _SessionSpy()
+    _patch_execute_construction(monkeypatch)
+    factory_calls = 0
+
+    class FakePlanService:
+        def __init__(self, **kwargs: object) -> None:
+            self.decision_factory = kwargs["decision_factory"]
+
+        def plan(self, data: object) -> AgentCompanyPlanResult:
+            self.decision_factory()  # type: ignore[operator]
+            raise AssertionError("unreachable")
+
+    def fail_factory() -> object:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise RuntimeError("secret OpenAI configuration")
+
+    monkeypatch.setattr(agent_cli, "SerpApiDiscoveryProvider", lambda client: object())
+    monkeypatch.setattr(agent_cli, "AgentCompanyPlanService", FakePlanService)
+
+    with pytest.raises(AgentCompanyPlanDecisionError) as caught:
+        agent_cli.execute_agent_company_plan(
+            AgentCompanyPlanInput(project_id=1, search_profile_id=2, goal="Choose"),
+            session_factory=lambda: session,  # type: ignore[arg-type]
+            decision_factory_factory=fail_factory,  # type: ignore[arg-type]
+            serpapi_client_factory=lambda **kwargs: object(),  # type: ignore[arg-type]
+        )
+
+    assert str(caught.value) == "Company decision provider failed."
+    assert factory_calls == 1
+    assert session.rollbacks == session.closes == 1

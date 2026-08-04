@@ -12,6 +12,14 @@ from app.providers.openai_decision import (
 _CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 
 
+def _require_utf8(value: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("String is not valid UTF-8.") from None
+    return value
+
+
 class AgentCompanyPlanInput(BaseModel):
     model_config = _CONFIG
 
@@ -31,7 +39,7 @@ class AgentCompanyPlanInput(BaseModel):
     def validate_goal(cls, value: object) -> object:
         if type(value) is not str or not value.strip() or len(value) > 1000:
             raise ValueError("Goal is invalid.")
-        return value
+        return _require_utf8(value)
 
 
 class AgentCompanyPlanResult(BaseModel):
@@ -98,6 +106,20 @@ class AgentCompanyPlanResult(BaseModel):
     def validate_query(cls, value: object) -> object:
         if type(value) is not str or not value.strip():
             raise ValueError("Query is invalid.")
+        return _require_utf8(value)
+
+    @field_validator(
+        "rationale",
+        "next_action_title",
+        "next_action_description",
+        mode="before",
+    )
+    @classmethod
+    def validate_output_text(cls, value: object) -> object:
+        if value is not None:
+            if type(value) is not str:
+                raise ValueError("Decision text is invalid.")
+            return _require_utf8(value)
         return value
 
     @field_validator("serpapi_call_count", mode="before")

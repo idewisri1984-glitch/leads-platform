@@ -251,6 +251,31 @@ def test_basic_execution_preserves_order_limits_context_duplicates_and_inputs() 
     assert [response.model_dump() for response in responses] == original_responses
 
 
+def test_precomputed_preview_bypasses_generator_and_executes_exact_query() -> None:
+    generated_query = make_query(1, limit=5).model_copy(update={"text": "query-1"})
+    preview = make_preview([generated_query], total_result_ceiling=5)
+    service, generator = make_service(
+        make_preview([make_query(2).model_copy(update={"text": "must-not-run"})])
+    )
+    provider = FakeProvider([make_response(generated_query)])
+
+    report = service.run_dry(
+        make_profile(),
+        provider,
+        SearchProfileRunOptions(
+            max_queries=1,
+            result_limit_per_query=5,
+            total_result_ceiling=5,
+        ),
+        precomputed_preview=preview,
+    )
+
+    assert generator.calls == []
+    assert [executed.text for executed in provider.queries] == ["query-1"]
+    assert report.query_results[0].query.text == "query-1"
+    assert report.query_results[0].query is not generated_query
+
+
 def test_empty_provider_response_produces_zero_query_counts() -> None:
     query = make_query(1)
 

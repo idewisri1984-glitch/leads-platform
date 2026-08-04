@@ -1,11 +1,14 @@
 import json
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Never, Protocol, cast
 
 import typer
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
+from typer import _click as click
+from typer._click.exceptions import UsageError
+from typer.core import TyperCommand
 
 from app.core.config.settings import settings
 from app.core.database.session import SessionLocal
@@ -27,8 +30,11 @@ from app.modules.agent import (
     AgentCompanyPlanService,
     AgentCompanySelectionService,
 )
+from app.modules.agent.company_plan import DecisionBoundary
 from app.modules.agent.company_selection import AgentCompanySelectionRepository
 from app.modules.company_discovery import SerpApiDiscoveryProvider
+from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
+from app.modules.company_discovery.schemas import DiscoveryProviderResponse
 from app.modules.company_discovery.staging_orchestration import (
     CompanyDiscoveryStagingService,
 )
@@ -41,18 +47,18 @@ from app.modules.search_profile import (
     SearchProfileRepository,
     SearchProfileService,
 )
-from app.providers.openai_decision import (
-    OpenAIDecisionClient,
-    OpenAIDecisionRequest,
-    OpenAIDecisionResult,
-)
+from app.modules.search_profile.schemas import SearchQuery
+from app.providers.openai_decision import OpenAIDecisionClient
 from app.providers.serpapi import SerpApiClient
 
 app = typer.Typer(help="Bounded Agent planning commands.")
 company_select_app = typer.Typer(help="Company-selection planning commands.")
 app.add_typer(company_select_app, name="company-select")
 
+_INVALID_MESSAGE = "Agent company plan data is invalid."
+_INTERNAL_MESSAGE = "Agent company plan failed."
 _FIELD_ORDER = tuple(AgentCompanyPlanResult.model_fields)
+_PLAN_OPTIONS = ("--project-id", "--search-profile-id", "--goal", "--output")
 _ERROR_CODES: tuple[tuple[type[AgentCompanyPlanError], int], ...] = (
     (AgentCompanyPlanInvalidDataError, 2),
     (AgentCompanyPlanProjectNotFoundError, 3),
@@ -72,6 +78,24 @@ class _SessionFactory(Protocol):
     def __call__(self) -> Session: ...
 
 
+class _AgentPlanCommand(TyperCommand):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not any(arg in {"--help", "-h"} for arg in args):
+            for option in _PLAN_OPTIONS:
+                occurrences = sum(arg == option or arg.startswith(f"{option}=") for arg in args)
+                if occurrences > 1:
+                    self._invalid_input()
+        try:
+            return super().parse_args(ctx, args)
+        except UsageError:
+            self._invalid_input()
+
+    @staticmethod
+    def _invalid_input() -> Never:
+        click.echo(_INVALID_MESSAGE, err=True)
+        raise click.exceptions.Exit(2)
+
+
 class _DiscoveryCommitter:
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -82,96 +106,183 @@ class _DiscoveryCommitter:
         self.committed = True
 
 
-class _LazyOpenAIDecisionBoundary:
+class _CountedDiscoveryProvider:
+    def __init__(self, provider: DiscoveryProvider) -> None:
+        self._provider = provider
+        self._call_count = 0
+        self._last_query: str | None = None
+
+    @property
+    def provider_name(self) -> str:
+        return self._provider.provider_name
+
+    def search(self, query: SearchQuery) -> DiscoveryProviderResponse:
+        self._call_count += 1
+        self._last_query = query.text
+        return self._provider.search(query)
+
+    def snapshot_call_count(self) -> int:
+        return self._call_count
+
+    def last_query(self) -> str | None:
+        return self._last_query
+
+
+class _OpenAIDecisionFactory:
     def __init__(self) -> None:
         self._client: OpenAIDecisionClient | None = None
 
-    def decide(self, request: OpenAIDecisionRequest) -> OpenAIDecisionResult:
-        if self._client is None:
-            self._client = OpenAIDecisionClient(
-                api_key=settings.openai_api_key,
-                model=settings.openai_model,
-                timeout_seconds=settings.openai_timeout_seconds,
-                max_output_tokens=settings.openai_max_output_tokens,
-            )
-        return self._client.decide(request)
+    def __call__(self) -> DecisionBoundary:
+        if self._client is not None:
+            return self._client
+        self._client = OpenAIDecisionClient(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            timeout_seconds=settings.openai_timeout_seconds,
+            max_output_tokens=settings.openai_max_output_tokens,
+        )
+        return self._client
 
     def close(self) -> None:
         if self._client is not None:
             self._client.close()
 
 
+class _LazyDecisionFactory:
+    def __init__(
+        self,
+        factory_factory: Callable[[], _OpenAIDecisionFactory],
+    ) -> None:
+        self._factory_factory = factory_factory
+        self._factory: _OpenAIDecisionFactory | None = None
+
+    def __call__(self) -> DecisionBoundary:
+        boundary: DecisionBoundary | None = None
+        error: AgentCompanyPlanDecisionError | None = None
+        try:
+            if self._factory is None:
+                self._factory = self._factory_factory()
+            boundary = self._factory()
+        except Exception:
+            error = AgentCompanyPlanDecisionError("Company decision provider failed.")
+        if error is not None:
+            raise error
+        return cast(DecisionBoundary, boundary)
+
+    def close(self) -> None:
+        if self._factory is not None:
+            self._factory.close()
+
+
+def _provider_construction[T](operation: Callable[[], T]) -> T:
+    error: AgentCompanyPlanSearchProviderError | None = None
+    value: T | None = None
+    try:
+        value = operation()
+    except Exception:
+        error = AgentCompanyPlanSearchProviderError("Company search provider failed.")
+    if error is not None:
+        raise error
+    return cast(T, value)
+
+
 def execute_agent_company_plan(
     data: AgentCompanyPlanInput,
     *,
     session_factory: _SessionFactory = SessionLocal,
-    decision_factory: Callable[[], _LazyOpenAIDecisionBoundary] = (_LazyOpenAIDecisionBoundary),
+    decision_factory_factory: Callable[[], _OpenAIDecisionFactory] = (_OpenAIDecisionFactory),
+    serpapi_client_factory: Callable[..., SerpApiClient] = SerpApiClient,
 ) -> AgentCompanyPlanResult:
     session = session_factory()
-    committer = _DiscoveryCommitter(session)
-    decision = decision_factory()
+    committer: _DiscoveryCommitter | None = None
+    decision_factory = _LazyDecisionFactory(decision_factory_factory)
     try:
+        committer = _DiscoveryCommitter(session)
         staging_repository = CompanyDiscoveryStagingRepository(session)
         query_generator = SearchProfileQueryGenerator()
-        serpapi_client = SerpApiClient(
-            api_key=settings.serpapi_api_key,
-            base_url=settings.serpapi_base_url,
-            timeout_seconds=settings.serpapi_timeout_seconds,
+        serpapi_client = _provider_construction(
+            lambda: serpapi_client_factory(
+                api_key=settings.serpapi_api_key,
+                base_url=settings.serpapi_base_url,
+                timeout_seconds=settings.serpapi_timeout_seconds,
+            )
         )
+        concrete_provider = _provider_construction(lambda: SerpApiDiscoveryProvider(serpapi_client))
+        counted_provider = _CountedDiscoveryProvider(concrete_provider)
         service = AgentCompanyPlanService(
             projects=ProjectRepository(session),
             profiles=SearchProfileService(SearchProfileRepository(session)),
-            query_generator=query_generator,
             staging=CompanyDiscoveryStagingService(
                 repository=staging_repository,
                 query_generator=query_generator,
             ),
-            staging_provider=SerpApiDiscoveryProvider(serpapi_client),
+            staging_provider=counted_provider,
             staging_repository=staging_repository,
+            provider_telemetry=counted_provider,
             committer=committer,
             selection=AgentCompanySelectionService(
                 cast(AgentCompanySelectionRepository, staging_repository)
             ),
-            decision=decision,
+            decision_factory=decision_factory,
         )
         return service.plan(data)
     except BaseException:
-        if not committer.committed:
-            with suppress(Exception):
-                session.rollback()
+        with suppress(Exception):
+            session.rollback()
         raise
     finally:
         with suppress(Exception):
-            decision.close()
+            decision_factory.close()
         session.close()
 
 
 def render_agent_company_plan(result: AgentCompanyPlanResult, output: str) -> str:
-    values = result.model_dump(mode="json")
+    if type(result) is not AgentCompanyPlanResult or output not in {"text", "json"}:
+        raise AgentCompanyPlanInternalError(_INTERNAL_MESSAGE)
+    invalid = False
+    validated: AgentCompanyPlanResult | None = None
+    try:
+        snapshot = {field: getattr(result, field) for field in AgentCompanyPlanResult.model_fields}
+        validated = AgentCompanyPlanResult(**snapshot)
+    except (AttributeError, TypeError, ValueError, ValidationError):
+        invalid = True
+    if invalid or validated is None:
+        raise AgentCompanyPlanInternalError(_INTERNAL_MESSAGE)
+
+    values = validated.model_dump(mode="json")
     if output == "json":
-        return json.dumps(
+        rendered = json.dumps(
             values,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
-    return "\n".join(
-        f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
-        for field in _FIELD_ORDER
-    )
+    else:
+        rendered = "\n".join(
+            f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
+            for field in _FIELD_ORDER
+        )
+    encoding_error = False
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError:
+        encoding_error = True
+    if encoding_error:
+        raise AgentCompanyPlanInternalError(_INTERNAL_MESSAGE)
+    return rendered
 
 
 def _parse_positive_integer(value: str) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        raise AgentCompanyPlanInvalidDataError("Agent company plan data is invalid.") from None
+        raise AgentCompanyPlanInvalidDataError(_INVALID_MESSAGE) from None
     if parsed <= 0 or value.strip() != value:
-        raise AgentCompanyPlanInvalidDataError("Agent company plan data is invalid.")
+        raise AgentCompanyPlanInvalidDataError(_INVALID_MESSAGE)
     return parsed
 
 
-@company_select_app.command("plan")
+@company_select_app.command("plan", cls=_AgentPlanCommand)
 def plan_company_selection(
     project_id: Annotated[
         str,
@@ -189,15 +300,16 @@ def plan_company_selection(
 ) -> None:
     try:
         if output not in {"text", "json"}:
-            raise AgentCompanyPlanInvalidDataError("Agent company plan data is invalid.")
+            raise AgentCompanyPlanInvalidDataError(_INVALID_MESSAGE)
         data = AgentCompanyPlanInput(
             project_id=_parse_positive_integer(project_id),
             search_profile_id=_parse_positive_integer(search_profile_id),
             goal=goal,
         )
         result = execute_agent_company_plan(data)
+        rendered = render_agent_company_plan(result, output)
     except ValidationError:
-        typer.echo("Agent company plan data is invalid.", err=True)
+        typer.echo(_INVALID_MESSAGE, err=True)
         raise typer.Exit(2) from None
     except AgentCompanyPlanError as error:
         exit_code = next(
@@ -207,9 +319,9 @@ def plan_company_selection(
         typer.echo(str(error), err=True)
         raise typer.Exit(exit_code) from None
     except Exception:
-        typer.echo("Agent company plan failed.", err=True)
+        typer.echo(_INTERNAL_MESSAGE, err=True)
         raise typer.Exit(1) from None
-    typer.echo(render_agent_company_plan(result, output))
+    typer.echo(rendered)
 
 
 __all__ = ["app", "execute_agent_company_plan", "render_agent_company_plan"]

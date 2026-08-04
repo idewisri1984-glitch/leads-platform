@@ -1,16 +1,18 @@
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from pydantic import ValidationError
 
 from app.modules.agent import (
+    AgentCompanyPlanDiscoveryDataError,
     AgentCompanyPlanInput,
     AgentCompanyPlanPersistenceError,
     AgentCompanyPlanProjectNotFoundError,
     AgentCompanyPlanResult,
     AgentCompanyPlanSearchProfileNotFoundError,
-    AgentCompanyPlanSearchProfileNotReadyError,
+    AgentCompanyPlanSelectionError,
     AgentCompanyPlanService,
     AgentCompanySelectionBinding,
     AgentCompanySelectionInput,
@@ -20,13 +22,17 @@ from app.modules.agent.company_plan import (
     DecisionBoundary,
     DiscoveryCommitter,
     ProjectLookup,
-    QueryGenerator,
+    ProviderTelemetry,
     SearchProfileLookup,
     SelectionBoundary,
     StagingOrchestrator,
 )
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
 from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
+from app.modules.company_discovery.staging_orchestration import (
+    CompanyDiscoveryBoundedPlanRunResult,
+    CompanyDiscoveryStagingServiceError,
+)
 from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
 from app.modules.company_discovery.staging_service_schemas import (
     CompanyDiscoveryStagingCandidatePreview,
@@ -48,6 +54,9 @@ class IntSubclass(int):
 
 class StrSubclass(str):
     pass
+
+
+_DEFAULT = object()
 
 
 def profile(*, project_id: int = 3, enabled: bool = True) -> SearchProfileRead:
@@ -180,21 +189,41 @@ class Lookup:
 
 
 @dataclass
-class Generator:
-    value: SearchQueryPreview
+class Staging:
+    value: CompanyDiscoveryStagingRunResult
+    telemetry: "Telemetry"
+    query_count: int = 1
+    calls: int = 0
+    provider_calls: int = 1
+    bounded_query: str = query().text
+    telemetry_query: str = query().text
 
-    def generate_preview(self, profile: object, options: object) -> SearchQueryPreview:
-        return self.value
+    def run_bounded_plan(self, **kwargs: object) -> CompanyDiscoveryBoundedPlanRunResult:
+        self.calls += 1
+        if self.query_count != 1:
+            raise CompanyDiscoveryStagingServiceError("invalid query count")
+        for _ in range(self.provider_calls):
+            self.telemetry.record(self.telemetry_query)
+        return CompanyDiscoveryBoundedPlanRunResult(
+            staging_result=self.value,
+            query=self.bounded_query,
+        )
 
 
 @dataclass
-class Staging:
-    value: CompanyDiscoveryStagingRunResult
+class Telemetry:
     calls: int = 0
+    query_text: str | None = None
 
-    def run(self, **kwargs: object) -> CompanyDiscoveryStagingRunResult:
+    def record(self, query_text: str) -> None:
         self.calls += 1
-        return self.value
+        self.query_text = query_text
+
+    def snapshot_call_count(self) -> int:
+        return self.calls
+
+    def last_query(self) -> str | None:
+        return self.query_text
 
 
 @dataclass
@@ -227,6 +256,38 @@ class Selection:
             return None
         return selection.bindings[0].candidate_id
 
+    def revalidate_selection_input(
+        self, selection: AgentCompanySelectionInput
+    ) -> AgentCompanySelectionInput:
+        self.events.append("revalidate")
+        return AgentCompanySelectionInput(
+            project_id=selection.project_id,
+            run_id=selection.run_id,
+            request=OpenAIDecisionRequest(
+                goal=selection.request.goal,
+                candidates=tuple(
+                    OpenAIDecisionCandidate(
+                        index=candidate.index,
+                        name=candidate.name,
+                        website=candidate.website,
+                        country=candidate.country,
+                        city=candidate.city,
+                        industry=candidate.industry,
+                        snippet=candidate.snippet,
+                        website_summary=candidate.website_summary,
+                    )
+                    for candidate in selection.request.candidates
+                ),
+            ),
+            bindings=tuple(
+                AgentCompanySelectionBinding(
+                    index=binding.index,
+                    candidate_id=binding.candidate_id,
+                )
+                for binding in selection.bindings
+            ),
+        )
+
 
 @dataclass
 class Decision:
@@ -251,26 +312,35 @@ class Provider:
 
 def make_service(
     *,
-    project_value: object | None = object(),
-    profile_value: SearchProfileRead | None = None,
+    project_value: object | None = _DEFAULT,
+    profile_value: object = _DEFAULT,
     query_count: int = 1,
     status: CompanyDiscoveryRunStatus = CompanyDiscoveryRunStatus.SUCCEEDED,
     no_candidates: bool = False,
     commit_fail: bool = False,
 ) -> tuple[AgentCompanyPlanService, Staging, Decision, list[str]]:
     events: list[str] = []
-    staging = Staging(staging_result(status))
+    telemetry = Telemetry()
+    staging = Staging(staging_result(status), telemetry, query_count)
     decision = Decision(events, select_decision())
+    actual_project = SimpleNamespace(id=3) if project_value is _DEFAULT else project_value
+    actual_profile = profile() if profile_value is _DEFAULT else profile_value
     service = AgentCompanyPlanService(
-        projects=cast(ProjectLookup, Lookup(project_value)),
-        profiles=cast(SearchProfileLookup, Lookup(profile_value or profile())),
-        query_generator=cast(QueryGenerator, Generator(preview(query_count))),
+        projects=cast(ProjectLookup, Lookup(actual_project)),
+        profiles=cast(SearchProfileLookup, Lookup(actual_profile)),
         staging=cast(StagingOrchestrator, staging),
         staging_provider=cast(DiscoveryProvider, Provider()),
         staging_repository=cast(CompanyDiscoveryStagingRepository, object()),
+        provider_telemetry=cast(ProviderTelemetry, telemetry),
         committer=cast(DiscoveryCommitter, Committer(events, commit_fail)),
-        selection=cast(SelectionBoundary, Selection(events, no_candidates)),
-        decision=cast(DecisionBoundary, decision),
+        selection=cast(
+            SelectionBoundary,
+            Selection(
+                events,
+                no_candidates or status is CompanyDiscoveryRunStatus.NOT_FOUND,
+            ),
+        ),
+        decision_factory=lambda: events.append("factory") or cast(DecisionBoundary, decision),
     )
     return service, staging, decision, events
 
@@ -296,6 +366,26 @@ def test_input_is_frozen_and_forbids_extra_without_trimming() -> None:
         data.goal = "changed"
 
 
+def test_input_and_result_reject_unpaired_surrogates_but_accept_astral_unicode() -> None:
+    valid = AgentCompanyPlanInput(
+        project_id=1,
+        search_profile_id=2,
+        goal="Выбрать компанию 🙂",
+    )
+    assert valid.goal.endswith("🙂")
+    with pytest.raises(ValidationError):
+        AgentCompanyPlanInput(project_id=1, search_profile_id=2, goal="bad\ud800")
+
+    values = (
+        make_service()[0]
+        .plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+        .model_dump()
+    )
+    values["rationale"] = "bad\udc00"
+    with pytest.raises(ValidationError):
+        AgentCompanyPlanResult(**values)
+
+
 def test_project_and_profile_isolation() -> None:
     service, *_ = make_service(project_value=None)
     with pytest.raises(AgentCompanyPlanProjectNotFoundError):
@@ -305,18 +395,56 @@ def test_project_and_profile_isolation() -> None:
         service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
 
 
+def test_project_and_profile_are_snapshotted_with_one_raw_read_per_field() -> None:
+    class OneReadProject:
+        reads = 0
+
+        @property
+        def id(self) -> int:
+            self.reads += 1
+            return 3 if self.reads == 1 else 999
+
+    class OneReadProfile:
+        def __init__(self) -> None:
+            self.values = profile().model_dump()
+            self.reads: dict[str, int] = {}
+
+        def __getattr__(self, name: str) -> object:
+            if name not in self.values:
+                raise AttributeError(name)
+            self.reads[name] = self.reads.get(name, 0) + 1
+            if self.reads[name] > 1 and name in {"project_id", "name"}:
+                return 999 if name == "project_id" else "changed profile"
+            return self.values[name]
+
+    raw_project = OneReadProject()
+    raw_profile = OneReadProfile()
+    service, *_ = make_service(
+        project_value=raw_project,
+        profile_value=raw_profile,
+        no_candidates=True,
+    )
+
+    result = service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert result.project_id == 3
+    assert raw_project.reads == 1
+    assert raw_profile.reads == dict.fromkeys(SearchProfileRead.model_fields, 1)
+
+
 @pytest.mark.parametrize("query_count", [0, 2])
 def test_non_single_query_is_rejected_before_staging(query_count: int) -> None:
     service, staging, *_ = make_service(query_count=query_count)
-    with pytest.raises(AgentCompanyPlanSearchProfileNotReadyError):
+    with pytest.raises(AgentCompanyPlanDiscoveryDataError):
         service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
-    assert staging.calls == 0
+    assert staging.calls == 1
+    assert staging.telemetry.calls == 0
 
 
 def test_select_orders_commit_prepare_decide_resolve_and_binds_id() -> None:
     service, staging, decision, events = make_service()
     result = service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
-    assert events == ["commit", "prepare", "decide", "resolve"]
+    assert events == ["commit", "prepare", "revalidate", "factory", "decide", "resolve"]
     assert staging.calls == decision.calls == 1
     assert result.selected_candidate_id == 41
     assert result.serpapi_call_count == result.openai_call_count == 1
@@ -355,3 +483,100 @@ def test_result_deep_invariants_and_immutability() -> None:
     invalid["selected_candidate_id"] = None
     with pytest.raises(ValidationError):
         AgentCompanyPlanResult.model_validate(invalid)
+    service, *_ = make_service(profile_value=None)
+    with pytest.raises(AgentCompanyPlanSearchProfileNotFoundError):
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"project_id": 4},
+        {"search_profile_id": 8},
+        {"run_id": "13"},
+    ],
+)
+def test_foreign_or_malformed_staging_is_rejected_before_commit(
+    updates: dict[str, object],
+) -> None:
+    service, staging, decision, events = make_service()
+    original = staging_result()
+    values = {
+        field: getattr(original, field) for field in CompanyDiscoveryStagingRunResult.model_fields
+    }
+    values.update(updates)
+    staging.value = CompanyDiscoveryStagingRunResult.model_construct(**values)
+
+    with pytest.raises(AgentCompanyPlanDiscoveryDataError) as caught:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert str(caught.value) == "Company discovery results are invalid."
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert events == []
+    assert decision.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("provider_calls", "bounded_query", "telemetry_query"),
+    [
+        (0, query().text, query().text),
+        (2, query().text, query().text),
+        (1, "different query", query().text),
+        (1, query().text, "different query"),
+    ],
+)
+def test_provider_telemetry_mismatch_is_rejected_before_commit(
+    provider_calls: int,
+    bounded_query: str,
+    telemetry_query: str,
+) -> None:
+    service, staging, decision, events = make_service()
+    staging.provider_calls = provider_calls
+    staging.bounded_query = bounded_query
+    staging.telemetry_query = telemetry_query
+
+    with pytest.raises(AgentCompanyPlanDiscoveryDataError):
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert events == []
+    assert decision.calls == 0
+
+
+def test_repeated_plans_measure_provider_delta_per_execution() -> None:
+    service, staging, decision, _ = make_service(no_candidates=True)
+    data = AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal")
+
+    first = service.plan(data)
+    second = service.plan(data)
+
+    assert first.serpapi_call_count == second.serpapi_call_count == 1
+    assert staging.telemetry.calls == staging.calls == 2
+    assert decision.calls == 0
+
+
+def test_malformed_selection_prevents_decision_factory_and_call() -> None:
+    service, _, decision, events = make_service()
+    factory_calls = 0
+
+    class MalformedSelection(Selection):
+        def revalidate_selection_input(
+            self, selection: AgentCompanySelectionInput
+        ) -> AgentCompanySelectionInput:
+            self.events.append("revalidate")
+            raise ValueError("sensitive malformed selection")
+
+    def factory() -> DecisionBoundary:
+        nonlocal factory_calls
+        factory_calls += 1
+        return decision
+
+    service.selection = cast(SelectionBoundary, MalformedSelection(events))
+    service.decision_factory = factory
+
+    with pytest.raises(AgentCompanyPlanSelectionError) as caught:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert str(caught.value) == "Agent company selection failed."
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert events == ["commit", "prepare", "revalidate"]
+    assert factory_calls == decision.calls == 0

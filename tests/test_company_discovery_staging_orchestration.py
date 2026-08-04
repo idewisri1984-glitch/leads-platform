@@ -13,7 +13,10 @@ from app.modules.company_discovery.schemas import (
     SearchProfileDiscoveryProviderError,
     SearchProfileDiscoveryQueryResult,
 )
-from app.modules.company_discovery.staging_orchestration import CompanyDiscoveryStagingService
+from app.modules.company_discovery.staging_orchestration import (
+    CompanyDiscoveryStagingService,
+    CompanyDiscoveryStagingServiceError,
+)
 from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
 from app.modules.company_discovery.staging_schemas import (
     CompanyDiscoveryCandidateCreate,
@@ -105,6 +108,7 @@ class FakeDiscoveryExecutionService:
         self.calls: list[
             tuple[SearchProfileRead, DiscoveryProvider, SearchProfileRunOptions | None]
         ] = []
+        self.precomputed_previews: list[SearchQueryPreview | None] = []
         self.outcome = outcome
 
     def run_dry(
@@ -112,8 +116,11 @@ class FakeDiscoveryExecutionService:
         profile: SearchProfileRead,
         provider: DiscoveryProvider,
         options: SearchProfileRunOptions | None = None,
+        *,
+        precomputed_preview: SearchQueryPreview | None = None,
     ) -> SearchProfileDiscoveryDryRunResult:
         self.calls.append((profile, provider, options))
+        self.precomputed_previews.append(precomputed_preview)
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome
@@ -1254,4 +1261,58 @@ def test_overlength_provider_name_marker_is_not_reflected_in_output() -> None:
     assert result.provider == "invalid-provider"
     assert provider_name not in str(result)
     assert provider_name not in repr(result)
+    assert execution.calls == []
+
+
+def test_bounded_plan_generates_once_and_passes_authoritative_preview() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    generator = FakeQueryGenerator(preview)
+    execution = FakeDiscoveryExecutionService(make_dry_result([query], [make_query_result(query)]))
+    service = make_run(execution, generator)
+
+    bounded = service.run_bounded_plan(
+        profile=make_profile(),
+        provider=FakeProvider(),
+        dry_run=True,
+    )
+
+    assert len(generator.calls) == len(execution.calls) == 1
+    assert execution.precomputed_previews[0] is not preview
+    assert execution.precomputed_previews[0].queries[0].text == query.text
+    assert bounded.query == query.text
+
+
+@pytest.mark.parametrize("query_count", [0, 2])
+def test_bounded_plan_rejects_non_single_preview_before_execution(query_count: int) -> None:
+    queries = [make_query(number + 1) for number in range(query_count)]
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=query_count,
+        estimated_provider_requests=query_count,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=queries,
+    )
+    generator = FakeQueryGenerator(preview)
+    execution = FakeDiscoveryExecutionService(make_dry_result([], []))
+    service = make_run(execution, generator)
+
+    with pytest.raises(CompanyDiscoveryStagingServiceError):
+        service.run_bounded_plan(
+            profile=make_profile(),
+            provider=FakeProvider(),
+            dry_run=True,
+        )
+
+    assert len(generator.calls) == 1
     assert execution.calls == []

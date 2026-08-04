@@ -215,15 +215,7 @@ class AgentCompanySelectionService:
         ):
             raise AgentCompanySelectionInvalidDataError(_INVALID_DATA_MESSAGE)
 
-        validated_selection = self._deep_validate_selection(selection)
-        request_size: int | None = None
-        serialization_failed = False
-        try:
-            request_size = self._serialized_request_size(validated_selection.request)
-        except UnicodeEncodeError:
-            serialization_failed = True
-        if serialization_failed or request_size is None or request_size > _MAX_OPENAI_REQUEST_BYTES:
-            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        validated_selection = self.revalidate_selection_input(selection)
         validated_decision = self._deep_validate_decision(decision)
 
         if validated_decision.decision is OpenAIDecisionKind.NO_SELECTION:
@@ -238,6 +230,25 @@ class AgentCompanySelectionService:
         if len(matches) != 1:
             raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
         return matches[0].candidate_id
+
+    def revalidate_selection_input(
+        self,
+        selection: AgentCompanySelectionInput,
+    ) -> AgentCompanySelectionInput:
+        if type(selection) is not AgentCompanySelectionInput:
+            raise AgentCompanySelectionInvalidDataError(_INVALID_DATA_MESSAGE)
+        validated = self._deep_validate_selection(selection)
+        request_size: int | None = None
+        serialization_failed = False
+        try:
+            request_size = self._serialized_request_size(validated.request)
+        except UnicodeEncodeError:
+            serialization_failed = True
+        if serialization_failed:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        if request_size is None or request_size > _MAX_OPENAI_REQUEST_BYTES:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        return validated
 
     @staticmethod
     def _validate_direct_input(
