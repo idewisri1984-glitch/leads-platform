@@ -1,3 +1,4 @@
+import json
 import socket
 import urllib.request
 from collections.abc import Generator
@@ -41,7 +42,9 @@ from app.modules.search_profile.models import SearchProfile
 from app.modules.task.models import Task
 from app.providers.openai_decision import (
     OpenAICompanyFit,
+    OpenAIDecisionCandidate,
     OpenAIDecisionKind,
+    OpenAIDecisionRequest,
     OpenAIDecisionResult,
 )
 
@@ -308,7 +311,34 @@ def test_corrective_oversized_persisted_values_are_rejected_without_session_muta
         for number in range(1, 6)
     ]
     for candidate in oversized_candidates:
-        candidate.website = "\x01" * 700
+        candidate.name = "N" + "\x01" * 199
+        candidate.website = "\x02" * 500
+        assert len(candidate.name) <= 255
+        assert len(candidate.website) <= 500
+
+    expected_request = OpenAIDecisionRequest(
+        goal="Choose",
+        candidates=tuple(
+            OpenAIDecisionCandidate(
+                index=index,
+                name=cast(str, candidate.name),
+                website=candidate.website,
+                country=candidate.country_code,
+                city=None,
+                industry=None,
+                snippet=None,
+                website_summary=None,
+            )
+            for index, candidate in enumerate(oversized_candidates, start=1)
+        ),
+    )
+    expected_serialized = json.dumps(
+        expected_request.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert len(expected_serialized.encode("utf-8")) > 20_000
 
     ordinary_run = create_run(
         repository,
@@ -391,6 +421,82 @@ def test_corrective_oversized_persisted_values_are_rejected_without_session_muta
             )
             for row in verification.scalars(select(CompanyDiscoveryCandidate))
         } == candidate_snapshot
+        assert verification.scalar(select(func.count()).select_from(Company)) == 0
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+        assert verification.scalar(select(func.count()).select_from(Lead)) == 0
+        assert verification.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_persisted_candidate_surrogate_is_sanitized_without_mutation(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, profile = project_and_profile(session, "Surrogate")
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = create_run(repository, project, profile, CompanyDiscoveryRunStatus.SUCCEEDED)
+    candidate = create_candidate(repository, project.id, run.id, 1, position=1)
+    session.commit()
+    original_website = candidate.website
+    install_network_guards(monkeypatch)
+    candidate.website = "https://example.test/\ud800"
+
+    with (
+        session.no_autoflush,
+        pytest.raises(
+            AgentCompanySelectionInvalidDataError,
+            match="^Agent company selection data is invalid\\.$",
+        ) as exc_info,
+    ):
+        AgentCompanySelectionService(cast(AgentCompanySelectionRepository, repository)).prepare(
+            project_id=project.id,
+            run_id=run.id,
+            goal="Choose",
+            max_candidates=5,
+        )
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    session.rollback()
+    bind = session.get_bind()
+    with Session(bind, expire_on_commit=False) as verification:
+        persisted = verification.get_one(CompanyDiscoveryCandidate, candidate.id)
+        assert persisted.website == original_website
+        assert verification.scalar(select(func.count()).select_from(Company)) == 0
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+        assert verification.scalar(select(func.count()).select_from(Lead)) == 0
+        assert verification.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_persisted_valid_unicode_prepares_read_only(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, profile = project_and_profile(session, "Unicode")
+    repository = CompanyDiscoveryStagingRepository(session)
+    run = create_run(repository, project, profile, CompanyDiscoveryRunStatus.SUCCEEDED)
+    candidate = create_candidate(repository, project.id, run.id, 1, position=1)
+    candidate.name = "Компания Việt Nam 🙂"
+    candidate.website = "https://пример.test/مرحبا"
+    session.commit()
+    install_network_guards(monkeypatch)
+
+    selection = AgentCompanySelectionService(
+        cast(AgentCompanySelectionRepository, repository)
+    ).prepare(
+        project_id=project.id,
+        run_id=run.id,
+        goal="Выбрать أفضل компанию 🙂",
+        max_candidates=5,
+    )
+
+    assert selection.request.candidates[0].name == "Компания Việt Nam 🙂"
+    assert selection.request.candidates[0].website == "https://пример.test/مرحبا"
+    session.rollback()
+    bind = session.get_bind()
+    with Session(bind, expire_on_commit=False) as verification:
+        persisted = verification.get_one(CompanyDiscoveryCandidate, candidate.id)
+        assert persisted.name == "Компания Việt Nam 🙂"
+        assert persisted.website == "https://пример.test/مرحبا"
         assert verification.scalar(select(func.count()).select_from(Company)) == 0
         assert verification.scalar(select(func.count()).select_from(Contact)) == 0
         assert verification.scalar(select(func.count()).select_from(Lead)) == 0

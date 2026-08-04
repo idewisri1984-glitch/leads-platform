@@ -1,6 +1,8 @@
 import ast
 import inspect
 import json
+import logging
+import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -951,3 +953,157 @@ def test_prepare_rejects_mapping_and_non_sequence_collection() -> None:
     for candidates in ({"candidate": _CorrectiveCandidate()}, (_ for _ in ())):
         with pytest.raises(AgentCompanySelectionConsistencyError):
             _corrective_prepare(candidates)
+
+
+@pytest.mark.parametrize(
+    ("source", "surrogate"),
+    [
+        ("goal", "\ud800"),
+        ("goal", "\udfff"),
+        ("name", "\ud800"),
+        ("name", "\udfff"),
+        ("website", "\ud800"),
+        ("website", "\udfff"),
+    ],
+)
+def test_prepare_sanitizes_unpaired_surrogate_encoding_failures(
+    source: str,
+    surrogate: str,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    candidate = _CorrectiveCandidate()
+    goal = "Choose one"
+    if source == "goal":
+        goal = f"Choose {surrogate}"
+    elif source == "name":
+        candidate.name = f"Candidate {surrogate}"
+    else:
+        candidate.website = f"https://example.test/{surrogate}"
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(
+            AgentCompanySelectionInvalidDataError,
+            match="^Agent company selection data is invalid\\.$",
+        ) as exc_info,
+    ):
+        _corrective_prepare((candidate,), goal=goal)
+
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert surrogate not in str(exc_info.value)
+    assert surrogate not in repr(exc_info.value)
+    assert surrogate not in rendered
+    assert "UnicodeEncodeError" not in rendered
+    assert "surrogates not allowed" not in rendered
+    assert capsys.readouterr() == ("", "")
+    assert caplog.records == []
+
+
+def test_prepare_rejects_surrogate_country_without_raw_unicode_error() -> None:
+    candidate = _CorrectiveCandidate()
+    candidate.country_code = "U\ud800"
+    with pytest.raises(AgentCompanySelectionConsistencyError) as exc_info:
+        _corrective_prepare((candidate,))
+    assert str(exc_info.value) == INCONSISTENT
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_prepare_accepts_valid_multibyte_unicode() -> None:
+    candidates = (
+        _CorrectiveCandidate(
+            candidate_id=11,
+            name="Компания 🙂",
+            website="https://пример.test/مرحبا",
+            identity_key="unicode-one",
+        ),
+        _CorrectiveCandidate(
+            candidate_id=12,
+            name="Công ty Việt Nam",
+            website="https://example.test/équipe",
+            identity_key="unicode-two",
+            best_position=2,
+        ),
+    )
+    selection = _corrective_prepare(
+        candidates,
+        goal="Выбрать أفضل компанию 🙂",
+    )
+    assert selection.request.goal == "Выбрать أفضل компанию 🙂"
+    assert tuple(candidate.name for candidate in selection.request.candidates) == (
+        "Компания 🙂",
+        "Công ty Việt Nam",
+    )
+
+
+@pytest.mark.parametrize("field", ["goal", "name", "website", "country"])
+def test_resolution_rejects_reconstructed_surrogate_request_without_repository_calls(
+    field: str,
+) -> None:
+    selection = _corrective_prepare((_CorrectiveCandidate(),))
+    candidate_data = selection.request.candidates[0].model_dump()
+    goal = selection.request.goal
+    if field == "goal":
+        goal = "Choose \ud800"
+    else:
+        candidate_data[field] = "value\ud800"
+    candidate = OpenAIDecisionCandidate.model_construct(**candidate_data)
+    request = OpenAIDecisionRequest.model_construct(goal=goal, candidates=(candidate,))
+    invalid = AgentCompanySelectionInput.model_construct(
+        project_id=selection.project_id,
+        run_id=selection.run_id,
+        request=request,
+        bindings=selection.bindings,
+    )
+    repository = _CorrectiveRepository(())
+
+    with pytest.raises(
+        AgentCompanySelectionConsistencyError,
+        match="^Agent company selection state is inconsistent\\.$",
+    ) as exc_info:
+        AgentCompanySelectionService(repository).resolve_selected_candidate_id(
+            invalid,
+            _corrective_select(),
+        )
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert repository.get_calls == 0
+    assert repository.list_calls == 0
+
+
+def test_resolution_rejects_reconstructed_oversized_request() -> None:
+    goal, candidates = _corrective_goal_for_serialized_size(20_001)
+    baseline = _corrective_prepare(candidates, goal="x")
+    oversized_request = OpenAIDecisionRequest(
+        goal=goal,
+        candidates=baseline.request.candidates,
+    )
+    serialized = json.dumps(
+        oversized_request.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert len(serialized.encode("utf-8")) == 20_001
+    invalid = AgentCompanySelectionInput.model_construct(
+        project_id=baseline.project_id,
+        run_id=baseline.run_id,
+        request=oversized_request,
+        bindings=baseline.bindings,
+    )
+    repository = _CorrectiveRepository(())
+
+    with pytest.raises(AgentCompanySelectionConsistencyError) as exc_info:
+        AgentCompanySelectionService(repository).resolve_selected_candidate_id(
+            invalid,
+            _corrective_select(),
+        )
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert repository.get_calls == 0
+    assert repository.list_calls == 0
