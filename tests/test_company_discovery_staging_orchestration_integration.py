@@ -100,6 +100,8 @@ class FakeExecutionService:
         profile: SearchProfileRead,
         provider: DiscoveryProvider,
         options: SearchProfileRunOptions | None = None,
+        *,
+        precomputed_preview: SearchQueryPreview | None = None,
     ) -> SearchProfileDiscoveryDryRunResult:
         self.calls.append((profile, provider, options))
         if isinstance(self.result, BaseException):

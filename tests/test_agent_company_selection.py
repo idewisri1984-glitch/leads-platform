@@ -127,6 +127,21 @@ def decision(kind: OpenAIDecisionKind = OpenAIDecisionKind.SELECT) -> OpenAIDeci
 
 def test_package_exports_are_exact() -> None:
     assert agent_package.__all__ == [
+        "AgentCompanyPlanBindingError",
+        "AgentCompanyPlanDecisionError",
+        "AgentCompanyPlanDiscoveryDataError",
+        "AgentCompanyPlanError",
+        "AgentCompanyPlanInput",
+        "AgentCompanyPlanInternalError",
+        "AgentCompanyPlanInvalidDataError",
+        "AgentCompanyPlanPersistenceError",
+        "AgentCompanyPlanProjectNotFoundError",
+        "AgentCompanyPlanResult",
+        "AgentCompanyPlanSearchProfileNotFoundError",
+        "AgentCompanyPlanSearchProfileNotReadyError",
+        "AgentCompanyPlanSearchProviderError",
+        "AgentCompanyPlanSelectionError",
+        "AgentCompanyPlanService",
         "AgentCompanySelectionBinding",
         "AgentCompanySelectionConsistencyError",
         "AgentCompanySelectionError",
@@ -153,6 +168,9 @@ def test_public_signatures_and_schema_fields_are_exact() -> None:
     assert tuple(
         inspect.signature(AgentCompanySelectionService.resolve_selected_candidate_id).parameters
     ) == ("self", "selection", "decision")
+    assert tuple(
+        inspect.signature(AgentCompanySelectionService.revalidate_selection_input).parameters
+    ) == ("self", "selection")
     assert tuple(AgentCompanySelectionBinding.model_fields) == ("index", "candidate_id")
     assert tuple(AgentCompanySelectionInput.model_fields) == (
         "project_id",
@@ -849,6 +867,45 @@ def test_resolution_rejects_bypassed_duplicate_bindings_without_repository_calls
         )
     assert repository.get_calls == 0
     assert repository.list_calls == 0
+
+
+def test_public_selection_revalidation_is_deep_pure_and_reused() -> None:
+    repository = RepositorySpy()
+    selection_service = service(repository)
+    original = selection_input()
+
+    validated = selection_service.revalidate_selection_input(original)
+
+    assert validated == original
+    assert validated is not original
+    assert validated.request is not original.request
+    assert repository.calls == []
+    assert selection_service.resolve_selected_candidate_id(original, decision()) == 11
+
+    malformed_candidate = OpenAIDecisionCandidate.model_construct(
+        index=1,
+        name="",
+        website=None,
+        country=None,
+        city=None,
+        industry=None,
+        snippet=None,
+        website_summary=None,
+    )
+    malformed_request = OpenAIDecisionRequest.model_construct(
+        goal="Choose",
+        candidates=(malformed_candidate,),
+    )
+    malformed = AgentCompanySelectionInput.model_construct(
+        project_id=3,
+        run_id=7,
+        request=malformed_request,
+        bindings=original.bindings,
+    )
+    with pytest.raises(AgentCompanySelectionConsistencyError) as caught:
+        selection_service.revalidate_selection_input(malformed)
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert repository.calls == []
 
 
 @pytest.mark.parametrize(

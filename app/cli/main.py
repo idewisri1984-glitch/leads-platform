@@ -1,5 +1,6 @@
 import typer
 
+from app.cli.agent import app as agent_app
 from app.cli.company import app as company_app
 from app.cli.company_discovery import app as company_discovery_app
 from app.cli.company_enrichment import app as company_enrichment_app
@@ -12,6 +13,11 @@ from app.cli.task import app as task_app
 
 app = typer.Typer(
     help="Bali Leads Platform CLI",
+)
+
+app.add_typer(
+    agent_app,
+    name="agent",
 )
 
 app.add_typer(

@@ -43,6 +43,12 @@ class CompanyDiscoveryStagingServiceError(ValueError):
     """Raised for malformed local orchestration configuration."""
 
 
+@dataclass(frozen=True, slots=True)
+class CompanyDiscoveryBoundedPlanRunResult:
+    staging_result: CompanyDiscoveryStagingRunResult
+    query: str
+
+
 _ALLOWED_ORCHESTRATION_ERROR_CODES = {
     "authentication_error",
     "configuration_error",
@@ -87,6 +93,60 @@ class CompanyDiscoveryStagingService:
         dry_run: bool,
         repository: CompanyDiscoveryStagingRepository | None = None,
     ) -> CompanyDiscoveryStagingRunResult:
+        return self._run(
+            profile=profile,
+            provider=provider,
+            options=options,
+            dry_run=dry_run,
+            repository=repository,
+            require_single_query=False,
+            precomputed_preview=None,
+        )
+
+    def run_bounded_plan(
+        self,
+        *,
+        profile: SearchProfileRead,
+        provider: DiscoveryProvider,
+        options: SearchProfileRunOptions | None = None,
+        dry_run: bool,
+        repository: CompanyDiscoveryStagingRepository | None = None,
+    ) -> CompanyDiscoveryBoundedPlanRunResult:
+        generated_preview = self.query_generator.generate_preview(profile, options)
+        preview = SearchProfileDiscoveryService.revalidate_query_preview(profile, generated_preview)
+        if (
+            preview.query_count != 1
+            or preview.estimated_provider_requests != 1
+            or len(preview.queries) != 1
+        ):
+            raise CompanyDiscoveryStagingServiceError(
+                "Bounded Agent planning requires exactly one query."
+            )
+        staging_result = self._run(
+            profile=profile,
+            provider=provider,
+            options=options,
+            dry_run=dry_run,
+            repository=repository,
+            require_single_query=True,
+            precomputed_preview=preview,
+        )
+        return CompanyDiscoveryBoundedPlanRunResult(
+            staging_result=staging_result,
+            query=preview.queries[0].text,
+        )
+
+    def _run(
+        self,
+        *,
+        profile: SearchProfileRead,
+        provider: DiscoveryProvider,
+        options: SearchProfileRunOptions | None,
+        dry_run: bool,
+        repository: CompanyDiscoveryStagingRepository | None,
+        require_single_query: bool,
+        precomputed_preview: SearchQueryPreview | None,
+    ) -> CompanyDiscoveryStagingRunResult:
         effective_repository = repository or self.repository
 
         if not dry_run and effective_repository is None:
@@ -94,7 +154,21 @@ class CompanyDiscoveryStagingService:
                 "A staging repository is required for persisted runs."
             )
 
-        preview = self.query_generator.generate_preview(profile, options)
+        if precomputed_preview is None:
+            generated_preview = self.query_generator.generate_preview(profile, options)
+            preview = SearchProfileDiscoveryService.revalidate_query_preview(
+                profile, generated_preview
+            )
+        else:
+            preview = precomputed_preview
+        if require_single_query and (
+            preview.query_count != 1
+            or preview.estimated_provider_requests != 1
+            or len(preview.queries) != 1
+        ):
+            raise CompanyDiscoveryStagingServiceError(
+                "Bounded Agent planning requires exactly one query."
+            )
 
         try:
             provider_name = self._resolve_provider_name(provider)
@@ -121,7 +195,12 @@ class CompanyDiscoveryStagingService:
             )
 
         try:
-            execution_result = self.execution_service.run_dry(profile, provider, options)
+            execution_result = self.execution_service.run_dry(
+                profile,
+                provider,
+                options,
+                precomputed_preview=preview,
+            )
         except SearchProfileDiscoveryExecutionError:
             raise
         except Exception:
