@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
@@ -318,7 +319,19 @@ def test_concurrent_same_candidate_converges_on_one_company(
     with database() as setup:
         project, run, candidate = _real_fixture(setup)
         project_id, run_id, candidate_id = project.id, run.id, candidate.id
+        run_state = (
+            run.id,
+            run.project_id,
+            run.run_status,
+            run.request_fingerprint,
+            deepcopy(run.request_snapshot),
+            run.query_count,
+            run.result_count,
+            run.candidate_count,
+            run.error_code,
+        )
         setup.commit()
+        del project, run, candidate
     barrier = Barrier(2)
     with ThreadPoolExecutor(max_workers=2) as executor:
         outcomes = list(
@@ -335,9 +348,21 @@ def test_concurrent_same_candidate_converges_on_one_company(
             )
     with database() as verification:
         stored = verification.get_one(CompanyDiscoveryCandidate, candidate_id)
+        persisted_run = verification.get_one(CompanyDiscoveryRun, run_id)
         assert len(set(company_ids)) == 1
         assert stored.candidate_status == CompanyDiscoveryCandidateStatus.PROMOTED.value
         assert stored.promoted_company_id == company_ids[0]
+        assert (
+            persisted_run.id,
+            persisted_run.project_id,
+            persisted_run.run_status,
+            persisted_run.request_fingerprint,
+            deepcopy(persisted_run.request_snapshot),
+            persisted_run.query_count,
+            persisted_run.result_count,
+            persisted_run.candidate_count,
+            persisted_run.error_code,
+        ) == run_state
         assert verification.scalar(select(func.count()).select_from(Company)) == 1
         assert verification.scalar(select(func.count()).select_from(Contact)) == 0
         assert verification.scalar(select(func.count()).select_from(Lead)) == 0
