@@ -21,6 +21,12 @@ from app.providers.serpapi.exceptions import (
 API_KEY = "test-serpapi-key"
 BASE_URL = "https://serpapi.test/search.json"
 _RAW_PAYLOAD_MARKER = "raw payload marker"
+_EXPECTED_JSON_RESTRICTOR = (
+    "search_metadata.{status},"
+    "search_information.{total_results,organic_results_state},"
+    "error,"
+    "organic_results[].{position,title,link,snippet,source}"
+)
 
 
 def make_client(
@@ -310,24 +316,32 @@ def test_organic_results_parse_correctly() -> None:
 
 
 def test_success_status_with_non_empty_organic_results_is_parsed() -> None:
-    client = make_client(
-        lambda request: httpx.Response(
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
             200,
             json={
                 "search_metadata": {"status": "Success"},
-                "search_information": {"total_results": 3},
+                "search_information": {
+                    "total_results": 157,
+                    "organic_results_state": "Results for exact spelling",
+                },
                 "organic_results": [
                     {
-                        "position": 7,
-                        "title": "Acme Bali",
-                        "link": "https://acme.example",
-                        "snippet": "Software company in Bali.",
-                        "source": "Acme",
+                        "position": 1,
+                        "title": "Example Interior Design",
+                        "link": "https://example.com",
+                        "snippet": "Interior design firm.",
+                        "source": "Example",
                     }
                 ],
             },
         )
-    )
+
+    client = make_client(handler)
 
     response = client.search_companies(
         query="software",
@@ -338,9 +352,14 @@ def test_success_status_with_non_empty_organic_results_is_parsed() -> None:
     )
 
     assert response.query == "software"
-    assert response.total_results == 3
+    assert response.total_results == 157
     assert len(response.results) == 1
-    assert response.results[0].position == 7
+    assert response.results[0].position == 1
+    assert response.results[0].title == "Example Interior Design"
+    assert response.results[0].link == "https://example.com"
+    assert response.results[0].snippet == "Interior design firm."
+    assert response.results[0].source == "Example"
+    assert calls == 1
 
 
 def test_success_status_with_explicit_empty_organic_results_is_parsed() -> None:
@@ -656,17 +675,21 @@ def test_invalid_result_limits_are_rejected_without_request(limit: int) -> None:
     assert calls == 0
 
 
-def test_request_sends_restrictor_timeout_and_exactly_once() -> None:
+def test_request_sends_exact_restrictor_contract_and_timeout_once() -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
         params = parse_qs(request.url.query.decode())
-        restrictor = params["json_restrictor"][0]
-        assert "search_metadata[status]" in restrictor
-        assert "search_information[total_results,organic_results_state]" in restrictor
-        assert "organic_results[position,title,link,snippet,source]" in restrictor
+        assert params == {
+            "engine": ["google"],
+            "q": ["interior design firms Bali Indonesia"],
+            "api_key": [API_KEY],
+            "num": ["5"],
+            "json_restrictor": [_EXPECTED_JSON_RESTRICTOR],
+            "gl": ["id"],
+        }
         assert request.extensions["timeout"] == {
             "connect": 5.0,
             "read": 5.0,
@@ -676,43 +699,28 @@ def test_request_sends_restrictor_timeout_and_exactly_once() -> None:
         return httpx.Response(200, json={"organic_results": []})
 
     make_client(handler).search_companies(
-        query="companies", country=None, city=None, industry=None, limit=10
+        query="interior design",
+        country="Indonesia",
+        city="Bali",
+        industry="firms",
+        limit=5,
+        iso_country_code="ID",
     )
     assert calls == 1
 
 
-def test_json_restrictor_contains_only_expected_paths() -> None:
+def test_json_restrictor_occurs_once_with_exact_decoded_value() -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        params = parse_qs(request.url.query.decode())
-        restrictor = params["json_restrictor"][0]
-        parts: list[str] = []
-        current: list[str] = []
-        bracket_depth = 0
-        for character in restrictor:
-            if character == "[":
-                bracket_depth += 1
-            elif character == "]":
-                bracket_depth -= 1
-            elif character == "," and bracket_depth == 0:
-                parts.append("".join(current))
-                current = []
-                continue
-            current.append(character)
-        parts.append("".join(current))
-        expected_paths = {
-            "search_metadata[status]",
-            "search_information[total_results,organic_results_state]",
-            "error",
-            "organic_results[position,title,link,snippet,source]",
-        }
-        assert set(parts) == expected_paths
-        assert "search_parameters" not in restrictor
-        assert "account api" not in restrictor.casefold()
-        assert API_KEY not in restrictor
+        restrictors = [
+            value for key, value in request.url.params.multi_items() if key == "json_restrictor"
+        ]
+        assert restrictors == [_EXPECTED_JSON_RESTRICTOR]
+        assert "gl" not in request.url.params
+        assert API_KEY not in restrictors[0]
         return httpx.Response(200, json={"organic_results": []})
 
     make_client(handler).search_companies(
