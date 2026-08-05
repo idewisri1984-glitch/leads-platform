@@ -58,6 +58,19 @@ from .company_selection_schemas import (
 )
 
 __all__ = [
+    "AgentCompanyApplyConflictError",
+    "AgentCompanyApplyConfirmationRequiredError",
+    "AgentCompanyApplyConsistencyError",
+    "AgentCompanyApplyError",
+    "AgentCompanyApplyInput",
+    "AgentCompanyApplyInternalError",
+    "AgentCompanyApplyInvalidDataError",
+    "AgentCompanyApplyNotEligibleError",
+    "AgentCompanyApplyNotFoundError",
+    "AgentCompanyApplyPersistenceError",
+    "AgentCompanyApplyResult",
+    "AgentCompanyApplyService",
+    "AgentCompanyApplyStaleHandoffError",
     "AgentCompanyPlanBindingError",
     "AgentCompanyPlanDecisionError",
     "AgentCompanyPlanDiscoveryDataError",
@@ -83,3 +96,17 @@ __all__ = [
     "AgentCompanySelectionRunNotReadyError",
     "AgentCompanySelectionService",
 ]
+from .company_apply import (
+    AgentCompanyApplyConfirmationRequiredError,
+    AgentCompanyApplyConflictError,
+    AgentCompanyApplyConsistencyError,
+    AgentCompanyApplyError,
+    AgentCompanyApplyInternalError,
+    AgentCompanyApplyInvalidDataError,
+    AgentCompanyApplyNotEligibleError,
+    AgentCompanyApplyNotFoundError,
+    AgentCompanyApplyPersistenceError,
+    AgentCompanyApplyService,
+    AgentCompanyApplyStaleHandoffError,
+)
+from .company_apply_schemas import AgentCompanyApplyInput, AgentCompanyApplyResult
