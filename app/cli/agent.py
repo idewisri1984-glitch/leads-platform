@@ -1,10 +1,11 @@
 import json
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Annotated, Never, Protocol, cast
+from typing import Annotated, Any, Never, Protocol, cast
 
 import typer
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from typer import _click as click
 from typer._click.exceptions import UsageError
@@ -13,6 +14,19 @@ from typer.core import TyperCommand
 from app.core.config.settings import settings
 from app.core.database.session import SessionLocal
 from app.modules.agent import (
+    AgentCompanyApplyConfirmationRequiredError,
+    AgentCompanyApplyConflictError,
+    AgentCompanyApplyConsistencyError,
+    AgentCompanyApplyError,
+    AgentCompanyApplyInput,
+    AgentCompanyApplyInternalError,
+    AgentCompanyApplyInvalidDataError,
+    AgentCompanyApplyNotEligibleError,
+    AgentCompanyApplyNotFoundError,
+    AgentCompanyApplyPersistenceError,
+    AgentCompanyApplyResult,
+    AgentCompanyApplyService,
+    AgentCompanyApplyStaleHandoffError,
     AgentCompanyPlanBindingError,
     AgentCompanyPlanDecisionError,
     AgentCompanyPlanDiscoveryDataError,
@@ -32,7 +46,12 @@ from app.modules.agent import (
 )
 from app.modules.agent.company_plan import DecisionBoundary
 from app.modules.agent.company_selection import AgentCompanySelectionRepository
-from app.modules.company_discovery import SerpApiDiscoveryProvider
+from app.modules.company.repository import CompanyRepository
+from app.modules.company_discovery import (
+    CompanyDiscoveryCandidatePromotionService,
+    CompanyDiscoveryCandidateReviewService,
+    SerpApiDiscoveryProvider,
+)
 from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
 from app.modules.company_discovery.schemas import DiscoveryProviderResponse
 from app.modules.company_discovery.staging_orchestration import (
@@ -320,6 +339,189 @@ def plan_company_selection(
         raise typer.Exit(exit_code) from None
     except Exception:
         typer.echo(_INTERNAL_MESSAGE, err=True)
+        raise typer.Exit(1) from None
+    typer.echo(rendered)
+
+
+_APPLY_INVALID = "Agent company apply data is invalid."
+_APPLY_CONFIRMATION = "Agent company apply requires --yes."
+_APPLY_INTERNAL = "Agent company apply failed."
+_APPLY_OPTIONS = (
+    "--project-id",
+    "--discovery-run-id",
+    "--candidate-id",
+    "--yes",
+    "--output",
+)
+_APPLY_FIELD_ORDER = tuple(AgentCompanyApplyResult.model_fields)
+_APPLY_ERROR_CODES: tuple[tuple[type[AgentCompanyApplyError], int], ...] = (
+    (AgentCompanyApplyInvalidDataError, 2),
+    (AgentCompanyApplyConfirmationRequiredError, 3),
+    (AgentCompanyApplyNotFoundError, 4),
+    (AgentCompanyApplyStaleHandoffError, 5),
+    (AgentCompanyApplyNotEligibleError, 6),
+    (AgentCompanyApplyConsistencyError, 7),
+    (AgentCompanyApplyConflictError, 8),
+    (AgentCompanyApplyPersistenceError, 9),
+    (AgentCompanyApplyInternalError, 1),
+)
+
+
+class _AgentApplyCommand(TyperCommand):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not any(arg in {"--help", "-h"} for arg in args):
+            for option in _APPLY_OPTIONS:
+                occurrences = sum(arg == option or arg.startswith(f"{option}=") for arg in args)
+                if occurrences > 1:
+                    self._invalid_input()
+        try:
+            return super().parse_args(ctx, args)
+        except UsageError:
+            self._invalid_input()
+
+    @staticmethod
+    def _invalid_input() -> Never:
+        click.echo(_APPLY_INVALID, err=True)
+        raise click.exceptions.Exit(2)
+
+
+def _apply_positive_integer(value: str) -> int:
+    invalid = False
+    parsed = 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        invalid = True
+    if invalid or parsed <= 0 or value.strip() != value:
+        raise AgentCompanyApplyInvalidDataError(_APPLY_INVALID)
+    return parsed
+
+
+def render_agent_company_apply(result: AgentCompanyApplyResult, output: str) -> str:
+    if type(result) is not AgentCompanyApplyResult or output not in {"text", "json"}:
+        raise AgentCompanyApplyInternalError(_APPLY_INTERNAL)
+    invalid = False
+    validated: AgentCompanyApplyResult | None = None
+    try:
+        snapshot = {field: getattr(result, field) for field in AgentCompanyApplyResult.model_fields}
+        validated = AgentCompanyApplyResult(**snapshot)
+    except (AttributeError, TypeError, ValueError, ValidationError):
+        invalid = True
+    if invalid or validated is None:
+        raise AgentCompanyApplyInternalError(_APPLY_INTERNAL)
+    values = validated.model_dump(mode="json")
+    if output == "json":
+        rendered = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    else:
+        rendered = "\n".join(
+            f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
+            for field in _APPLY_FIELD_ORDER
+        )
+    encoding_failed = False
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError:
+        encoding_failed = True
+    if encoding_failed:
+        raise AgentCompanyApplyInternalError(_APPLY_INTERNAL)
+    return rendered
+
+
+def _cleanup_preserving_primary(operation: Callable[[], object]) -> None:
+    cleanup_failed = False
+    try:
+        operation()
+    except BaseException:
+        cleanup_failed = True
+    if cleanup_failed:
+        return
+
+
+def _execute_agent_company_apply(
+    data: AgentCompanyApplyInput,
+    output: str,
+    *,
+    session_factory: _SessionFactory = SessionLocal,
+) -> str:
+    session = session_factory()
+    committed = False
+    primary_active = False
+    try:
+        staging_repository = CompanyDiscoveryStagingRepository(session)
+        company_repository = CompanyRepository(session)
+        service = AgentCompanyApplyService(
+            staging_repository=cast(Any, staging_repository),
+            company_repository=cast(Any, company_repository),
+            review_service=CompanyDiscoveryCandidateReviewService(staging_repository),
+            promotion_service=CompanyDiscoveryCandidatePromotionService(
+                staging_repository, company_repository
+            ),
+        )
+        result = service.apply(data)
+        rendered = render_agent_company_apply(result, output)
+        commit_failed = False
+        commit_conflict = False
+        try:
+            session.commit()
+            committed = True
+        except IntegrityError:
+            commit_conflict = True
+        except Exception:
+            commit_failed = True
+        if commit_conflict:
+            raise AgentCompanyApplyConflictError("Agent company apply persistence conflict.")
+        if commit_failed:
+            raise AgentCompanyApplyPersistenceError("Agent company apply could not be persisted.")
+        return rendered
+    except BaseException:
+        primary_active = True
+        if not committed:
+            _cleanup_preserving_primary(session.rollback)
+        raise
+    finally:
+        if primary_active:
+            _cleanup_preserving_primary(session.close)
+        else:
+            session.close()
+
+
+@company_select_app.command("apply", cls=_AgentApplyCommand)
+def apply_company_selection(
+    project_id: Annotated[str, typer.Option("--project-id", metavar="INTEGER", help="Project ID.")],
+    discovery_run_id: Annotated[
+        str,
+        typer.Option("--discovery-run-id", metavar="INTEGER", help="Discovery run ID."),
+    ],
+    candidate_id: Annotated[
+        str, typer.Option("--candidate-id", metavar="INTEGER", help="Candidate ID.")
+    ],
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm Company apply.")] = False,
+    output: Annotated[str, typer.Option("--output", help="Output format: text or json.")] = "text",
+) -> None:
+    if not yes:
+        typer.echo(_APPLY_CONFIRMATION, err=True)
+        raise typer.Exit(3)
+    try:
+        if output not in {"text", "json"}:
+            raise AgentCompanyApplyInvalidDataError(_APPLY_INVALID)
+        data = AgentCompanyApplyInput(
+            project_id=_apply_positive_integer(project_id),
+            discovery_run_id=_apply_positive_integer(discovery_run_id),
+            candidate_id=_apply_positive_integer(candidate_id),
+            confirmed=True,
+        )
+        rendered = _execute_agent_company_apply(data, output)
+    except ValidationError:
+        typer.echo(_APPLY_INVALID, err=True)
+        raise typer.Exit(2) from None
+    except AgentCompanyApplyError as error:
+        exit_code = next(
+            (code for error_type, code in _APPLY_ERROR_CODES if isinstance(error, error_type)), 1
+        )
+        typer.echo(str(error), err=True)
+        raise typer.Exit(exit_code) from None
+    except Exception:
+        typer.echo(_APPLY_INTERNAL, err=True)
         raise typer.Exit(1) from None
     typer.echo(rendered)
 

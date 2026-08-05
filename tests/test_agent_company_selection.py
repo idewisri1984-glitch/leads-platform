@@ -127,6 +127,19 @@ def decision(kind: OpenAIDecisionKind = OpenAIDecisionKind.SELECT) -> OpenAIDeci
 
 def test_package_exports_are_exact() -> None:
     assert agent_package.__all__ == [
+        "AgentCompanyApplyConflictError",
+        "AgentCompanyApplyConfirmationRequiredError",
+        "AgentCompanyApplyConsistencyError",
+        "AgentCompanyApplyError",
+        "AgentCompanyApplyInput",
+        "AgentCompanyApplyInternalError",
+        "AgentCompanyApplyInvalidDataError",
+        "AgentCompanyApplyNotEligibleError",
+        "AgentCompanyApplyNotFoundError",
+        "AgentCompanyApplyPersistenceError",
+        "AgentCompanyApplyResult",
+        "AgentCompanyApplyService",
+        "AgentCompanyApplyStaleHandoffError",
         "AgentCompanyPlanBindingError",
         "AgentCompanyPlanDecisionError",
         "AgentCompanyPlanDiscoveryDataError",
@@ -153,7 +166,24 @@ def test_package_exports_are_exact() -> None:
         "AgentCompanySelectionService",
     ]
     assert all(hasattr(agent_package, name) for name in agent_package.__all__)
+    stage_2c_exports = agent_package.__all__[:13]
+    assert all(getattr(agent_package, name).__name__ == name for name in stage_2c_exports)
+    assert len(agent_package.__all__) == len(set(agent_package.__all__))
     assert not hasattr(agent_package, "AgentCompanySelectionRepository")
+    assert all(
+        name not in agent_package.__all__
+        for name in (
+            "_StagingRepository",
+            "_CompanyRepository",
+            "_RunSnapshot",
+            "_CandidateSnapshot",
+            "_CompanySnapshot",
+            "_execute_agent_company_apply",
+            "_AgentApplyCommand",
+            "render_agent_company_apply",
+            "_SessionFactory",
+        )
+    )
 
 
 def test_public_signatures_and_schema_fields_are_exact() -> None:
