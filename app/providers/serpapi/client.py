@@ -26,8 +26,10 @@ from app.providers.serpapi.schemas import (
 DEFAULT_MAX_RESPONSE_BYTES = 2_000_000
 _MAX_CONFIGURED_RESPONSE_BYTES = 20_000_000
 _JSON_RESTRICTOR = (
-    "search_metadata[status],search_information[total_results,organic_results_state],"
-    "error,organic_results[position,title,link,snippet,source]"
+    "search_metadata.{status},"
+    "search_information.{total_results,organic_results_state},"
+    "error,"
+    "organic_results[].{position,title,link,snippet,source}"
 )
 _QUOTA_MESSAGES = frozenset(
     {
