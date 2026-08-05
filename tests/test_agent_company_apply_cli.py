@@ -190,6 +190,117 @@ def test_apply_help_is_successful_without_confirmation() -> None:
     assert "--yes" in result.stdout
 
 
+def test_unknown_option_is_rejected_before_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    constructions = 0
+
+    def execute(*args: object, **kwargs: object) -> str:
+        nonlocal constructions
+        constructions += 1
+        return "unexpected"
+
+    monkeypatch.setattr(agent_cli, "_execute_agent_company_apply", execute)
+    result = runner.invoke(app, COMMAND + VALID + ["--yes", "--unknown-option"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert result.stderr == "Agent company apply data is invalid.\n"
+    assert "Usage" not in result.stderr and "Traceback" not in result.stderr
+    assert constructions == 0
+
+
+class _PublicBoundarySession:
+    def __init__(self) -> None:
+        self.commits = 0
+        self.rollbacks = 0
+        self.closes = 0
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+def _install_public_executor_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    service_result: object,
+    session: _PublicBoundarySession,
+) -> list[int]:
+    monkeypatch.setattr(
+        agent_cli, "CompanyDiscoveryStagingRepository", lambda active_session: object()
+    )
+    monkeypatch.setattr(agent_cli, "CompanyRepository", lambda active_session: object())
+    monkeypatch.setattr(
+        agent_cli, "CompanyDiscoveryCandidateReviewService", lambda repository: object()
+    )
+    monkeypatch.setattr(
+        agent_cli,
+        "CompanyDiscoveryCandidatePromotionService",
+        lambda staging, companies: object(),
+    )
+
+    class Service:
+        def __init__(self, **dependencies: object) -> None:
+            assert len(dependencies) == 4
+
+        def apply(self, data: AgentCompanyApplyInput) -> object:
+            if isinstance(service_result, BaseException):
+                raise service_result
+            return service_result
+
+    monkeypatch.setattr(agent_cli, "AgentCompanyApplyService", Service)
+    real_execute = agent_cli._execute_agent_company_apply
+    constructions = [0]
+
+    def execute(data: AgentCompanyApplyInput, output: str) -> str:
+        constructions[0] += 1
+        return real_execute(data, output, session_factory=lambda: session)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(agent_cli, "_execute_agent_company_apply", execute)
+    return constructions
+
+
+def test_public_unexpected_executor_failure_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _PublicBoundarySession()
+    constructions = _install_public_executor_boundary(
+        monkeypatch, RuntimeError("unexpected secret"), session
+    )
+    result = runner.invoke(app, COMMAND + VALID + ["--yes"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "Agent company apply failed.\n"
+    assert "Usage" not in result.stderr and "Traceback" not in result.stderr
+    assert "unexpected secret" not in result.stderr
+    assert constructions == [1]
+    assert (session.commits, session.rollbacks, session.closes) == (0, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "hostile_payload",
+    ["\ud800", "line\nfeed", "carriage\rreturn", "tab\tvalue", "control\x01value"],
+)
+def test_public_real_renderer_rejects_hostile_result_before_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    hostile_payload: str,
+) -> None:
+    hostile = _result().model_copy()
+    object.__setattr__(hostile, "company_id", hostile_payload)
+    session = _PublicBoundarySession()
+    constructions = _install_public_executor_boundary(monkeypatch, hostile, session)
+    result = runner.invoke(app, COMMAND + VALID + ["--yes"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "Agent company apply failed.\n"
+    assert "Usage" not in result.stderr and "Traceback" not in result.stderr
+    assert hostile_payload not in result.stderr
+    assert constructions == [1]
+    assert (session.commits, session.rollbacks, session.closes) == (0, 1, 1)
+
+
 @pytest.mark.parametrize(
     ("error", "code", "message"),
     [

@@ -31,6 +31,7 @@ from app.modules.company_discovery import (
 from app.modules.company_discovery.models import (
     CompanyDiscoveryCandidate,
     CompanyDiscoveryCandidateStatus,
+    CompanyDiscoveryRun,
     CompanyDiscoveryRunStatus,
 )
 from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
@@ -362,8 +363,35 @@ def test_concurrent_same_hostname_candidates_converge_on_one_company(
                 position=2,
             ),
         )
+        untouched = repository.upsert_candidate(
+            project.id,
+            run.id,
+            CompanyDiscoveryCandidateCreate(
+                project_id=project.id,
+                run_id=run.id,
+                provider="serpapi",
+                name="Untouched",
+                website="https://untouched.example",
+                country_code="US",
+                position=3,
+            ),
+        ).candidate
         project_id, run_id = project.id, run.id
         candidate_ids = [first.id, created.candidate.id]
+        untouched_state = (
+            untouched.candidate_status,
+            untouched.promoted_company_id,
+            untouched.last_seen_run_id,
+        )
+        run_state = (
+            run.run_status,
+            run.request_fingerprint,
+            run.request_snapshot,
+            run.query_count,
+            run.result_count,
+            run.candidate_count,
+            run.error_code,
+        )
         setup.commit()
     barrier = Barrier(2)
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -386,30 +414,69 @@ def test_concurrent_same_hostname_candidates_converge_on_one_company(
         )
     with database() as verification:
         stored = [verification.get_one(CompanyDiscoveryCandidate, value) for value in candidate_ids]
+        persisted_company_ids = [row.promoted_company_id for row in stored]
+        assert all(
+            row.candidate_status == CompanyDiscoveryCandidateStatus.PROMOTED.value for row in stored
+        )
+        assert all(type(value) is int and value > 0 for value in persisted_company_ids)
+        assert persisted_company_ids[0] == persisted_company_ids[1] == company_ids[0]
         assert len(set(company_ids)) == 1
-        assert all(row.promoted_company_id == company_ids[0] for row in stored)
         assert verification.scalar(select(func.count()).select_from(Company)) == 1
+        persisted_run = verification.get_one(CompanyDiscoveryRun, run_id)
+        assert (
+            persisted_run.run_status,
+            persisted_run.request_fingerprint,
+            persisted_run.request_snapshot,
+            persisted_run.query_count,
+            persisted_run.result_count,
+            persisted_run.candidate_count,
+            persisted_run.error_code,
+        ) == run_state
+        persisted_untouched = verification.get_one(CompanyDiscoveryCandidate, untouched.id)
+        assert (
+            persisted_untouched.candidate_status,
+            persisted_untouched.promoted_company_id,
+            persisted_untouched.last_seen_run_id,
+        ) == untouched_state
         assert verification.scalar(select(func.count()).select_from(Contact)) == 0
         assert verification.scalar(select(func.count()).select_from(Lead)) == 0
         assert verification.scalar(select(func.count()).select_from(Task)) == 0
 
 
-def test_postgresql_locking_sql_contains_for_update() -> None:
+class _PostgresqlRecordingSession:
+    def __init__(self) -> None:
+        self.statements: list[Any] = []
+
+    def get_bind(self) -> Any:
+        return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+    def scalar(self, statement: Any) -> int:
+        self.statements.append(statement)
+        return 1
+
+
+def test_actual_repository_postgresql_locking_sql_contains_for_update() -> None:
     dialect = postgresql.dialect()  # type: ignore[no-untyped-call]
-    project_sql = str(
-        select(Project.id).where(Project.id == 1).with_for_update().compile(dialect=dialect)
+    project_session = _PostgresqlRecordingSession()
+    CompanyRepository(cast(Any, project_session)).acquire_promotion_scope(1)
+    assert len(project_session.statements) == 1
+    compiled_project = project_session.statements[0].compile(dialect=dialect)
+    project_sql = str(compiled_project)
+
+    candidate_session = _PostgresqlRecordingSession()
+    CompanyDiscoveryStagingRepository(cast(Any, candidate_session)).get_candidate_for_promotion(
+        1, 2
     )
-    candidate_sql = str(
-        select(CompanyDiscoveryCandidate)
-        .where(
-            CompanyDiscoveryCandidate.project_id == 1,
-            CompanyDiscoveryCandidate.id == 2,
-        )
-        .with_for_update()
-        .compile(dialect=dialect)
-    )
+    assert len(candidate_session.statements) == 1
+    compiled_candidate = candidate_session.statements[0].compile(dialect=dialect)
+    candidate_sql = str(compiled_candidate)
+
     assert "FOR UPDATE" in project_sql
+    assert "project" in project_sql.lower()
+    assert 1 in compiled_project.params.values()
     assert "FOR UPDATE" in candidate_sql
+    assert "company_discovery_candidate" in candidate_sql.lower()
+    assert {1, 2}.issubset(set(compiled_candidate.params.values()))
 
 
 def _input() -> AgentCompanyApplyInput:
@@ -584,8 +651,12 @@ class _CleanupBaseException(BaseException):
     [
         (None, None),
         (RuntimeError("rollback"), None),
+        (KeyboardInterrupt(), None),
+        (SystemExit(23), None),
         (_CleanupBaseException("rollback"), None),
         (None, RuntimeError("close")),
+        (None, KeyboardInterrupt()),
+        (None, SystemExit(24)),
         (None, _CleanupBaseException("close")),
         (_CleanupBaseException("rollback"), _CleanupBaseException("close")),
     ],
@@ -597,14 +668,48 @@ def test_executor_preserves_primary_identity_across_all_cleanup_failures(
     close_error: BaseException | None,
 ) -> None:
     session = _Session(rollback_error=rollback_error, close_error=close_error)
+    constructions = 0
+
+    def session_factory() -> _Session:
+        nonlocal constructions
+        constructions += 1
+        return session
+
     _install_boundaries(monkeypatch, primary)
     with pytest.raises(type(primary)) as caught:
         agent_cli._execute_agent_company_apply(
-            _input(), "text", session_factory=cast(Any, lambda: session)
+            _input(), "text", session_factory=cast(Any, session_factory)
         )
     assert caught.value is primary
     assert primary.__cause__ is None and primary.__context__ is None
+    assert constructions == 1
     assert (session.commits, session.rollbacks, session.closes) == (0, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [KeyboardInterrupt(), SystemExit(31), _CleanupBaseException("close")],
+)
+def test_executor_propagates_success_path_close_base_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    close_error: BaseException,
+) -> None:
+    session = _Session(close_error=close_error)
+    constructions = 0
+
+    def session_factory() -> _Session:
+        nonlocal constructions
+        constructions += 1
+        return session
+
+    _install_boundaries(monkeypatch, _result())
+    with pytest.raises(type(close_error)) as caught:
+        agent_cli._execute_agent_company_apply(
+            _input(), "json", session_factory=cast(Any, session_factory)
+        )
+    assert caught.value is close_error
+    assert constructions == 1
+    assert (session.commits, session.rollbacks, session.closes) == (1, 0, 1)
 
 
 def test_executor_does_not_commit_when_rendering_fails(monkeypatch: pytest.MonkeyPatch) -> None:
