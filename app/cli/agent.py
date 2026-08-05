@@ -427,6 +427,16 @@ def render_agent_company_apply(result: AgentCompanyApplyResult, output: str) -> 
     return rendered
 
 
+def _cleanup_preserving_primary(operation: Callable[[], object]) -> None:
+    cleanup_failed = False
+    try:
+        operation()
+    except BaseException:
+        cleanup_failed = True
+    if cleanup_failed:
+        return
+
+
 def _execute_agent_company_apply(
     data: AgentCompanyApplyInput,
     output: str,
@@ -435,6 +445,7 @@ def _execute_agent_company_apply(
 ) -> str:
     session = session_factory()
     committed = False
+    primary_active = False
     try:
         staging_repository = CompanyDiscoveryStagingRepository(session)
         company_repository = CompanyRepository(session)
@@ -463,12 +474,14 @@ def _execute_agent_company_apply(
             raise AgentCompanyApplyPersistenceError("Agent company apply could not be persisted.")
         return rendered
     except BaseException:
+        primary_active = True
         if not committed:
-            with suppress(Exception):
-                session.rollback()
+            _cleanup_preserving_primary(session.rollback)
         raise
     finally:
-        with suppress(Exception):
+        if primary_active:
+            _cleanup_preserving_primary(session.close)
+        else:
             session.close()
 
 

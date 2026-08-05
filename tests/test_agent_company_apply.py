@@ -376,3 +376,49 @@ def test_service_translates_dependency_exception_without_leaking_text() -> None:
     with pytest.raises(AgentCompanyApplyPersistenceError) as caught:
         service.apply(_input())
     assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("record", "field", "value", "expected"),
+    [
+        ("run", "id", 99, AgentCompanyApplyNotFoundError),
+        ("run", "project_id", 2, AgentCompanyApplyNotFoundError),
+        ("run", "id", True, AgentCompanyApplyConsistencyError),
+        ("candidate", "id", 99, AgentCompanyApplyNotFoundError),
+        ("candidate", "project_id", 2, AgentCompanyApplyNotFoundError),
+        ("candidate", "first_seen_run_id", 0, AgentCompanyApplyConsistencyError),
+        ("candidate", "last_seen_run_id", True, AgentCompanyApplyConsistencyError),
+    ],
+)
+def test_service_rejects_hostile_scope_snapshots(
+    record: str, field: str, value: object, expected: type[Exception]
+) -> None:
+    service, staging = _service(CompanyDiscoveryCandidateStatus.REVIEWED)
+    setattr(getattr(staging, record), field, value)
+    with pytest.raises(expected) as caught:
+        service.apply(_input())
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_service_rejects_foreign_promoted_company() -> None:
+    service, _ = _service(CompanyDiscoveryCandidateStatus.PROMOTED)
+    service.company_repository.company.project_id = 2  # type: ignore[attr-defined]
+    with pytest.raises(AgentCompanyApplyConsistencyError) as caught:
+        service.apply(_input())
+    assert str(caught.value) == "Agent company apply Company state is invalid."
+    assert caught.value.__cause__ is caught.value.__context__ is None
+
+
+def test_service_rejects_promotion_result_candidate_mismatch() -> None:
+    service, staging = _service(CompanyDiscoveryCandidateStatus.REVIEWED)
+
+    class MismatchedPromotion(_Promotion):
+        def promote(self, project_id: int, candidate_id: int) -> Any:
+            result = super().promote(project_id, candidate_id)
+            return result.model_copy(update={"candidate_id": 99})
+
+    service.promotion_service = MismatchedPromotion(staging)
+    with pytest.raises(AgentCompanyApplyConsistencyError) as caught:
+        service.apply(_input())
+    assert caught.value.__cause__ is caught.value.__context__ is None
