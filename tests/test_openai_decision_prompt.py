@@ -50,6 +50,10 @@ def test_fixed_instructions_cover_every_safety_boundary() -> None:
         assert phrase.casefold() in value.casefold()
     for forbidden in ("sk-test", "api.openai.com", "{goal}", "{candidate", "gpt-"):
         assert forbidden not in value
+    assert (
+        "When decision is NO_SELECTION, set selected_candidate_index, next_action_title, and\n"
+        "next_action_description to null, and set company_fit to NOT_SUITABLE."
+    ) in value
 
 
 def test_untrusted_injection_and_special_characters_remain_json_data() -> None:

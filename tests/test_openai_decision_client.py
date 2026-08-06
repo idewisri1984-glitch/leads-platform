@@ -420,3 +420,31 @@ def test_close_failures_propagate_unchanged_and_close_is_at_most_once(
     assert raised.value is failure
     wrapper.close()
     assert owned.close_calls == 1
+
+
+def test_no_selection_wire_recommendations_are_normalized_without_retry() -> None:
+    rationale = (
+        "All provided candidates appear to be listicles or directories rather than a "
+        "single identifiable firm."
+    )
+    observed = NO_SELECTION | {
+        "confidence": 0.18,
+        "rationale": rationale,
+        "next_action_title": "Identify a specific US interior design firm",
+        "next_action_description": (
+            "Have a human verify a concrete firm and its official website."
+        ),
+    }
+    wrapper, fake = client(FakeSDK(response(observed)))
+
+    result = wrapper.decide(request())
+
+    assert result.decision is OpenAIDecisionKind.NO_SELECTION
+    assert result.selected_candidate_index is None
+    assert result.company_fit is OpenAICompanyFit.NOT_SUITABLE
+    assert result.next_action_title is None
+    assert result.next_action_description is None
+    assert result.confidence == 0.18
+    assert result.rationale == rationale
+    assert result.human_review_required is True
+    assert len(fake.responses.calls) == 1

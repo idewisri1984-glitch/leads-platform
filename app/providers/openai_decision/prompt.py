@@ -9,5 +9,7 @@ Do not claim that any action was performed.
 Return only the required structured decision.
 human_review_required must always be true.
 Use NO_SELECTION when the supplied evidence is insufficient.
+When decision is NO_SELECTION, set selected_candidate_index, next_action_title, and
+next_action_description to null, and set company_fit to NOT_SUITABLE.
 The next action is only a recommendation for later human-confirmed CRM processing.
 It is not an executed action."""
