@@ -22,6 +22,7 @@ from app.modules.contact_discovery.schemas import (
     ContactDiscoveryCandidateCreate,
     ContactDiscoveryCandidateRead,
     ContactDiscoveryCandidateUpsertResult,
+    ContactDiscoveryPersistedCandidateRaw,
 )
 
 _UNSET = object()
@@ -354,8 +355,26 @@ class ContactDiscoveryRepository:
         updated: bool = False,
         protected: bool = False,
     ) -> ContactDiscoveryCandidateUpsertResult:
+        read = ContactDiscoveryCandidateRead.model_validate(candidate)
         return ContactDiscoveryCandidateUpsertResult(
-            candidate=ContactDiscoveryCandidateRead.model_validate(candidate),
+            candidate=read,
+            persisted_candidate=ContactDiscoveryPersistedCandidateRaw(
+                id=read.id,
+                company_id=read.company_id,
+                promoted_contact_id=read.promoted_contact_id,
+                name=read.name,
+                title=read.title,
+                email=read.email,
+                normalized_email=read.normalized_email,
+                phone=read.phone,
+                source_url=read.source_url,
+                source_type=read.source_type,
+                confidence=float(read.confidence) / 100.0,
+                discovery_status=read.discovery_status,
+                deduplication_key=read.deduplication_key,
+                notes=read.notes,
+                last_error=read.last_error,
+            ),
             created=created,
             updated=updated,
             protected=protected,

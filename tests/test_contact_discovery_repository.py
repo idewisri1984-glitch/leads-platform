@@ -926,6 +926,39 @@ def test_promotion_link_and_status_are_protected_from_review_and_upsert(
     assert result.candidate.notes == "preserve"
 
 
+def test_upsert_equal_confidence_retains_stable_candidate_without_update(session: Session) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    first = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name="Original",
+            email="equal@example.com",
+            confidence=73,
+            notes="preserved",
+        ),
+    )
+
+    second = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name="Replacement",
+            email="equal@example.com",
+            confidence=73,
+            notes="replacement",
+        ),
+    )
+
+    assert second.candidate.id == first.candidate.id
+    assert second.candidate.confidence == 73
+    assert second.candidate.name == "Original"
+    assert second.candidate.notes == "preserved"
+    assert second.updated is False
+
+
 def test_reviewed_candidate_with_existing_link_is_ineligible(session: Session) -> None:
     project = create_project(session, "Project")
     company = create_company(session, project, "Company")

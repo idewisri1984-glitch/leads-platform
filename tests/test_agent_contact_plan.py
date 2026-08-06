@@ -36,6 +36,7 @@ from app.modules.contact_discovery.repository import ContactDiscoveryCandidateUp
 from app.modules.contact_discovery.schemas import (
     ContactDiscoveryCandidateCreate,
     ContactDiscoveryCandidateRead,
+    ContactDiscoveryPersistedCandidateRaw,
 )
 from app.modules.contact_discovery.service import (
     ContactDiscoveryPersistedCandidate,
@@ -128,9 +129,9 @@ class Repository:
             )
             self.rows[key] = existing
             self.next_id += 1
-            return ContactDiscoveryCandidateUpsertResult(candidate=existing, created=True)
+            return self.result(existing, created=True)
         if existing.discovery_status is not ContactDiscoveryCandidateStatus.DISCOVERED:
-            return ContactDiscoveryCandidateUpsertResult(candidate=existing, protected=True)
+            return self.result(existing, protected=True)
         incoming = {
             "name": clean_discovered_text(value.name),
             "title": clean_discovered_text(value.title),
@@ -151,9 +152,32 @@ class Repository:
         if updates:
             existing = existing.model_copy(update=updates | {"updated_at": datetime.now(UTC)})
             self.rows[key] = existing
+        return self.result(existing, updated=bool(updates))
+
+    @staticmethod
+    def result(
+        candidate: ContactDiscoveryCandidateRead, **flags: bool
+    ) -> ContactDiscoveryCandidateUpsertResult:
         return ContactDiscoveryCandidateUpsertResult(
-            candidate=existing,
-            updated=bool(updates),
+            candidate=candidate,
+            persisted_candidate=ContactDiscoveryPersistedCandidateRaw(
+                id=candidate.id,
+                company_id=candidate.company_id,
+                promoted_contact_id=candidate.promoted_contact_id,
+                name=candidate.name,
+                title=candidate.title,
+                email=candidate.email,
+                normalized_email=candidate.normalized_email,
+                phone=candidate.phone,
+                source_url=candidate.source_url,
+                source_type=candidate.source_type,
+                confidence=float(candidate.confidence) / 100.0,
+                discovery_status=candidate.discovery_status,
+                deduplication_key=candidate.deduplication_key,
+                notes=candidate.notes,
+                last_error=candidate.last_error,
+            ),
+            **flags,
         )
 
     def update_state(self, *args: object, **kwargs: object) -> object:
@@ -425,6 +449,31 @@ def test_every_role_priority_group_is_ordered(better: str, worse: str) -> None:
 )
 def test_role_phrase_boundaries_accept_expected_titles(title: str, priority: int) -> None:
     assert AgentContactPlanService._role_priority(title) == priority
+
+
+def test_fake_repository_equal_confidence_does_not_report_update() -> None:
+    repository = Repository()
+    original = candidate_create(
+        2,
+        name="Original",
+        email="equal-fake@example.com",
+        confidence=73,
+    )
+    first = repository.upsert_candidate(2, original)
+    second = repository.upsert_candidate(
+        2,
+        candidate_create(
+            2,
+            name="Replacement",
+            email="equal-fake@example.com",
+            confidence=73,
+        ),
+    )
+
+    assert second.candidate.id == first.candidate.id
+    assert second.candidate.confidence == 73
+    assert second.candidate.name == "Original"
+    assert second.updated is False
 
 
 @pytest.mark.parametrize(

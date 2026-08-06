@@ -1,5 +1,7 @@
 from collections.abc import Generator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from math import inf, nan
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -9,7 +11,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.cli.agent import execute_agent_contact_plan
 from app.core.database.base import Base
 from app.modules.agent.contact_plan import (
-    AgentContactPlanDiscoveryResultError,
     AgentContactPlanPersistenceError,
     AgentContactPlanProviderError,
     AgentContactPlanSelectionConsistencyError,
@@ -25,8 +26,11 @@ from app.modules.contact_discovery.models import (
     ContactDiscoverySourceType,
     ContactDiscoveryStatus,
 )
-from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
-from app.modules.contact_discovery.service import ContactDiscoveryService
+from app.modules.contact_discovery.repository import ContactDiscoveryRepository
+from app.modules.contact_discovery.schemas import (
+    ContactDiscoveryCandidateCreate,
+    ContactDiscoveryCandidateUpsertResult,
+)
 from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
@@ -83,7 +87,8 @@ class FakeProvider:
 
 @dataclass
 class TransactionCounters:
-    commits: int = 0
+    commit_attempts: int = 0
+    successful_commits: int = 0
     rollbacks: int = 0
 
 
@@ -100,10 +105,11 @@ class InstrumentedSession(Session):
         super().__init__(*args, **kwargs)
 
     def commit(self) -> None:
-        self.counters.commits += 1
+        self.counters.commit_attempts += 1
         if self.fail_commit:
             raise RuntimeError("controlled commit failure")
         super().commit()
+        self.counters.successful_commits += 1
 
     def rollback(self) -> None:
         self.counters.rollbacks += 1
@@ -153,14 +159,17 @@ def test_full_plan_persists_only_staging_and_is_idempotent(database) -> None:
     first = execute_agent_contact_plan(
         data, session_factory=instrumented, provider_factory=lambda: provider
     )
-    assert provider.calls == instrumented.counters.commits == 1
+    assert provider.calls == instrumented.counters.commit_attempts == 1
+    assert instrumented.counters.successful_commits == 1
     assert instrumented.counters.rollbacks == 0
     second = execute_agent_contact_plan(
         data, session_factory=instrumented, provider_factory=lambda: provider
     )
     assert first.decision is AgentContactDecision.SELECT and first.selected_contact_name == "Buyer"
     assert second.selected_candidate_id == first.selected_candidate_id and provider.calls == 2
-    assert instrumented.counters.commits == 2 and instrumented.counters.rollbacks == 0
+    assert instrumented.counters.commit_attempts == 2
+    assert instrumented.counters.successful_commits == 2
+    assert instrumented.counters.rollbacks == 0
     with factory() as session:
         rows = list(
             session.scalars(
@@ -199,7 +208,9 @@ def test_provider_failure_rolls_back_external_database(database, failed_result: 
                 company_id, fail=not failed_result, failed_result=failed_result
             ),
         )
-    assert instrumented.counters.commits == 0 and instrumented.counters.rollbacks == 1
+    assert instrumented.counters.commit_attempts == 0
+    assert instrumented.counters.successful_commits == 0
+    assert instrumented.counters.rollbacks == 1
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
         restored = session.scalar(select(CompanyContactDiscoveryState))
@@ -212,30 +223,65 @@ def test_provider_failure_rolls_back_external_database(database, failed_result: 
         assert session.scalar(select(func.count()).select_from(Task)) == 0
 
 
-def test_invalid_persisted_candidate_rolls_back_all_staging(
-    database, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("id", True),
+        ("id", False),
+        ("company_id", True),
+        ("company_id", False),
+        ("confidence", True),
+        ("confidence", False),
+        ("confidence", 0),
+        ("confidence", 1),
+        ("confidence", "0"),
+        ("confidence", "0.9"),
+        ("confidence", "1"),
+        ("confidence", nan),
+        ("confidence", inf),
+        ("confidence", -inf),
+    ],
+)
+def test_invalid_raw_repository_result_rolls_back_all_staging(
+    database, monkeypatch: pytest.MonkeyPatch, field: str, invalid: object
 ) -> None:
     engine, project_id, company_id = database
     instrumented = InstrumentedFactory(engine)
-    original = ContactDiscoveryService._persisted_snapshot
+    original = ContactDiscoveryRepository.upsert_candidate
 
-    def invalid_snapshot(candidate):
-        return replace(original(candidate), id=True)
+    def invalid_upsert(repository, scoped_company_id, candidate):
+        result = original(repository, scoped_company_id, candidate)
+        raw = result.persisted_candidate.model_dump()
+        raw[field] = invalid
+        return ContactDiscoveryCandidateUpsertResult.model_construct(
+            candidate=result.candidate,
+            persisted_candidate=SimpleNamespace(**raw),
+            created=result.created,
+            updated=result.updated,
+            protected=result.protected,
+        )
 
-    monkeypatch.setattr(
-        ContactDiscoveryService, "_persisted_snapshot", staticmethod(invalid_snapshot)
-    )
-    with pytest.raises(AgentContactPlanDiscoveryResultError):
+    monkeypatch.setattr(ContactDiscoveryRepository, "upsert_candidate", invalid_upsert)
+    with pytest.raises(
+        AgentContactPlanPersistenceError,
+        match=r"^Contact discovery state could not be persisted\.$",
+    ) as exc_info:
         execute_agent_contact_plan(
             AgentContactPlanInput(project_id=project_id, company_id=company_id, goal="Find"),
             session_factory=instrumented,
             provider_factory=lambda: FakeProvider(company_id),
         )
-    assert instrumented.counters.commits == 0 and instrumented.counters.rollbacks == 1
+    assert str(invalid) not in str(exc_info.value)
+    assert instrumented.counters.commit_attempts == 0
+    assert instrumented.counters.successful_commits == 0
+    assert instrumented.counters.rollbacks == 1
     factory = sessionmaker(bind=engine)
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
         assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 0
+        assert session.scalar(select(func.count()).select_from(Contact)) == 0
+        assert session.scalar(select(func.count()).select_from(Lead)) == 0
+        assert session.scalar(select(func.count()).select_from(Task)) == 0
 
 
 def test_selection_consistency_failure_rolls_back_all_staging(
@@ -254,7 +300,9 @@ def test_selection_consistency_failure_rolls_back_all_staging(
             session_factory=instrumented,
             provider_factory=lambda: FakeProvider(company_id),
         )
-    assert instrumented.counters.commits == 0 and instrumented.counters.rollbacks == 1
+    assert instrumented.counters.commit_attempts == 0
+    assert instrumented.counters.successful_commits == 0
+    assert instrumented.counters.rollbacks == 1
     factory = sessionmaker(bind=engine)
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
@@ -270,7 +318,9 @@ def test_commit_failure_rolls_back_all_staging(database) -> None:
             session_factory=instrumented,
             provider_factory=lambda: FakeProvider(company_id),
         )
-    assert instrumented.counters.commits == 1 and instrumented.counters.rollbacks == 1
+    assert instrumented.counters.commit_attempts == 1
+    assert instrumented.counters.successful_commits == 0
+    assert instrumented.counters.rollbacks == 1
     factory = sessionmaker(bind=engine)
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
@@ -278,3 +328,200 @@ def test_commit_failure_rolls_back_all_staging(database) -> None:
         assert session.scalar(select(func.count()).select_from(Contact)) == 0
         assert session.scalar(select(func.count()).select_from(Lead)) == 0
         assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def _candidate_snapshot(candidate: ContactDiscoveryCandidate) -> tuple[object, ...]:
+    return (
+        candidate.id,
+        candidate.company_id,
+        candidate.name,
+        candidate.title,
+        candidate.email,
+        candidate.normalized_email,
+        candidate.phone,
+        candidate.source_url,
+        candidate.source_type,
+        candidate.confidence,
+        candidate.discovery_status,
+        candidate.deduplication_key,
+        candidate.notes,
+        candidate.last_error,
+        candidate.promoted_contact_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "protected_status",
+    [
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.REJECTED,
+        ContactDiscoveryCandidateStatus.PROMOTED,
+    ],
+)
+def test_protected_candidate_does_not_block_separate_current_run_selection(
+    database, protected_status: ContactDiscoveryCandidateStatus
+) -> None:
+    engine, project_id, company_id = database
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        repository = ContactDiscoveryRepository(session)
+        protected_id = repository.upsert_candidate(
+            company_id,
+            ContactDiscoveryCandidateCreate(
+                company_id=company_id,
+                name="Protected",
+                title="Creative Director",
+                email="creative@example.com",
+                source_url="https://example.com/team",
+                source_type=ContactDiscoverySourceType.TEAM_PAGE,
+                confidence=60,
+                notes="preserved",
+            ),
+        ).candidate.id
+        contact = Contact(company_id=company_id, first_name="Existing")
+        session.add(contact)
+        session.flush()
+        protected = session.get(ContactDiscoveryCandidate, protected_id)
+        assert protected is not None
+        protected.discovery_status = protected_status
+        protected.promoted_contact_id = contact.id
+        session.commit()
+        before = _candidate_snapshot(protected)
+        canonical_counts = (
+            session.scalar(select(func.count()).select_from(Contact)),
+            session.scalar(select(func.count()).select_from(Lead)),
+            session.scalar(select(func.count()).select_from(Task)),
+        )
+
+    instrumented = InstrumentedFactory(engine)
+    result = execute_agent_contact_plan(
+        AgentContactPlanInput(project_id=project_id, company_id=company_id, goal="Find"),
+        session_factory=instrumented,
+        provider_factory=lambda: FakeProvider(company_id),
+    )
+
+    assert result.decision is AgentContactDecision.SELECT
+    assert result.selected_contact_name == "Buyer"
+    assert result.staged_candidate_count == 2
+    assert result.eligible_candidate_count == 1
+    assert instrumented.counters.commit_attempts == 1
+    assert instrumented.counters.successful_commits == 1
+    assert instrumented.counters.rollbacks == 0
+    with factory() as session:
+        protected = session.get(ContactDiscoveryCandidate, protected_id)
+        assert protected is not None
+        assert _candidate_snapshot(protected) == before
+        assert (
+            session.scalar(select(func.count()).select_from(Contact)),
+            session.scalar(select(func.count()).select_from(Lead)),
+            session.scalar(select(func.count()).select_from(Task)),
+        ) == canonical_counts
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["invalid_raw", "selection", "commit", "failed_result"],
+)
+def test_failures_preserve_existing_candidate_and_state(
+    database, monkeypatch: pytest.MonkeyPatch, failure_mode: str
+) -> None:
+    engine, project_id, company_id = database
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        repository = ContactDiscoveryRepository(session)
+        candidate_id = repository.upsert_candidate(
+            company_id,
+            ContactDiscoveryCandidateCreate(
+                company_id=company_id,
+                name="Original",
+                title="Creative Director",
+                email="creative@example.com",
+                phone="+15550100",
+                source_url="https://example.com/team",
+                source_type=ContactDiscoverySourceType.TEAM_PAGE,
+                confidence=40,
+                notes="preserved",
+                last_error="existing-error",
+            ),
+        ).candidate.id
+        existing = session.get(ContactDiscoveryCandidate, candidate_id)
+        assert existing is not None
+        existing.discovery_status = ContactDiscoveryCandidateStatus.REVIEWED
+        state = CompanyContactDiscoveryState(
+            company_id=company_id,
+            provider="existing",
+            discovery_status=ContactDiscoveryStatus.NOT_FOUND,
+            last_error="existing-state",
+        )
+        session.add(state)
+        session.commit()
+        candidate_before = _candidate_snapshot(existing)
+        state_before = (state.provider, state.discovery_status, state.last_error, state.checked_at)
+        row_count = session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate))
+        canonical_counts = (
+            session.scalar(select(func.count()).select_from(Contact)),
+            session.scalar(select(func.count()).select_from(Lead)),
+            session.scalar(select(func.count()).select_from(Task)),
+        )
+
+    if failure_mode == "invalid_raw":
+        original_upsert = ContactDiscoveryRepository.upsert_candidate
+
+        def invalid_upsert(repository, scoped_company_id, candidate):
+            result = original_upsert(repository, scoped_company_id, candidate)
+            raw = result.persisted_candidate.model_dump()
+            raw["id"] = True
+            return ContactDiscoveryCandidateUpsertResult.model_construct(
+                candidate=result.candidate,
+                persisted_candidate=SimpleNamespace(**raw),
+                created=result.created,
+                updated=result.updated,
+                protected=result.protected,
+            )
+
+        monkeypatch.setattr(ContactDiscoveryRepository, "upsert_candidate", invalid_upsert)
+    elif failure_mode == "selection":
+
+        def inconsistent(*args: object, **kwargs: object):
+            raise AgentContactPlanSelectionConsistencyError("controlled")
+
+        monkeypatch.setattr(AgentContactPlanService, "_result", staticmethod(inconsistent))
+
+    instrumented = InstrumentedFactory(engine, fail_commit=failure_mode == "commit")
+    provider = FakeProvider(company_id, failed_result=failure_mode == "failed_result")
+    expected_error = {
+        "invalid_raw": AgentContactPlanPersistenceError,
+        "selection": AgentContactPlanSelectionConsistencyError,
+        "commit": AgentContactPlanPersistenceError,
+        "failed_result": AgentContactPlanProviderError,
+    }[failure_mode]
+    with pytest.raises(expected_error):
+        execute_agent_contact_plan(
+            AgentContactPlanInput(project_id=project_id, company_id=company_id, goal="Find"),
+            session_factory=instrumented,
+            provider_factory=lambda: provider,
+        )
+
+    expected_attempts = int(failure_mode == "commit")
+    assert instrumented.counters.commit_attempts == expected_attempts
+    assert instrumented.counters.successful_commits == 0
+    assert instrumented.counters.rollbacks == 1
+    with factory() as session:
+        existing = session.get(ContactDiscoveryCandidate, candidate_id)
+        restored_state = session.scalar(select(CompanyContactDiscoveryState))
+        assert existing is not None and restored_state is not None
+        assert _candidate_snapshot(existing) == candidate_before
+        assert (
+            restored_state.provider,
+            restored_state.discovery_status,
+            restored_state.last_error,
+            restored_state.checked_at,
+        ) == state_before
+        assert (
+            session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == row_count
+        )
+        assert (
+            session.scalar(select(func.count()).select_from(Contact)),
+            session.scalar(select(func.count()).select_from(Lead)),
+            session.scalar(select(func.count()).select_from(Task)),
+        ) == canonical_counts

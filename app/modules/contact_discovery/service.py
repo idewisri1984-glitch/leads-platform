@@ -15,8 +15,8 @@ from app.modules.contact_discovery.normalization import (
 from app.modules.contact_discovery.repository import ContactDiscoveryRepository
 from app.modules.contact_discovery.schemas import (
     ContactDiscoveryCandidateCreate,
-    ContactDiscoveryCandidateRead,
     ContactDiscoveryCandidateUpsertResult,
+    ContactDiscoveryPersistedCandidateRaw,
 )
 from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
 
@@ -135,7 +135,7 @@ class ContactDiscoveryService:
                 upserted = self.repository.upsert_candidate(company_id, candidate)
                 if type(upserted) is not ContactDiscoveryCandidateUpsertResult:
                     raise ValueError("Candidate persistence result is invalid.")
-                persisted_candidates.append(self._persisted_snapshot(upserted.candidate))
+                persisted_candidates.append(self._persisted_snapshot(upserted.persisted_candidate))
                 candidate_upserts += 1
 
         self.repository.update_state(
@@ -258,49 +258,25 @@ class ContactDiscoveryService:
 
     @staticmethod
     def _persisted_snapshot(
-        candidate: ContactDiscoveryCandidateRead,
+        candidate: object,
     ) -> ContactDiscoveryPersistedCandidate:
-        string_values = (
-            candidate.name,
-            candidate.title,
-            candidate.email,
-            candidate.phone,
-            candidate.source_url,
-        )
-        if (
-            type(candidate.id) is not int
-            or candidate.id <= 0
-            or type(candidate.company_id) is not int
-            or candidate.company_id <= 0
-            or (
-                candidate.promoted_contact_id is not None
-                and (
-                    type(candidate.promoted_contact_id) is not int
-                    or candidate.promoted_contact_id <= 0
-                )
-            )
-            or any(value is not None and type(value) is not str for value in string_values)
-            or type(candidate.confidence) is not int
-            or not 0 <= candidate.confidence <= 100
-            or not isinstance(candidate.source_type, ContactDiscoverySourceType)
-            or not isinstance(candidate.discovery_status, ContactDiscoveryCandidateStatus)
-            or type(candidate.deduplication_key) is not str
-            or not candidate.deduplication_key.strip()
-        ):
-            raise ValueError("Candidate persistence result is invalid.")
+        try:
+            validated = ContactDiscoveryPersistedCandidateRaw.model_validate(candidate)
+        except (TypeError, ValueError):
+            raise ValueError("Candidate persistence result is invalid.") from None
         return ContactDiscoveryPersistedCandidate(
-            id=candidate.id,
-            company_id=candidate.company_id,
-            promoted_contact_id=candidate.promoted_contact_id,
-            name=candidate.name,
-            title=candidate.title,
-            email=candidate.email,
-            phone=candidate.phone,
-            source_url=candidate.source_url,
-            source_type=candidate.source_type,
-            confidence=float(candidate.confidence) / 100.0,
-            discovery_status=candidate.discovery_status,
-            deduplication_key=candidate.deduplication_key,
+            id=validated.id,
+            company_id=validated.company_id,
+            promoted_contact_id=validated.promoted_contact_id,
+            name=validated.name,
+            title=validated.title,
+            email=validated.email,
+            phone=validated.phone,
+            source_url=validated.source_url,
+            source_type=validated.source_type,
+            confidence=validated.confidence,
+            discovery_status=validated.discovery_status,
+            deduplication_key=validated.deduplication_key,
         )
 
     @staticmethod
