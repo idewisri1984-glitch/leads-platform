@@ -946,6 +946,8 @@ def test_successful_caller_commit_persists_state_and_candidate_atomically(sessio
     assert result.state_persisted is True
     assert len(result.persisted_candidates) == 1
     assert result.persisted_candidates[0].id > 0
+    assert type(result.persisted_candidates[0].confidence) is float
+    assert 0.0 <= result.persisted_candidates[0].confidence <= 1.0
     assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 1
     assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 1
 

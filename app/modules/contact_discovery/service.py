@@ -3,7 +3,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from app.modules.contact_discovery.models import ContactDiscoveryStatus
+from app.modules.contact_discovery.models import (
+    ContactDiscoveryCandidateStatus,
+    ContactDiscoverySourceType,
+    ContactDiscoveryStatus,
+)
 from app.modules.contact_discovery.normalization import (
     build_contact_candidate_deduplication_key,
     normalize_source_for_deduplication,
@@ -42,6 +46,22 @@ class ContactDiscoveryProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class ContactDiscoveryPersistedCandidate:
+    id: int
+    company_id: int
+    promoted_contact_id: int | None
+    name: str | None
+    title: str | None
+    email: str | None
+    phone: str | None
+    source_url: str | None
+    source_type: ContactDiscoverySourceType
+    confidence: float
+    discovery_status: ContactDiscoveryCandidateStatus
+    deduplication_key: str
+
+
+@dataclass(frozen=True)
 class ContactDiscoveryRunResult:
     company_id: int
     dry_run: bool
@@ -54,7 +74,7 @@ class ContactDiscoveryRunResult:
     state_persisted: bool = False
     selected_urls: int = 0
     limited_link_scan: bool = False
-    persisted_candidates: tuple[ContactDiscoveryCandidateRead, ...] = ()
+    persisted_candidates: tuple[ContactDiscoveryPersistedCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -109,15 +129,13 @@ class ContactDiscoveryService:
             )
 
         candidate_upserts = 0
-        persisted_candidates: list[ContactDiscoveryCandidateRead] = []
+        persisted_candidates: list[ContactDiscoveryPersistedCandidate] = []
         if status in {ContactDiscoveryStatus.SUCCEEDED, ContactDiscoveryStatus.PARTIAL}:
             for candidate in validated.candidates:
                 upserted = self.repository.upsert_candidate(company_id, candidate)
                 if type(upserted) is not ContactDiscoveryCandidateUpsertResult:
                     raise ValueError("Candidate persistence result is invalid.")
-                persisted_candidates.append(
-                    ContactDiscoveryCandidateRead.model_validate(upserted.candidate.model_dump())
-                )
+                persisted_candidates.append(self._persisted_snapshot(upserted.candidate))
                 candidate_upserts += 1
 
         self.repository.update_state(
@@ -239,6 +257,53 @@ class ContactDiscoveryService:
         return provider_name[:100] or None
 
     @staticmethod
+    def _persisted_snapshot(
+        candidate: ContactDiscoveryCandidateRead,
+    ) -> ContactDiscoveryPersistedCandidate:
+        string_values = (
+            candidate.name,
+            candidate.title,
+            candidate.email,
+            candidate.phone,
+            candidate.source_url,
+        )
+        if (
+            type(candidate.id) is not int
+            or candidate.id <= 0
+            or type(candidate.company_id) is not int
+            or candidate.company_id <= 0
+            or (
+                candidate.promoted_contact_id is not None
+                and (
+                    type(candidate.promoted_contact_id) is not int
+                    or candidate.promoted_contact_id <= 0
+                )
+            )
+            or any(value is not None and type(value) is not str for value in string_values)
+            or type(candidate.confidence) is not int
+            or not 0 <= candidate.confidence <= 100
+            or not isinstance(candidate.source_type, ContactDiscoverySourceType)
+            or not isinstance(candidate.discovery_status, ContactDiscoveryCandidateStatus)
+            or type(candidate.deduplication_key) is not str
+            or not candidate.deduplication_key.strip()
+        ):
+            raise ValueError("Candidate persistence result is invalid.")
+        return ContactDiscoveryPersistedCandidate(
+            id=candidate.id,
+            company_id=candidate.company_id,
+            promoted_contact_id=candidate.promoted_contact_id,
+            name=candidate.name,
+            title=candidate.title,
+            email=candidate.email,
+            phone=candidate.phone,
+            source_url=candidate.source_url,
+            source_type=candidate.source_type,
+            confidence=float(candidate.confidence) / 100.0,
+            discovery_status=candidate.discovery_status,
+            deduplication_key=candidate.deduplication_key,
+        )
+
+    @staticmethod
     def _run_result(
         *,
         company_id: int,
@@ -247,7 +312,7 @@ class ContactDiscoveryService:
         result: _ValidatedProviderResult,
         candidate_upserts: int = 0,
         state_persisted: bool = False,
-        persisted_candidates: tuple[ContactDiscoveryCandidateRead, ...] = (),
+        persisted_candidates: tuple[ContactDiscoveryPersistedCandidate, ...] = (),
     ) -> ContactDiscoveryRunResult:
         return ContactDiscoveryRunResult(
             company_id=company_id,

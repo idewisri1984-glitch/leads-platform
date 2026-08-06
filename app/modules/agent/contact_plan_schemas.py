@@ -17,7 +17,7 @@ _MAX_SOURCE_URL = 500
 _MAX_RATIONALE = 1000
 _MAX_LEAD_TITLE = 255
 _MAX_TASK_TITLE = 255
-_MAX_TASK_DESCRIPTION = 2000
+_MAX_TASK_DESCRIPTION = 4000
 
 
 class AgentContactDecision(StrEnum):
@@ -223,7 +223,7 @@ class AgentContactPlanResult(BaseModel):
             raise ValueError("Page counts are inconsistent.")
         if self.eligible_candidate_count > self.staged_candidate_count:
             raise ValueError("Candidate counts are inconsistent.")
-        if self.candidate_upsert_count != self.staged_candidate_count:
+        if self.candidate_upsert_count < self.staged_candidate_count:
             raise ValueError("Staging counts are inconsistent.")
         selected_fields = (
             self.selected_candidate_id,

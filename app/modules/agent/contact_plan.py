@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from math import isfinite
 from typing import Protocol, cast
 
 from pydantic import ValidationError
@@ -13,8 +14,8 @@ from ..contact_discovery.normalization import (
     build_contact_candidate_deduplication_key,
 )
 from ..contact_discovery.repository import ContactDiscoveryRepository
-from ..contact_discovery.schemas import ContactDiscoveryCandidateRead
 from ..contact_discovery.service import (
+    ContactDiscoveryPersistedCandidate,
     ContactDiscoveryProvider,
     ContactDiscoveryRunResult,
     ContactDiscoveryService,
@@ -145,7 +146,7 @@ class _CompanySnapshot:
 
 @dataclass(frozen=True, slots=True)
 class _RankedCandidate:
-    candidate: ContactDiscoveryCandidateRead
+    candidate: ContactDiscoveryPersistedCandidate
     name: str
     title: str | None
     email: str | None
@@ -178,6 +179,26 @@ def _enum[T](enum_type: type[T], value: object) -> T:
 
 def _bounded(value: str, maximum: int) -> str:
     return value if len(value) <= maximum else value[:maximum].rstrip()
+
+
+def _phrase_tokens(value: str) -> tuple[str, ...]:
+    separated = "".join(character if character.isalnum() else " " for character in value.casefold())
+    return tuple(separated.split())
+
+
+def _contains_phrase(tokens: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
+    width = len(phrase)
+    return bool(width) and any(
+        tokens[index : index + width] == phrase for index in range(len(tokens) - width + 1)
+    )
+
+
+def _strict_persisted_enum[T](enum_type: type[T], value: object) -> T:
+    if isinstance(value, enum_type):
+        return value
+    if type(value) is not str:
+        raise ValueError
+    return enum_type(value)  # type: ignore[call-arg]
 
 
 class AgentContactPlanService:
@@ -305,10 +326,7 @@ class AgentContactPlanService:
             raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
         try:
             status = _enum(ContactDiscoveryStatus, raw.status)
-            persisted = tuple(
-                ContactDiscoveryCandidateRead.model_validate(item.model_dump())
-                for item in raw.persisted_candidates
-            )
+            persisted = tuple(raw.persisted_candidates)
             candidates = tuple(raw.candidates)
         except (AttributeError, TypeError, ValueError, ValidationError):
             raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID) from None
@@ -319,7 +337,8 @@ class AgentContactPlanService:
             raw.candidate_upserts,
         )
         if (
-            raw.company_id != company_id
+            type(raw.company_id) is not int
+            or raw.company_id != company_id
             or raw.dry_run is not False
             or raw.state_persisted is not True
             or status is ContactDiscoveryStatus.PENDING
@@ -332,8 +351,10 @@ class AgentContactPlanService:
         if status in {ContactDiscoveryStatus.SUCCEEDED, ContactDiscoveryStatus.PARTIAL}:
             if not (len(candidates) == len(persisted) == raw.candidate_upserts):
                 raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
+            unique_persisted: dict[int, ContactDiscoveryPersistedCandidate] = {}
             for source, stored in zip(candidates, persisted, strict=True):
                 try:
+                    AgentContactPlanService._validate_persisted_candidate(stored, company_id)
                     expected_key = build_contact_candidate_deduplication_key(
                         email=source.email,
                         name=source.name,
@@ -344,6 +365,11 @@ class AgentContactPlanService:
                     raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID) from None
                 if stored.company_id != company_id or stored.deduplication_key != expected_key:
                     raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
+                existing = unique_persisted.get(stored.id)
+                if existing is not None and existing.deduplication_key != stored.deduplication_key:
+                    raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
+                unique_persisted[stored.id] = stored
+            persisted = tuple(unique_persisted.values())
         elif raw.candidate_upserts or persisted or candidates:
             raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
         return ContactDiscoveryRunResult(
@@ -362,14 +388,59 @@ class AgentContactPlanService:
         )
 
     @staticmethod
+    def _validate_persisted_candidate(
+        candidate: object, company_id: int
+    ) -> ContactDiscoveryPersistedCandidate:
+        if type(candidate) is not ContactDiscoveryPersistedCandidate:
+            raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
+        string_values = (
+            candidate.name,
+            candidate.title,
+            candidate.email,
+            candidate.phone,
+            candidate.source_url,
+        )
+        try:
+            _strict_persisted_enum(ContactDiscoveryCandidateStatus, candidate.discovery_status)
+            _strict_persisted_enum(ContactDiscoverySourceType, candidate.source_type)
+        except (TypeError, ValueError):
+            raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID) from None
+        if (
+            type(candidate.id) is not int
+            or candidate.id <= 0
+            or type(candidate.company_id) is not int
+            or candidate.company_id <= 0
+            or candidate.company_id != company_id
+            or (
+                candidate.promoted_contact_id is not None
+                and (
+                    type(candidate.promoted_contact_id) is not int
+                    or candidate.promoted_contact_id <= 0
+                )
+            )
+            or any(value is not None and type(value) is not str for value in string_values)
+            or type(candidate.confidence) is not float
+            or not isfinite(candidate.confidence)
+            or not 0.0 <= candidate.confidence <= 1.0
+            or type(candidate.deduplication_key) is not str
+            or not candidate.deduplication_key.strip()
+        ):
+            raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
+        return candidate
+
+    @staticmethod
     def _eligible(
-        candidates: tuple[ContactDiscoveryCandidateRead, ...], company_id: int
+        candidates: tuple[ContactDiscoveryPersistedCandidate, ...], company_id: int
     ) -> tuple[_RankedCandidate, ...]:
         eligible: list[_RankedCandidate] = []
         for candidate in candidates:
             try:
-                status = _enum(ContactDiscoveryCandidateStatus, candidate.discovery_status)
-                source_type = _enum(ContactDiscoverySourceType, candidate.source_type)
+                status = _strict_persisted_enum(
+                    ContactDiscoveryCandidateStatus, candidate.discovery_status
+                )
+                source_type = _strict_persisted_enum(
+                    ContactDiscoverySourceType, candidate.source_type
+                )
                 name = _text(candidate.name, required=True)
                 title = _text(candidate.title)
                 email = _text(candidate.email)
@@ -383,12 +454,12 @@ class AgentContactPlanService:
                 or candidate.id <= 0
                 or candidate.company_id != company_id
                 or not candidate.deduplication_key.strip()
-                or type(candidate.confidence) is not int
-                or not 0 <= candidate.confidence <= 100
+                or type(candidate.confidence) is not float
+                or not isfinite(candidate.confidence)
+                or not 0.0 <= candidate.confidence <= 1.0
                 or name is None
             ):
                 continue
-            confidence = float(candidate.confidence) / 100.0
             eligible.append(
                 _RankedCandidate(
                     candidate=candidate,
@@ -398,7 +469,7 @@ class AgentContactPlanService:
                     phone=phone,
                     source_url=source_url,
                     source_type=source_type,
-                    confidence=confidence,
+                    confidence=candidate.confidence,
                     role_priority=AgentContactPlanService._role_priority(title),
                 )
             )
@@ -414,9 +485,9 @@ class AgentContactPlanService:
 
     @staticmethod
     def _role_priority(title: str | None) -> int:
-        normalized = " ".join((title or "").casefold().split())
+        tokens = _phrase_tokens(title or "")
         for priority, markers in enumerate(_ROLE_GROUPS):
-            if any(marker in normalized for marker in markers):
+            if any(_contains_phrase(tokens, _phrase_tokens(marker)) for marker in markers):
                 return priority
         return 4
 
@@ -483,7 +554,7 @@ class AgentContactPlanService:
             f"Selected person: {selected.name}{title_detail}. Company: {company.name}. "
             "Prepare a personalized Bohemia Bali partnership message. Goal: "
         )
-        description = _bounded(fixed + data.goal, 2000)
+        description = _bounded(fixed + data.goal, 4000)
         try:
             return AgentContactPlanResult(
                 **common,
