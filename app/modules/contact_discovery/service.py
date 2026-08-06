@@ -9,7 +9,11 @@ from app.modules.contact_discovery.normalization import (
     normalize_source_for_deduplication,
 )
 from app.modules.contact_discovery.repository import ContactDiscoveryRepository
-from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
+from app.modules.contact_discovery.schemas import (
+    ContactDiscoveryCandidateCreate,
+    ContactDiscoveryCandidateRead,
+    ContactDiscoveryCandidateUpsertResult,
+)
 from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
 
 _PROVIDER_INVALID_RESULT = "provider_invalid_result"
@@ -50,6 +54,7 @@ class ContactDiscoveryRunResult:
     state_persisted: bool = False
     selected_urls: int = 0
     limited_link_scan: bool = False
+    persisted_candidates: tuple[ContactDiscoveryCandidateRead, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,9 +109,15 @@ class ContactDiscoveryService:
             )
 
         candidate_upserts = 0
+        persisted_candidates: list[ContactDiscoveryCandidateRead] = []
         if status in {ContactDiscoveryStatus.SUCCEEDED, ContactDiscoveryStatus.PARTIAL}:
             for candidate in validated.candidates:
-                self.repository.upsert_candidate(company_id, candidate)
+                upserted = self.repository.upsert_candidate(company_id, candidate)
+                if type(upserted) is not ContactDiscoveryCandidateUpsertResult:
+                    raise ValueError("Candidate persistence result is invalid.")
+                persisted_candidates.append(
+                    ContactDiscoveryCandidateRead.model_validate(upserted.candidate.model_dump())
+                )
                 candidate_upserts += 1
 
         self.repository.update_state(
@@ -123,6 +134,7 @@ class ContactDiscoveryService:
             result=validated,
             candidate_upserts=candidate_upserts,
             state_persisted=True,
+            persisted_candidates=tuple(persisted_candidates),
         )
 
     @staticmethod
@@ -235,6 +247,7 @@ class ContactDiscoveryService:
         result: _ValidatedProviderResult,
         candidate_upserts: int = 0,
         state_persisted: bool = False,
+        persisted_candidates: tuple[ContactDiscoveryCandidateRead, ...] = (),
     ) -> ContactDiscoveryRunResult:
         return ContactDiscoveryRunResult(
             company_id=company_id,
@@ -248,4 +261,5 @@ class ContactDiscoveryService:
             state_persisted=state_persisted,
             selected_urls=result.selected_urls,
             limited_link_scan=result.limited_link_scan,
+            persisted_candidates=persisted_candidates,
         )

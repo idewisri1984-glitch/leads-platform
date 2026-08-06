@@ -140,6 +140,7 @@ def test_run_result_is_typed_frozen_safe_and_preserves_provider_metadata(session
     assert result.limited_link_scan is True
     assert isinstance(result.candidates, tuple)
     assert isinstance(result.errors, tuple)
+    assert result.persisted_candidates == ()
     assert not hasattr(result, "session")
     with pytest.raises(FrozenInstanceError):
         result.status = ContactDiscoveryStatus.FAILED  # type: ignore[misc]
@@ -943,6 +944,8 @@ def test_successful_caller_commit_persists_state_and_candidate_atomically(sessio
     result = run(session, company, provider_result(candidate(company.id)), dry_run=False)
     session.commit()
     assert result.state_persisted is True
+    assert len(result.persisted_candidates) == 1
+    assert result.persisted_candidates[0].id > 0
     assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 1
     assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 1
 
