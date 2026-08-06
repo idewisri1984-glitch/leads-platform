@@ -303,6 +303,8 @@ def test_invalid_raw_record_is_rejected_before_read_model(
         ("confidence", 1),
         ("name", "Contradiction"),
         ("promoted_contact_id", 999),
+        ("persisted_confidence", 0.89),
+        ("persisted_confidence_percent", 89),
     ],
 )
 def test_contradictory_repository_representations_are_rejected(
@@ -317,10 +319,22 @@ def test_contradictory_repository_representations_are_rejected(
 
     def contradictory_upsert(repository, scoped_company_id, candidate):
         result = original(repository, scoped_company_id, candidate)
-        contradictory_candidate = result.candidate.model_copy(update={field: contradiction})
+        if field == "persisted_confidence":
+            contradictory_candidate = result.candidate
+            persisted_candidate = result.persisted_candidate.model_copy(
+                update={"confidence": contradiction}
+            )
+        elif field == "persisted_confidence_percent":
+            contradictory_candidate = result.candidate
+            persisted_candidate = result.persisted_candidate.model_copy(
+                update={"confidence_percent": contradiction}
+            )
+        else:
+            contradictory_candidate = result.candidate.model_copy(update={field: contradiction})
+            persisted_candidate = result.persisted_candidate
         return ContactDiscoveryCandidateUpsertResult.model_construct(
             candidate=contradictory_candidate,
-            persisted_candidate=result.persisted_candidate,
+            persisted_candidate=persisted_candidate,
             created=result.created,
             updated=result.updated,
             protected=result.protected,

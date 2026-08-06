@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from math import isfinite
 from typing import Any
 
@@ -120,6 +121,7 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
     source_url: str | None = Field(max_length=500)
     source_type: ContactDiscoverySourceType
     confidence: float
+    confidence_percent: int
     discovery_status: ContactDiscoveryCandidateStatus
     deduplication_key: str = Field(max_length=255)
     notes: str | None = None
@@ -139,6 +141,7 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
             "source_url",
             "source_type",
             "confidence",
+            "confidence_percent",
             "discovery_status",
             "deduplication_key",
             "notes",
@@ -149,6 +152,7 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
         if type(record) is ContactDiscoveryCandidate:
             if type(confidence) is not int or not 0 <= confidence <= 100:
                 raise ValueError("Candidate persistence result is invalid.")
+            values["confidence_percent"] = confidence
             values["confidence"] = float(confidence) / 100.0
         return cls.model_validate(values)
 
@@ -156,9 +160,6 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
         self, *, created_at: object, updated_at: object
     ) -> ContactDiscoveryCandidateRead:
         if type(created_at) is not datetime or type(updated_at) is not datetime:
-            raise ValueError("Candidate persistence result is invalid.")
-        confidence = self.confidence * 100.0
-        if not confidence.is_integer():
             raise ValueError("Candidate persistence result is invalid.")
         return ContactDiscoveryCandidateRead(
             id=self.id,
@@ -171,7 +172,7 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
             phone=self.phone,
             source_url=self.source_url,
             source_type=self.source_type,
-            confidence=int(confidence),
+            confidence=self.confidence_percent,
             discovery_status=self.discovery_status,
             deduplication_key=self.deduplication_key,
             notes=self.notes,
@@ -222,7 +223,7 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
             and candidate.phone == self.phone
             and candidate.source_url == self.source_url
             and candidate.source_type is self.source_type
-            and float(candidate.confidence) / 100.0 == self.confidence
+            and candidate.confidence == self.confidence_percent
             and candidate.discovery_status is self.discovery_status
             and candidate.deduplication_key == self.deduplication_key
             and candidate.notes == self.notes
@@ -241,6 +242,7 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
         company_id = field("company_id")
         promoted_contact_id = field("promoted_contact_id")
         confidence = field("confidence")
+        confidence_percent = field("confidence_percent")
         text_fields = (
             "name",
             "title",
@@ -285,11 +287,42 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
             )
         ):
             raise ValueError("Candidate persistence result is invalid.")
+        scaled_confidence = Decimal(str(confidence)) * Decimal(100)
+        if scaled_confidence != scaled_confidence.to_integral_value():
+            raise ValueError("Candidate persistence result is invalid.")
+        derived_confidence_percent = int(scaled_confidence)
+        if confidence_percent is None:
+            confidence_percent = derived_confidence_percent
+        if (
+            type(confidence_percent) is not int
+            or not 0 <= confidence_percent <= 100
+            or confidence_percent != derived_confidence_percent
+        ):
+            raise ValueError("Candidate persistence result is invalid.")
         for name in text_fields:
             if field(name) is not None and "\x00" in field(name):
                 raise ValueError("Candidate persistence result is invalid.")
             _safe_text(field(name))
-        return value
+        field_names = (
+            "id",
+            "company_id",
+            "promoted_contact_id",
+            "name",
+            "title",
+            "email",
+            "normalized_email",
+            "phone",
+            "source_url",
+            "source_type",
+            "confidence",
+            "discovery_status",
+            "deduplication_key",
+            "notes",
+            "last_error",
+        )
+        validated = {name: field(name) for name in field_names}
+        validated["confidence_percent"] = confidence_percent
+        return validated
 
 
 class ContactDiscoveryCandidateUpsertResult(BaseModel):
