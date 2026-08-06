@@ -553,3 +553,45 @@ def test_configured_single_page_never_fetches_secondary_links() -> None:
     assert result.attempted_pages == 1
     assert result.selected_urls == 0
     assert fetcher.calls == [(HOME, None)]
+
+
+def test_provider_extracts_narrative_founders_without_assigning_generic_inboxes() -> None:
+    about = f"{HOME}/about"
+    homepage_html = """
+    <html><body><a href="/about">About</a><footer>
+      <a href="mailto:vendors@example.com">Vendor Inquiries</a>
+      <a href="mailto:proposals@example.com">Project Inquiries</a>
+      <a href="mailto:info@example.com">General Inquiries</a>
+    </footer></body></html>
+    """
+    about_html = """
+    <html><body><main><h1>Profile</h1><p>
+      Meyer Davis is a globally recognized architecture and design studio
+      founded in 1999 by Will Meyer and Gray Davis.
+    </p></main></body></html>
+    """
+    provider, fetcher = provider_for(
+        {HOME: fetched(HOME, homepage_html), about: fetched(about, about_html)}
+    )
+
+    result = provider.discover(company_id=7, website_url=HOME)
+
+    assert fetcher.calls == [(HOME, None), (about, "example.com")]
+    assert result.attempted_pages == 2
+    assert result.successful_pages == 2
+    assert result.selected_urls == 1
+    assert result.errors == ()
+    assert [
+        (
+            candidate.name,
+            candidate.title,
+            candidate.email,
+            candidate.phone,
+            candidate.source_type,
+            candidate.source_url,
+        )
+        for candidate in result.candidates
+    ] == [
+        ("Will Meyer", "Founder", None, None, ContactDiscoverySourceType.ABOUT_PAGE, about),
+        ("Gray Davis", "Founder", None, None, ContactDiscoverySourceType.ABOUT_PAGE, about),
+    ]

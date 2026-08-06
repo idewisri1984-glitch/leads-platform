@@ -22,6 +22,51 @@ _ParserBase: Any = getattr(_html_parser, "HTML" + "Parser")
 
 _EMAIL = re.compile(r"(?<![\w.+-])([\w.+-]+@[\w-]+(?:\.[\w-]+)+)", re.ASCII)
 _PHONE = re.compile(r"(?<!\w)(\+?\d[\d ()\-.]{6,}\d)(?!\w)")
+_FOUNDER_PHRASE = re.compile(
+    r"\b(?:co-founded|cofounded|founded)(?:\s+in\s+\d{4})?\s+by\s+"
+    r"(?P<founders>[^.!?;:\n]{1,200})(?=[.!?;:\n]|$)",
+    re.IGNORECASE,
+)
+_FOUNDER_SEPARATOR = re.compile(
+    r"\s*(?:,\s*(?:(?:and|&)\s+)?|\s+(?:and|&)\s+)\s*",
+    re.IGNORECASE,
+)
+_MAX_NARRATIVE_FOUNDERS = 4
+_MAX_NARRATIVE_FOUNDER_TAIL = 200
+_FOUNDER_COMPATIBLE_TITLES = {"founder", "co-founder", "co founder", "cofounder"}
+_NARRATIVE_ORGANIZATION_SUFFIXES = {
+    "association",
+    "company",
+    "corporation",
+    "foundation",
+    "group",
+    "inc",
+    "limited",
+    "llc",
+    "ltd",
+    "studio",
+}
+_NARRATIVE_NON_PERSON_WORDS = {
+    "artisan",
+    "artisans",
+    "award",
+    "awards",
+    "chef",
+    "chefs",
+    "client",
+    "clients",
+    "holdings",
+    "inquiries",
+    "inquiry",
+    "investor",
+    "investors",
+    "principles",
+    "proposal",
+    "proposals",
+    "team",
+    "vendor",
+    "vendors",
+}
 _CONTEXT_WORDS = {
     "team",
     "leadership",
@@ -268,31 +313,50 @@ def parse_contact_discovery_candidates_from_html(
         if collector.exhausted:
             return []
         budget = _WorkBudget()
-        extracted = [
+        structured_people = [
             *_extract_html_people(collector.root, budget),
             *_extract_json_ld_people(collector, budget),
         ]
+        narrative_people = _extract_narrative_founders(collector.root, source_type, budget)
         if budget.exhausted:
             return []
-        candidates: dict[str, ContactDiscoveryCandidateCreate] = {}
-        for person in extracted:
+        candidates: list[ContactDiscoveryCandidateCreate] = []
+        canonical_indexes: dict[str, int] = {}
+        founder_alias_indexes: dict[tuple[str, str, str], int | None] = {}
+        for person in structured_people:
             candidate = _to_candidate(company_id, source_url, source_type, person)
             if candidate is None:
                 continue
-            key = build_contact_candidate_deduplication_key(
-                email=candidate.email,
-                name=candidate.name,
-                title=candidate.title,
-                source_url=candidate.source_url,
-            )
-            previous = candidates.get(key)
-            if previous is None:
-                candidates[key] = candidate
+            index = _store_canonical_candidate(candidates, canonical_indexes, candidate)
+            alias = _founder_candidate_alias(candidates[index])
+            if alias is None:
+                continue
+            if alias not in founder_alias_indexes:
+                founder_alias_indexes[alias] = index
+            elif founder_alias_indexes[alias] != index:
+                founder_alias_indexes[alias] = None
+        for person in narrative_people:
+            candidate = _to_candidate(company_id, source_url, source_type, person)
+            if candidate is None:
+                continue
+            alias = _founder_candidate_alias(candidate)
+            existing_index = founder_alias_indexes.get(alias) if alias is not None else None
+            if (
+                alias is not None
+                and existing_index is not None
+                and _narrative_merge_is_safe(candidates[existing_index], candidate)
+            ):
+                candidates[existing_index] = _merge_candidates(
+                    candidates[existing_index], candidate
+                )
+                canonical_indexes[_canonical_candidate_key(candidate)] = existing_index
             else:
-                candidates[key] = _merge_candidates(previous, candidate)
+                index = _store_canonical_candidate(candidates, canonical_indexes, candidate)
+                if alias is not None and alias not in founder_alias_indexes:
+                    founder_alias_indexes[alias] = index
         if budget.exhausted:
             return []
-        return list(candidates.values())
+        return candidates
     except (RecursionError, ValueError, TypeError):
         return []
 
@@ -360,6 +424,88 @@ def _extract_html_people(root: _Node, budget: _WorkBudget) -> list[_ExtractedPer
         if _looks_like_name(name) and _looks_like_title(title):
             people.append(_ExtractedPerson(name, title, None, None, in_context=True))
     return people
+
+
+def _extract_narrative_founders(
+    root: _Node,
+    source_type: ContactDiscoverySourceType,
+    budget: _WorkBudget,
+) -> list[_ExtractedPerson]:
+    if source_type is not ContactDiscoverySourceType.ABOUT_PAGE:
+        return []
+    people: list[_ExtractedPerson] = []
+    nodes = _walk(root, budget)
+    if budget.exhausted:
+        return []
+    for node in nodes:
+        if not node.text_parts or _narrative_context_is_blocked(node, budget):
+            if budget.exhausted:
+                return []
+            continue
+        for text_part in node.text_parts:
+            if not budget.consume(len(text_part) + 1):
+                return []
+            text = clean_discovered_text(text_part)
+            if not text:
+                continue
+            for match in _FOUNDER_PHRASE.finditer(text):
+                if not budget.consume():
+                    return []
+                names = _parse_narrative_founder_names(match.group("founders"))
+                if not names:
+                    continue
+                people.extend(
+                    _ExtractedPerson(
+                        name=name,
+                        title="Founder",
+                        email=None,
+                        phone=None,
+                        in_context=True,
+                    )
+                    for name in names
+                )
+    return people
+
+
+def _narrative_context_is_blocked(node: _Node, budget: _WorkBudget) -> bool:
+    for ancestor in _ancestors(node, budget):
+        if (
+            ancestor.tag in _BLOCKED_TAGS
+            or any(marker in ancestor.marker_text() for marker in _BLOCKED_MARKERS)
+            or "hidden" in ancestor.attrs
+            or ancestor.attrs.get("aria-hidden", "").casefold() == "true"
+            or "display:none" in ancestor.attrs.get("style", "").replace(" ", "").casefold()
+            or "visibility:hidden" in ancestor.attrs.get("style", "").replace(" ", "").casefold()
+        ):
+            return True
+    return budget.exhausted
+
+
+def _parse_narrative_founder_names(value: str) -> list[str]:
+    tail = clean_discovered_text(value)
+    if not tail or len(tail) > _MAX_NARRATIVE_FOUNDER_TAIL:
+        return []
+    names = [clean_discovered_text(part) for part in _FOUNDER_SEPARATOR.split(tail)]
+    if not 1 <= len(names) <= _MAX_NARRATIVE_FOUNDERS:
+        return []
+    if any(name is None or not _looks_like_narrative_person_name(name) for name in names):
+        return []
+    return [name for name in names if name is not None]
+
+
+def _looks_like_narrative_person_name(value: str) -> bool:
+    words = value.split()
+    normalized_words = [word.strip("'\".,-").casefold() for word in words]
+    return (
+        2 <= len(words) <= 4
+        and _looks_like_name(value)
+        and normalized_words[-1] not in _NARRATIVE_ORGANIZATION_SUFFIXES
+        and not any(
+            word in _NARRATIVE_ORGANIZATION_SUFFIXES | _NARRATIVE_NON_PERSON_WORDS
+            for word in normalized_words
+        )
+        and all(word and word[0].isupper() for word in words)
+    )
 
 
 def _person_from_node(
@@ -498,6 +644,63 @@ def _merge_candidates(
             values[field_name] = getattr(second, field_name)
     values["confidence"] = max(first.confidence, second.confidence)
     return ContactDiscoveryCandidateCreate.model_validate(values)
+
+
+def _canonical_candidate_key(candidate: ContactDiscoveryCandidateCreate) -> str:
+    return build_contact_candidate_deduplication_key(
+        email=candidate.email,
+        name=candidate.name,
+        title=candidate.title,
+        source_url=candidate.source_url,
+    )
+
+
+def _store_canonical_candidate(
+    candidates: list[ContactDiscoveryCandidateCreate],
+    canonical_indexes: dict[str, int],
+    candidate: ContactDiscoveryCandidateCreate,
+) -> int:
+    key = _canonical_candidate_key(candidate)
+    existing_index = canonical_indexes.get(key)
+    if existing_index is None:
+        existing_index = len(candidates)
+        candidates.append(candidate)
+        canonical_indexes[key] = existing_index
+    else:
+        candidates[existing_index] = _merge_candidates(candidates[existing_index], candidate)
+    return existing_index
+
+
+def _founder_candidate_alias(
+    candidate: ContactDiscoveryCandidateCreate,
+) -> tuple[str, str, str] | None:
+    name = clean_discovered_text(candidate.name)
+    title = clean_discovered_text(candidate.title)
+    if (
+        not name
+        or not title
+        or title.casefold() not in _FOUNDER_COMPATIBLE_TITLES
+        or not candidate.source_url
+    ):
+        return None
+    source = normalize_source_for_deduplication(candidate.source_url)
+    if source is None:
+        return None
+    return source, " ".join(name.split()).casefold(), "founder"
+
+
+def _narrative_merge_is_safe(
+    existing: ContactDiscoveryCandidateCreate,
+    narrative: ContactDiscoveryCandidateCreate,
+) -> bool:
+    if _founder_candidate_alias(existing) != _founder_candidate_alias(narrative):
+        return False
+    for field_name in ("email", "phone"):
+        first = clean_discovered_text(getattr(existing, field_name))
+        second = clean_discovered_text(getattr(narrative, field_name))
+        if first and second and first.casefold() != second.casefold():
+            return False
+    return True
 
 
 def _ancestors(node: _Node, budget: _WorkBudget) -> list[_Node]:

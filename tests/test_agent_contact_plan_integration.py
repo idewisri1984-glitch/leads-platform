@@ -31,10 +31,14 @@ from app.modules.contact_discovery.schemas import (
     ContactDiscoveryCandidateCreate,
     ContactDiscoveryCandidateUpsertResult,
 )
-from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
+from app.modules.contact_discovery.website_provider import (
+    WebsiteContactDiscoveryProvider,
+    WebsiteContactDiscoveryProviderResult,
+)
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
 from app.modules.task.models import Task
+from app.providers.public_web_fetcher import PublicWebFetchResult
 
 
 class FakeProvider:
@@ -181,6 +185,95 @@ def test_full_plan_persists_only_staging_and_is_idempotent(database) -> None:
         )
         assert all(row.promoted_contact_id is None for row in rows)
         assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 1
+        assert session.scalar(select(func.count()).select_from(Contact)) == 0
+        assert session.scalar(select(func.count()).select_from(Lead)) == 0
+        assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_real_provider_narrative_founders_select_and_remain_idempotent(database) -> None:
+    engine, project_id, company_id = database
+    instrumented = InstrumentedFactory(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    about = "https://example.com/about"
+    homepage_html = """
+    <html><body><a href="/about">About</a><footer>
+      <a href="mailto:vendors@example.com">Vendor Inquiries</a>
+      <a href="mailto:proposals@example.com">Project Inquiries</a>
+      <a href="mailto:info@example.com">General Inquiries</a>
+    </footer></body></html>
+    """
+    about_html = """
+    <html><body><main><h1>Profile</h1><p>
+      Meyer Davis is a globally recognized architecture and design studio
+      founded in 1999 by Will Meyer and Gray Davis.
+    </p></main></body></html>
+    """
+
+    class MockFetcher:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def fetch(self, url: str, *, allowed_hostname: str | None = None) -> PublicWebFetchResult:
+            self.calls.append(url)
+            if url == "https://example.com":
+                assert allowed_hostname is None
+            else:
+                assert allowed_hostname == "example.com"
+            html = homepage_html if url == "https://example.com" else about_html
+            return PublicWebFetchResult(final_url=url, text=html, content_type="text/html")
+
+    class CountingProvider(WebsiteContactDiscoveryProvider):
+        def __init__(self, fetcher: MockFetcher) -> None:
+            super().__init__(fetcher=fetcher)
+            self.calls = 0
+
+        def discover(
+            self, *, company_id: int, website_url: str
+        ) -> WebsiteContactDiscoveryProviderResult:
+            self.calls += 1
+            return super().discover(company_id=company_id, website_url=website_url)
+
+    fetcher = MockFetcher()
+    provider = CountingProvider(fetcher)
+    data = AgentContactPlanInput(
+        project_id=project_id,
+        company_id=company_id,
+        goal="Find the best founder for a partnership",
+    )
+
+    first = execute_agent_contact_plan(
+        data, session_factory=instrumented, provider_factory=lambda: provider
+    )
+
+    assert provider.calls == 1
+    assert fetcher.calls == ["https://example.com", about]
+    assert first.attempted_pages == first.successful_pages == 2
+    assert first.candidate_upsert_count == 2
+    assert first.staged_candidate_count == 2
+    assert first.eligible_candidate_count == 2
+    assert first.decision is AgentContactDecision.SELECT
+    assert first.selected_contact_name == "Will Meyer"
+    assert first.selected_contact_title == "Founder"
+    assert first.selected_contact_email is None
+    assert first.human_review_required is True
+    assert (
+        first.contact_mutation_count == first.lead_mutation_count == first.task_mutation_count == 0
+    )
+    assert instrumented.counters.commit_attempts == 1
+    assert instrumented.counters.successful_commits == 1
+    assert instrumented.counters.rollbacks == 0
+
+    second = execute_agent_contact_plan(
+        data, session_factory=instrumented, provider_factory=lambda: provider
+    )
+
+    assert provider.calls == 2
+    assert second.selected_candidate_id == first.selected_candidate_id
+    assert instrumented.counters.commit_attempts == 2
+    assert instrumented.counters.successful_commits == 2
+    assert instrumented.counters.rollbacks == 0
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 2
         assert session.scalar(select(func.count()).select_from(Contact)) == 0
         assert session.scalar(select(func.count()).select_from(Lead)) == 0
         assert session.scalar(select(func.count()).select_from(Task)) == 0

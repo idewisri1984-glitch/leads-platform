@@ -23,6 +23,15 @@ def parse(html: str) -> list[ContactDiscoveryCandidateCreate]:
     )
 
 
+def parse_about(html: str) -> list[ContactDiscoveryCandidateCreate]:
+    return parse_contact_discovery_candidates_from_html(
+        company_id=7,
+        html=html,
+        source_url="https://example.com/about",
+        source_type=ContactDiscoverySourceType.ABOUT_PAGE,
+    )
+
+
 def test_extracts_person_card_with_name_and_title() -> None:
     candidates = parse(
         '<section id="team"><div class="person"><h3>Ada Lovelace</h3>'
@@ -496,3 +505,145 @@ def test_invalid_company_or_source_is_rejected_without_network() -> None:
             source_url="file:///secret",
             source_type=ContactDiscoverySourceType.TEAM_PAGE,
         )
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_names"),
+    [
+        ("founded by Jane Smith", ["Jane Smith"]),
+        ("founded by Jane Smith and John Doe", ["Jane Smith", "John Doe"]),
+        ("founded in 1999 by Jane Smith and John Doe", ["Jane Smith", "John Doe"]),
+        ("co-founded by Jane Smith & John Doe", ["Jane Smith", "John Doe"]),
+        (
+            "founded by Jane Smith, John Doe, and Alex Brown",
+            ["Jane Smith", "John Doe", "Alex Brown"],
+        ),
+    ],
+)
+def test_extracts_bounded_narrative_founder_lists(phrase: str, expected_names: list[str]) -> None:
+    candidates = parse_about(f"<main><p>Our studio was {phrase}.</p></main>")
+    assert [candidate.name for candidate in candidates] == expected_names
+    assert all(candidate.title == "Founder" for candidate in candidates)
+    assert all(candidate.email is None and candidate.phone is None for candidate in candidates)
+    assert all(candidate.confidence == 65 for candidate in candidates)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "founded by the design team",
+        "founded by Acme Holdings LLC",
+        "founded on strong principles",
+        "the foundation was founded in 1999",
+        "founded by Jane",
+        "founded by Jane Smith, John Doe, Alex Brown, Mary Jones, and Will White",
+        "founded by " + ("Jane Smith " * 25),
+    ],
+)
+def test_rejects_invalid_narrative_founder_phrases(phrase: str) -> None:
+    assert parse_about(f"<main><p>{phrase}.</p></main>") == []
+
+
+@pytest.mark.parametrize(
+    "source_type",
+    [ContactDiscoverySourceType.CONTACT_PAGE, ContactDiscoverySourceType.OTHER_PUBLIC_PAGE],
+)
+def test_narrative_founders_are_about_page_only(
+    source_type: ContactDiscoverySourceType,
+) -> None:
+    assert (
+        parse_contact_discovery_candidates_from_html(
+            company_id=7,
+            html="<p>Founded by Jane Smith and John Doe.</p>",
+            source_url="https://example.com/page",
+            source_type=source_type,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<article><p>Founded by Jane Smith.</p></article>",
+        '<div class="blog"><p>Founded by Jane Smith.</p></div>',
+        '<div class="testimonial"><p>Founded by Jane Smith.</p></div>',
+    ],
+)
+def test_narrative_founders_ignore_blocked_content(html: str) -> None:
+    assert parse_about(html) == []
+
+
+def test_supported_card_and_narrative_founder_merge_without_losing_details() -> None:
+    candidates = parse_about(
+        '<div class="person"><h3>Jane Smith</h3><p class="role">Founder</p>'
+        '<a href="mailto:jane@example.com">Email</a>'
+        '<a href="tel:+1 555 0100">Phone</a></div>'
+        "<p>The studio was founded by Jane Smith.</p>"
+    )
+    assert len(candidates) == 1
+    assert candidates[0].name == "Jane Smith"
+    assert candidates[0].email == "jane@example.com"
+    assert candidates[0].phone == "+1 555 0100"
+    assert candidates[0].confidence == 95
+
+
+def test_page_level_generic_email_is_not_assigned_to_narrative_founder() -> None:
+    candidates = parse_about(
+        "<main><p>The studio was founded by Jane Smith.</p></main>"
+        '<footer><a href="mailto:info@example.com">General Inquiries</a></footer>'
+    )
+    assert len(candidates) == 1
+    assert candidates[0].name == "Jane Smith"
+    assert candidates[0].email is None
+
+
+@pytest.mark.parametrize(
+    ("card_name", "narrative_name", "card_title"),
+    [
+        ("Will Meyer", "Will Meyers", "Founder"),
+        ("Gray Davis", "Davis Gray", "Founder"),
+        ("Jane Smith", "Jane Smith", "Foundation Director"),
+    ],
+)
+def test_narrative_alias_does_not_merge_inexact_identity_or_title(
+    card_name: str, narrative_name: str, card_title: str
+) -> None:
+    candidates = parse_about(
+        f'<div class="person"><h3>{card_name}</h3><p class="role">{card_title}</p>'
+        f'<a href="mailto:person@example.com">Email</a></div>'
+        f"<p>The studio was founded by {narrative_name}.</p>"
+    )
+    assert len(candidates) == 2
+
+
+def test_narrative_alias_requires_same_normalized_source_url() -> None:
+    about = ContactDiscoveryCandidateCreate(
+        company_id=7,
+        name="Jane Smith",
+        title="Founder",
+        email="jane@example.com",
+        source_url="https://example.com/about#profile",
+        source_type=ContactDiscoverySourceType.ABOUT_PAGE,
+        confidence=80,
+    )
+    team = about.model_copy(update={"email": None, "source_url": "https://example.com/team"})
+    assert website_contact_parser._founder_candidate_alias(about) != (
+        website_contact_parser._founder_candidate_alias(team)
+    )
+
+
+def test_ambiguous_supported_founder_cards_are_not_alias_merged() -> None:
+    candidates = parse_about(
+        '<div class="person"><h3>Jane Smith</h3><p class="role">Founder</p>'
+        '<a href="mailto:jane.one@example.com">Email</a></div>'
+        '<div class="person"><h3>Jane Smith</h3><p class="role">Founder</p>'
+        '<a href="mailto:jane.two@example.com">Email</a></div>'
+        "<p>The studio was founded by Jane Smith.</p>"
+    )
+    assert len(candidates) == 3
+    assert [candidate.email for candidate in candidates] == [
+        "jane.one@example.com",
+        "jane.two@example.com",
+        None,
+    ]
