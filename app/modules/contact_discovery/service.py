@@ -133,9 +133,7 @@ class ContactDiscoveryService:
         if status in {ContactDiscoveryStatus.SUCCEEDED, ContactDiscoveryStatus.PARTIAL}:
             for candidate in validated.candidates:
                 upserted = self.repository.upsert_candidate(company_id, candidate)
-                if type(upserted) is not ContactDiscoveryCandidateUpsertResult:
-                    raise ValueError("Candidate persistence result is invalid.")
-                persisted_candidates.append(self._persisted_snapshot(upserted.persisted_candidate))
+                persisted_candidates.append(self._validated_upsert_snapshot(upserted, company_id))
                 candidate_upserts += 1
 
         self.repository.update_state(
@@ -255,6 +253,29 @@ class ContactDiscoveryService:
             return None
         provider_name = provider_name.strip()
         return provider_name[:100] or None
+
+    @staticmethod
+    def _validated_upsert_snapshot(
+        result: object, company_id: int
+    ) -> ContactDiscoveryPersistedCandidate:
+        if type(result) is not ContactDiscoveryCandidateUpsertResult:
+            raise ValueError("Candidate persistence result is invalid.")
+        if (
+            type(result.created) is not bool
+            or type(result.updated) is not bool
+            or type(result.protected) is not bool
+        ):
+            raise ValueError("Candidate persistence result is invalid.")
+        try:
+            persisted = ContactDiscoveryPersistedCandidateRaw.model_validate(
+                result.persisted_candidate
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Candidate persistence result is invalid.") from None
+        snapshot = ContactDiscoveryService._persisted_snapshot(persisted)
+        if snapshot.company_id != company_id or not persisted.matches_read_model(result.candidate):
+            raise ValueError("Candidate persistence result is invalid.")
+        return snapshot
 
     @staticmethod
     def _persisted_snapshot(

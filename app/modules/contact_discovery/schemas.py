@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.contact_discovery.models import (
+    ContactDiscoveryCandidate,
     ContactDiscoveryCandidateStatus,
     ContactDiscoverySourceType,
     ContactDiscoveryStatus,
@@ -124,6 +125,110 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
     notes: str | None = None
     last_error: str | None = None
 
+    @classmethod
+    def from_record(cls, record: object) -> "ContactDiscoveryPersistedCandidateRaw":
+        fields = (
+            "id",
+            "company_id",
+            "promoted_contact_id",
+            "name",
+            "title",
+            "email",
+            "normalized_email",
+            "phone",
+            "source_url",
+            "source_type",
+            "confidence",
+            "discovery_status",
+            "deduplication_key",
+            "notes",
+            "last_error",
+        )
+        values = {name: getattr(record, name, None) for name in fields}
+        confidence = values["confidence"]
+        if type(record) is ContactDiscoveryCandidate:
+            if type(confidence) is not int or not 0 <= confidence <= 100:
+                raise ValueError("Candidate persistence result is invalid.")
+            values["confidence"] = float(confidence) / 100.0
+        return cls.model_validate(values)
+
+    def to_read_model(
+        self, *, created_at: object, updated_at: object
+    ) -> ContactDiscoveryCandidateRead:
+        if type(created_at) is not datetime or type(updated_at) is not datetime:
+            raise ValueError("Candidate persistence result is invalid.")
+        confidence = self.confidence * 100.0
+        if not confidence.is_integer():
+            raise ValueError("Candidate persistence result is invalid.")
+        return ContactDiscoveryCandidateRead(
+            id=self.id,
+            company_id=self.company_id,
+            promoted_contact_id=self.promoted_contact_id,
+            name=self.name,
+            title=self.title,
+            email=self.email,
+            normalized_email=self.normalized_email,
+            phone=self.phone,
+            source_url=self.source_url,
+            source_type=self.source_type,
+            confidence=int(confidence),
+            discovery_status=self.discovery_status,
+            deduplication_key=self.deduplication_key,
+            notes=self.notes,
+            last_error=self.last_error,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def matches_read_model(self, candidate: object) -> bool:
+        if type(candidate) is not ContactDiscoveryCandidateRead:
+            return False
+        text_fields = (
+            "name",
+            "title",
+            "email",
+            "normalized_email",
+            "phone",
+            "source_url",
+            "deduplication_key",
+            "notes",
+            "last_error",
+        )
+        if (
+            type(candidate.id) is not int
+            or type(candidate.company_id) is not int
+            or (
+                candidate.promoted_contact_id is not None
+                and type(candidate.promoted_contact_id) is not int
+            )
+            or type(candidate.confidence) is not int
+            or not 0 <= candidate.confidence <= 100
+            or type(candidate.source_type) is not ContactDiscoverySourceType
+            or type(candidate.discovery_status) is not ContactDiscoveryCandidateStatus
+            or any(
+                getattr(candidate, name) is not None and type(getattr(candidate, name)) is not str
+                for name in text_fields
+            )
+        ):
+            return False
+        return (
+            candidate.id == self.id
+            and candidate.company_id == self.company_id
+            and candidate.promoted_contact_id == self.promoted_contact_id
+            and candidate.name == self.name
+            and candidate.title == self.title
+            and candidate.email == self.email
+            and candidate.normalized_email == self.normalized_email
+            and candidate.phone == self.phone
+            and candidate.source_url == self.source_url
+            and candidate.source_type is self.source_type
+            and float(candidate.confidence) / 100.0 == self.confidence
+            and candidate.discovery_status is self.discovery_status
+            and candidate.deduplication_key == self.deduplication_key
+            and candidate.notes == self.notes
+            and candidate.last_error == self.last_error
+        )
+
     @model_validator(mode="before")
     @classmethod
     def validate_raw_persisted_values(cls, value: object) -> object:
@@ -188,11 +293,19 @@ class ContactDiscoveryPersistedCandidateRaw(BaseModel):
 
 
 class ContactDiscoveryCandidateUpsertResult(BaseModel):
+    model_config = ConfigDict(revalidate_instances="always")
+
     candidate: ContactDiscoveryCandidateRead
     persisted_candidate: ContactDiscoveryPersistedCandidateRaw
     created: bool = False
     updated: bool = False
     protected: bool = False
+
+    @model_validator(mode="after")
+    def require_consistent_representations(self) -> "ContactDiscoveryCandidateUpsertResult":
+        if not self.persisted_candidate.matches_read_model(self.candidate):
+            raise ValueError("Candidate persistence result is invalid.")
+        return self
 
 
 def _safe_text(value: str | None) -> str | None:

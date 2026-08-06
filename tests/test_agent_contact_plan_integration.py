@@ -224,26 +224,37 @@ def test_provider_failure_rolls_back_external_database(database, failed_result: 
 
 
 @pytest.mark.parametrize(
-    ("field", "invalid"),
+    "changes",
     [
-        ("id", True),
-        ("id", False),
-        ("company_id", True),
-        ("company_id", False),
-        ("confidence", True),
-        ("confidence", False),
-        ("confidence", 0),
-        ("confidence", 1),
-        ("confidence", "0"),
-        ("confidence", "0.9"),
-        ("confidence", "1"),
-        ("confidence", nan),
-        ("confidence", inf),
-        ("confidence", -inf),
+        {"id": True},
+        {"id": False},
+        {"company_id": True},
+        {"company_id": False},
+        {"confidence": True},
+        {"confidence": False},
+        {"confidence": 0},
+        {"confidence": 1},
+        {"confidence": "0"},
+        {"confidence": "0.9"},
+        {"confidence": "1"},
+        {"confidence": nan},
+        {"confidence": inf},
+        {"confidence": -inf},
+        {"promoted_contact_id": True},
+        {"promoted_contact_id": False},
+        {"promoted_contact_id": 0},
+        {"promoted_contact_id": "1"},
+        {"discovery_status": "UNKNOWN"},
+        {"source_type": "UNKNOWN"},
+        {"name": 1},
+        {"name": "bad\x00name"},
+        {"notes": "<raw>"},
+        {"company_id": 999},
+        {"id": True, "company_id": True, "confidence": True},
     ],
 )
-def test_invalid_raw_repository_result_rolls_back_all_staging(
-    database, monkeypatch: pytest.MonkeyPatch, field: str, invalid: object
+def test_invalid_raw_record_is_rejected_before_read_model(
+    database, monkeypatch: pytest.MonkeyPatch, changes: dict[str, object]
 ) -> None:
     engine, project_id, company_id = database
     instrumented = InstrumentedFactory(engine)
@@ -251,11 +262,9 @@ def test_invalid_raw_repository_result_rolls_back_all_staging(
 
     def invalid_upsert(repository, scoped_company_id, candidate):
         result = original(repository, scoped_company_id, candidate)
-        raw = result.persisted_candidate.model_dump()
-        raw[field] = invalid
-        return ContactDiscoveryCandidateUpsertResult.model_construct(
-            candidate=result.candidate,
-            persisted_candidate=SimpleNamespace(**raw),
+        raw = result.candidate.model_dump() | {"confidence": result.persisted_candidate.confidence}
+        return ContactDiscoveryRepository._result(
+            SimpleNamespace(**(raw | changes)),
             created=result.created,
             updated=result.updated,
             protected=result.protected,
@@ -271,7 +280,63 @@ def test_invalid_raw_repository_result_rolls_back_all_staging(
             session_factory=instrumented,
             provider_factory=lambda: FakeProvider(company_id),
         )
-    assert str(invalid) not in str(exc_info.value)
+    assert all(str(value) not in str(exc_info.value) for value in changes.values())
+    assert instrumented.counters.commit_attempts == 0
+    assert instrumented.counters.successful_commits == 0
+    assert instrumented.counters.rollbacks == 1
+    factory = sessionmaker(bind=engine)
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(ContactDiscoveryCandidate)) == 0
+        assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 0
+        assert session.scalar(select(func.count()).select_from(Contact)) == 0
+        assert session.scalar(select(func.count()).select_from(Lead)) == 0
+        assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "contradiction"),
+    [
+        ("id", 999),
+        ("company_id", 999),
+        ("discovery_status", ContactDiscoveryCandidateStatus.REVIEWED),
+        ("source_type", ContactDiscoverySourceType.CONTACT_PAGE),
+        ("confidence", 1),
+        ("name", "Contradiction"),
+        ("promoted_contact_id", 999),
+    ],
+)
+def test_contradictory_repository_representations_are_rejected(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    contradiction: object,
+) -> None:
+    engine, project_id, company_id = database
+    instrumented = InstrumentedFactory(engine)
+    original = ContactDiscoveryRepository.upsert_candidate
+
+    def contradictory_upsert(repository, scoped_company_id, candidate):
+        result = original(repository, scoped_company_id, candidate)
+        contradictory_candidate = result.candidate.model_copy(update={field: contradiction})
+        return ContactDiscoveryCandidateUpsertResult.model_construct(
+            candidate=contradictory_candidate,
+            persisted_candidate=result.persisted_candidate,
+            created=result.created,
+            updated=result.updated,
+            protected=result.protected,
+        )
+
+    monkeypatch.setattr(ContactDiscoveryRepository, "upsert_candidate", contradictory_upsert)
+    with pytest.raises(
+        AgentContactPlanPersistenceError,
+        match=r"^Contact discovery state could not be persisted\.$",
+    ):
+        execute_agent_contact_plan(
+            AgentContactPlanInput(project_id=project_id, company_id=company_id, goal="Find"),
+            session_factory=instrumented,
+            provider_factory=lambda: FakeProvider(company_id),
+        )
+
     assert instrumented.counters.commit_attempts == 0
     assert instrumented.counters.successful_commits == 0
     assert instrumented.counters.rollbacks == 1
@@ -420,7 +485,7 @@ def test_protected_candidate_does_not_block_separate_current_run_selection(
 
 @pytest.mark.parametrize(
     "failure_mode",
-    ["invalid_raw", "selection", "commit", "failed_result"],
+    ["invalid_raw", "contradiction", "selection", "commit", "failed_result"],
 )
 def test_failures_preserve_existing_candidate_and_state(
     database, monkeypatch: pytest.MonkeyPatch, failure_mode: str
@@ -480,6 +545,20 @@ def test_failures_preserve_existing_candidate_and_state(
             )
 
         monkeypatch.setattr(ContactDiscoveryRepository, "upsert_candidate", invalid_upsert)
+    elif failure_mode == "contradiction":
+        original_upsert = ContactDiscoveryRepository.upsert_candidate
+
+        def contradictory_upsert(repository, scoped_company_id, candidate):
+            result = original_upsert(repository, scoped_company_id, candidate)
+            return ContactDiscoveryCandidateUpsertResult.model_construct(
+                candidate=result.candidate.model_copy(update={"id": result.candidate.id + 1}),
+                persisted_candidate=result.persisted_candidate,
+                created=result.created,
+                updated=result.updated,
+                protected=result.protected,
+            )
+
+        monkeypatch.setattr(ContactDiscoveryRepository, "upsert_candidate", contradictory_upsert)
     elif failure_mode == "selection":
 
         def inconsistent(*args: object, **kwargs: object):
@@ -491,6 +570,7 @@ def test_failures_preserve_existing_candidate_and_state(
     provider = FakeProvider(company_id, failed_result=failure_mode == "failed_result")
     expected_error = {
         "invalid_raw": AgentContactPlanPersistenceError,
+        "contradiction": AgentContactPlanPersistenceError,
         "selection": AgentContactPlanSelectionConsistencyError,
         "commit": AgentContactPlanPersistenceError,
         "failed_result": AgentContactPlanProviderError,
