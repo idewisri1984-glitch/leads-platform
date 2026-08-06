@@ -3,13 +3,21 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from app.modules.contact_discovery.models import ContactDiscoveryStatus
+from app.modules.contact_discovery.models import (
+    ContactDiscoveryCandidateStatus,
+    ContactDiscoverySourceType,
+    ContactDiscoveryStatus,
+)
 from app.modules.contact_discovery.normalization import (
     build_contact_candidate_deduplication_key,
     normalize_source_for_deduplication,
 )
 from app.modules.contact_discovery.repository import ContactDiscoveryRepository
-from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
+from app.modules.contact_discovery.schemas import (
+    ContactDiscoveryCandidateCreate,
+    ContactDiscoveryCandidateUpsertResult,
+    ContactDiscoveryPersistedCandidateRaw,
+)
 from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
 
 _PROVIDER_INVALID_RESULT = "provider_invalid_result"
@@ -38,6 +46,22 @@ class ContactDiscoveryProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class ContactDiscoveryPersistedCandidate:
+    id: int
+    company_id: int
+    promoted_contact_id: int | None
+    name: str | None
+    title: str | None
+    email: str | None
+    phone: str | None
+    source_url: str | None
+    source_type: ContactDiscoverySourceType
+    confidence: float
+    discovery_status: ContactDiscoveryCandidateStatus
+    deduplication_key: str
+
+
+@dataclass(frozen=True)
 class ContactDiscoveryRunResult:
     company_id: int
     dry_run: bool
@@ -50,6 +74,7 @@ class ContactDiscoveryRunResult:
     state_persisted: bool = False
     selected_urls: int = 0
     limited_link_scan: bool = False
+    persisted_candidates: tuple[ContactDiscoveryPersistedCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,9 +129,11 @@ class ContactDiscoveryService:
             )
 
         candidate_upserts = 0
+        persisted_candidates: list[ContactDiscoveryPersistedCandidate] = []
         if status in {ContactDiscoveryStatus.SUCCEEDED, ContactDiscoveryStatus.PARTIAL}:
             for candidate in validated.candidates:
-                self.repository.upsert_candidate(company_id, candidate)
+                upserted = self.repository.upsert_candidate(company_id, candidate)
+                persisted_candidates.append(self._validated_upsert_snapshot(upserted, company_id))
                 candidate_upserts += 1
 
         self.repository.update_state(
@@ -123,6 +150,7 @@ class ContactDiscoveryService:
             result=validated,
             candidate_upserts=candidate_upserts,
             state_persisted=True,
+            persisted_candidates=tuple(persisted_candidates),
         )
 
     @staticmethod
@@ -227,6 +255,52 @@ class ContactDiscoveryService:
         return provider_name[:100] or None
 
     @staticmethod
+    def _validated_upsert_snapshot(
+        result: object, company_id: int
+    ) -> ContactDiscoveryPersistedCandidate:
+        if type(result) is not ContactDiscoveryCandidateUpsertResult:
+            raise ValueError("Candidate persistence result is invalid.")
+        if (
+            type(result.created) is not bool
+            or type(result.updated) is not bool
+            or type(result.protected) is not bool
+        ):
+            raise ValueError("Candidate persistence result is invalid.")
+        try:
+            persisted = ContactDiscoveryPersistedCandidateRaw.model_validate(
+                result.persisted_candidate
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Candidate persistence result is invalid.") from None
+        snapshot = ContactDiscoveryService._persisted_snapshot(persisted)
+        if snapshot.company_id != company_id or not persisted.matches_read_model(result.candidate):
+            raise ValueError("Candidate persistence result is invalid.")
+        return snapshot
+
+    @staticmethod
+    def _persisted_snapshot(
+        candidate: object,
+    ) -> ContactDiscoveryPersistedCandidate:
+        try:
+            validated = ContactDiscoveryPersistedCandidateRaw.model_validate(candidate)
+        except (TypeError, ValueError):
+            raise ValueError("Candidate persistence result is invalid.") from None
+        return ContactDiscoveryPersistedCandidate(
+            id=validated.id,
+            company_id=validated.company_id,
+            promoted_contact_id=validated.promoted_contact_id,
+            name=validated.name,
+            title=validated.title,
+            email=validated.email,
+            phone=validated.phone,
+            source_url=validated.source_url,
+            source_type=validated.source_type,
+            confidence=validated.confidence,
+            discovery_status=validated.discovery_status,
+            deduplication_key=validated.deduplication_key,
+        )
+
+    @staticmethod
     def _run_result(
         *,
         company_id: int,
@@ -235,6 +309,7 @@ class ContactDiscoveryService:
         result: _ValidatedProviderResult,
         candidate_upserts: int = 0,
         state_persisted: bool = False,
+        persisted_candidates: tuple[ContactDiscoveryPersistedCandidate, ...] = (),
     ) -> ContactDiscoveryRunResult:
         return ContactDiscoveryRunResult(
             company_id=company_id,
@@ -248,4 +323,5 @@ class ContactDiscoveryService:
             state_persisted=state_persisted,
             selected_urls=result.selected_urls,
             limited_link_scan=result.limited_link_scan,
+            persisted_candidates=persisted_candidates,
         )

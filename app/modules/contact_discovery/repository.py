@@ -20,8 +20,8 @@ from app.modules.contact_discovery.normalization import (
 )
 from app.modules.contact_discovery.schemas import (
     ContactDiscoveryCandidateCreate,
-    ContactDiscoveryCandidateRead,
     ContactDiscoveryCandidateUpsertResult,
+    ContactDiscoveryPersistedCandidateRaw,
 )
 
 _UNSET = object()
@@ -354,8 +354,14 @@ class ContactDiscoveryRepository:
         updated: bool = False,
         protected: bool = False,
     ) -> ContactDiscoveryCandidateUpsertResult:
+        persisted = ContactDiscoveryPersistedCandidateRaw.from_record(candidate)
+        read = persisted.to_read_model(
+            created_at=getattr(candidate, "created_at", None),
+            updated_at=getattr(candidate, "updated_at", None),
+        )
         return ContactDiscoveryCandidateUpsertResult(
-            candidate=ContactDiscoveryCandidateRead.model_validate(candidate),
+            candidate=read,
+            persisted_candidate=persisted,
             created=created,
             updated=updated,
             protected=protected,

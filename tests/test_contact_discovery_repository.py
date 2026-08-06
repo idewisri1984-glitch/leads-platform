@@ -1,7 +1,9 @@
 from collections.abc import Generator
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
+from math import inf, nan
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -29,7 +31,10 @@ from app.modules.contact_discovery.repository import (
     ContactDiscoveryRepository,
     _normalize_persisted_candidate_status,
 )
-from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
+from app.modules.contact_discovery.schemas import (
+    ContactDiscoveryCandidateCreate,
+    ContactDiscoveryPersistedCandidateRaw,
+)
 from app.modules.project.models import Project
 
 
@@ -924,6 +929,159 @@ def test_promotion_link_and_status_are_protected_from_review_and_upsert(
     assert result.candidate.promoted_contact_id == contact.id
     assert result.candidate.name == "Original"
     assert result.candidate.notes == "preserve"
+
+
+def test_upsert_equal_confidence_retains_stable_candidate_without_update(session: Session) -> None:
+    project = create_project(session, "Project")
+    company = create_company(session, project, "Company")
+    repository = ContactDiscoveryRepository(session)
+    first = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name="Original",
+            email="equal@example.com",
+            confidence=73,
+            notes="preserved",
+        ),
+    )
+
+    second = repository.upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            name="Replacement",
+            email="equal@example.com",
+            confidence=73,
+            notes="replacement",
+        ),
+    )
+
+    assert second.candidate.id == first.candidate.id
+    assert second.candidate.confidence == 73
+    assert second.candidate.name == "Original"
+    assert second.candidate.notes == "preserved"
+    assert second.updated is False
+
+
+@pytest.mark.parametrize("confidence", range(101))
+def test_repository_result_preserves_every_valid_orm_confidence(
+    session: Session, confidence: int
+) -> None:
+    project = create_project(session, f"Project {confidence}")
+    company = create_company(session, project, f"Company {confidence}")
+
+    result = ContactDiscoveryRepository(session).upsert_candidate(
+        company.id,
+        candidate(
+            company.id,
+            email=f"confidence-{confidence}@example.com",
+            confidence=confidence,
+        ),
+    )
+
+    assert result.candidate.confidence == confidence
+    assert result.persisted_candidate.confidence_percent == confidence
+    assert result.persisted_candidate.confidence == confidence / 100.0
+    assert result.persisted_candidate.matches_read_model(result.candidate)
+
+
+@pytest.mark.parametrize("confidence", [-1, 101, True, False])
+def test_repository_result_rejects_invalid_orm_confidence(confidence: object) -> None:
+    now = datetime.now(UTC)
+    record = ContactDiscoveryCandidate(
+        id=1,
+        company_id=1,
+        promoted_contact_id=None,
+        name="Ada",
+        title="Director",
+        email="ada@example.com",
+        normalized_email="ada@example.com",
+        phone=None,
+        source_url=None,
+        source_type=ContactDiscoverySourceType.TEAM_PAGE,
+        confidence=confidence,
+        discovery_status=ContactDiscoveryCandidateStatus.DISCOVERED,
+        deduplication_key="email:ada@example.com",
+        notes=None,
+        last_error=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+    with pytest.raises(ValueError, match="persistence result is invalid"):
+        ContactDiscoveryRepository._result(record)
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expected_percent"),
+    [
+        (0.0, 0),
+        (0.01, 1),
+        (0.07, 7),
+        (0.14, 14),
+        (0.28, 28),
+        (0.29, 29),
+        (0.5, 50),
+        (0.55, 55),
+        (0.56, 56),
+        (0.57, 57),
+        (0.58, 58),
+        (1.0, 100),
+    ],
+)
+def test_non_orm_confidence_uses_exact_decimal_percentage(
+    confidence: float, expected_percent: int
+) -> None:
+    snapshot = ContactDiscoveryPersistedCandidateRaw.from_record(
+        SimpleNamespace(
+            id=1,
+            company_id=1,
+            promoted_contact_id=None,
+            name="Ada",
+            title="Director",
+            email="ada@example.com",
+            normalized_email="ada@example.com",
+            phone=None,
+            source_url=None,
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+            confidence=confidence,
+            discovery_status=ContactDiscoveryCandidateStatus.DISCOVERED,
+            deduplication_key="email:ada@example.com",
+            notes=None,
+            last_error=None,
+        )
+    )
+
+    assert snapshot.confidence_percent == expected_percent
+    assert snapshot.confidence == expected_percent / 100.0
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    [0.001, 0.333, 0.999, True, False, 0, 1, "0.29", nan, inf, -inf],
+)
+def test_non_orm_confidence_rejects_noncanonical_values(confidence: object) -> None:
+    with pytest.raises(ValueError, match="persistence result is invalid"):
+        ContactDiscoveryPersistedCandidateRaw.from_record(
+            SimpleNamespace(
+                id=1,
+                company_id=1,
+                promoted_contact_id=None,
+                name="Ada",
+                title="Director",
+                email="ada@example.com",
+                normalized_email="ada@example.com",
+                phone=None,
+                source_url=None,
+                source_type=ContactDiscoverySourceType.TEAM_PAGE,
+                confidence=confidence,
+                discovery_status=ContactDiscoveryCandidateStatus.DISCOVERED,
+                deduplication_key="email:ada@example.com",
+                notes=None,
+                last_error=None,
+            )
+        )
 
 
 def test_reviewed_candidate_with_existing_link_is_ineligible(session: Session) -> None:

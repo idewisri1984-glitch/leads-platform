@@ -46,6 +46,24 @@ from app.modules.agent import (
 )
 from app.modules.agent.company_plan import DecisionBoundary
 from app.modules.agent.company_selection import AgentCompanySelectionRepository
+from app.modules.agent.contact_plan import (
+    AgentContactPlanBindingMismatchError,
+    AgentContactPlanCompanyNotFoundError,
+    AgentContactPlanDiscoveryResultError,
+    AgentContactPlanError,
+    AgentContactPlanInternalError,
+    AgentContactPlanInvalidDataError,
+    AgentContactPlanPersistenceError,
+    AgentContactPlanProjectNotFoundError,
+    AgentContactPlanProviderError,
+    AgentContactPlanSelectionConsistencyError,
+    AgentContactPlanService,
+    AgentContactPlanWebsiteMissingError,
+)
+from app.modules.agent.contact_plan_schemas import (
+    AgentContactPlanInput,
+    AgentContactPlanResult,
+)
 from app.modules.company.repository import CompanyRepository
 from app.modules.company_discovery import (
     CompanyDiscoveryCandidatePromotionService,
@@ -60,6 +78,11 @@ from app.modules.company_discovery.staging_orchestration import (
 from app.modules.company_discovery.staging_repository import (
     CompanyDiscoveryStagingRepository,
 )
+from app.modules.contact_discovery import (
+    ContactDiscoveryProvider,
+    ContactDiscoveryRepository,
+    WebsiteContactDiscoveryProvider,
+)
 from app.modules.project import ProjectRepository
 from app.modules.search_profile import (
     SearchProfileQueryGenerator,
@@ -73,6 +96,156 @@ from app.providers.serpapi import SerpApiClient
 app = typer.Typer(help="Bounded Agent planning commands.")
 company_select_app = typer.Typer(help="Company-selection planning commands.")
 app.add_typer(company_select_app, name="company-select")
+contact_select_app = typer.Typer(help="Contact-selection planning commands.")
+app.add_typer(contact_select_app, name="contact-select")
+
+_CONTACT_INVALID = "Agent contact plan data is invalid."
+_CONTACT_INTERNAL = "Agent contact plan failed."
+_CONTACT_OPTIONS = ("--project-id", "--company-id", "--goal", "--output")
+_CONTACT_FIELD_ORDER = tuple(AgentContactPlanResult.model_fields)
+_CONTACT_ERROR_CODES: tuple[tuple[type[AgentContactPlanError], int], ...] = (
+    (AgentContactPlanInvalidDataError, 2),
+    (AgentContactPlanProjectNotFoundError, 3),
+    (AgentContactPlanCompanyNotFoundError, 4),
+    (AgentContactPlanBindingMismatchError, 5),
+    (AgentContactPlanWebsiteMissingError, 6),
+    (AgentContactPlanProviderError, 7),
+    (AgentContactPlanDiscoveryResultError, 8),
+    (AgentContactPlanPersistenceError, 9),
+    (AgentContactPlanSelectionConsistencyError, 10),
+    (AgentContactPlanInternalError, 1),
+)
+
+
+class _AgentContactPlanCommand(TyperCommand):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not any(arg in {"--help", "-h"} for arg in args):
+            for option in _CONTACT_OPTIONS:
+                occurrences = sum(arg == option or arg.startswith(f"{option}=") for arg in args)
+                if occurrences > 1:
+                    self._invalid_input()
+        try:
+            return super().parse_args(ctx, args)
+        except UsageError:
+            self._invalid_input()
+
+    @staticmethod
+    def _invalid_input() -> Never:
+        click.echo(_CONTACT_INVALID, err=True)
+        raise click.exceptions.Exit(2)
+
+
+def _contact_positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise AgentContactPlanInvalidDataError(_CONTACT_INVALID) from None
+    if parsed <= 0 or value.strip() != value:
+        raise AgentContactPlanInvalidDataError(_CONTACT_INVALID)
+    return parsed
+
+
+def render_agent_contact_plan(result: AgentContactPlanResult, output: str) -> str:
+    if type(result) is not AgentContactPlanResult or output not in {"text", "json"}:
+        raise AgentContactPlanInternalError(_CONTACT_INTERNAL)
+    try:
+        snapshot = {field: getattr(result, field) for field in AgentContactPlanResult.model_fields}
+        validated = AgentContactPlanResult(**snapshot)
+        values = validated.model_dump(mode="json")
+    except (AttributeError, TypeError, ValueError, ValidationError):
+        raise AgentContactPlanInternalError(_CONTACT_INTERNAL) from None
+    if output == "json":
+        rendered = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    else:
+        rendered = "\n".join(
+            f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
+            for field in _CONTACT_FIELD_ORDER
+        )
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError:
+        raise AgentContactPlanInternalError(_CONTACT_INTERNAL) from None
+    return rendered
+
+
+class _SessionFactory(Protocol):
+    def __call__(self) -> Session: ...
+
+
+def execute_agent_contact_plan(
+    data: AgentContactPlanInput,
+    *,
+    session_factory: _SessionFactory = SessionLocal,
+    provider_factory: Callable[[], ContactDiscoveryProvider] = (WebsiteContactDiscoveryProvider),
+) -> AgentContactPlanResult:
+    session = session_factory()
+    committed = False
+    primary = False
+    try:
+        discovery_repository = ContactDiscoveryRepository(session)
+        service = AgentContactPlanService(
+            projects=ProjectRepository(session),
+            companies=CompanyRepository(session),
+            discovery_repository=discovery_repository,
+            provider_factory=provider_factory,
+        )
+        result = service.plan(data)
+        try:
+            session.commit()
+            committed = True
+        except Exception:
+            raise AgentContactPlanPersistenceError(
+                "Contact discovery state could not be persisted."
+            ) from None
+        return result
+    except BaseException:
+        primary = True
+        if not committed:
+            with suppress(Exception):
+                session.rollback()
+        raise
+    finally:
+        if primary:
+            with suppress(Exception):
+                session.close()
+        else:
+            try:
+                session.close()
+            except Exception:
+                raise AgentContactPlanInternalError(_CONTACT_INTERNAL) from None
+
+
+@contact_select_app.command("plan", cls=_AgentContactPlanCommand)
+def plan_contact_selection(
+    project_id: Annotated[str, typer.Option("--project-id", metavar="INTEGER", help="Project ID.")],
+    company_id: Annotated[str, typer.Option("--company-id", metavar="INTEGER", help="Company ID.")],
+    goal: Annotated[str, typer.Option("--goal", help="Planning goal.")],
+    output: Annotated[str, typer.Option("--output", help="Output format: text or json.")] = "text",
+) -> None:
+    try:
+        if output not in {"text", "json"}:
+            raise AgentContactPlanInvalidDataError(_CONTACT_INVALID)
+        data = AgentContactPlanInput(
+            project_id=_contact_positive_integer(project_id),
+            company_id=_contact_positive_integer(company_id),
+            goal=goal,
+        )
+        rendered = render_agent_contact_plan(execute_agent_contact_plan(data), output)
+    except ValidationError:
+        typer.echo(_CONTACT_INVALID, err=True)
+        raise typer.Exit(2) from None
+    except AgentContactPlanError as error:
+        exit_code = next(
+            (code for error_type, code in _CONTACT_ERROR_CODES if isinstance(error, error_type)),
+            1,
+        )
+        typer.echo(str(error), err=True)
+        raise typer.Exit(exit_code) from None
+    except Exception:
+        typer.echo(_CONTACT_INTERNAL, err=True)
+        raise typer.Exit(1) from None
+    typer.echo(rendered)
+
 
 _INVALID_MESSAGE = "Agent company plan data is invalid."
 _INTERNAL_MESSAGE = "Agent company plan failed."
@@ -91,10 +264,6 @@ _ERROR_CODES: tuple[tuple[type[AgentCompanyPlanError], int], ...] = (
     (AgentCompanyPlanBindingError, 10),
     (AgentCompanyPlanInternalError, 1),
 )
-
-
-class _SessionFactory(Protocol):
-    def __call__(self) -> Session: ...
 
 
 class _AgentPlanCommand(TyperCommand):
@@ -526,4 +695,10 @@ def apply_company_selection(
     typer.echo(rendered)
 
 
-__all__ = ["app", "execute_agent_company_plan", "render_agent_company_plan"]
+__all__ = [
+    "app",
+    "execute_agent_company_plan",
+    "execute_agent_contact_plan",
+    "render_agent_company_plan",
+    "render_agent_contact_plan",
+]
