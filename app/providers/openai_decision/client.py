@@ -178,17 +178,24 @@ class OpenAIDecisionClient:
         ):
             raise OpenAIDecisionResponseError()
 
+        is_no_selection = wire.decision == "NO_SELECTION"
         result: OpenAIDecisionResult | None = None
         result_error = False
         try:
             result = OpenAIDecisionResult(
                 decision=OpenAIDecisionKind(wire.decision),
-                selected_candidate_index=wire.selected_candidate_index,
+                selected_candidate_index=(
+                    None if is_no_selection else wire.selected_candidate_index
+                ),
                 confidence=wire.confidence,
-                company_fit=OpenAICompanyFit(wire.company_fit),
+                company_fit=(
+                    OpenAICompanyFit.NOT_SUITABLE
+                    if is_no_selection
+                    else OpenAICompanyFit(wire.company_fit)
+                ),
                 rationale=wire.rationale,
-                next_action_title=wire.next_action_title,
-                next_action_description=wire.next_action_description,
+                next_action_title=None if is_no_selection else wire.next_action_title,
+                next_action_description=(None if is_no_selection else wire.next_action_description),
                 human_review_required=wire.human_review_required,
             )
         except (ValidationError, ValueError, TypeError):

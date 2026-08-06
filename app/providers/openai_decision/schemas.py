@@ -240,11 +240,6 @@ class _OpenAIDecisionWireResult(BaseModel):
                 or self.next_action_description is None
             ):
                 raise ValueError("SELECT wire result is inconsistent.")
-        elif (
-            self.selected_candidate_index is not None
-            or self.company_fit != "NOT_SUITABLE"
-            or self.next_action_title is not None
-            or self.next_action_description is not None
-        ):
+        elif self.selected_candidate_index is not None or self.company_fit != "NOT_SUITABLE":
             raise ValueError("NO_SELECTION wire result is inconsistent.")
         return self

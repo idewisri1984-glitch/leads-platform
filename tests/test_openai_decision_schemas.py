@@ -299,3 +299,75 @@ def test_frozen_models_reject_assignment_and_preserve_original_values() -> None:
         with pytest.raises(ValidationError):
             setattr(model, field, replacement)
         assert getattr(model, field) == original
+
+
+def test_wire_no_selection_accepts_schema_valid_recommendation_fields() -> None:
+    result = _OpenAIDecisionWireResult.model_validate(
+        {
+            "decision": "NO_SELECTION",
+            "selected_candidate_index": None,
+            "confidence": 0.18,
+            "company_fit": "NOT_SUITABLE",
+            "rationale": "All supplied candidates are directories.",
+            "next_action_title": "Identify a specific firm",
+            "next_action_description": "Have a human verify its official website.",
+            "human_review_required": True,
+        }
+    )
+
+    assert result.decision == "NO_SELECTION"
+    assert result.next_action_title == "Identify a specific firm"
+    assert result.next_action_description == "Have a human verify its official website."
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"selected_candidate_index": 1},
+        {"company_fit": "LOW"},
+        {"human_review_required": False},
+        {"rationale": " "},
+        {"unexpected": "field"},
+    ],
+)
+def test_wire_no_selection_preserves_all_other_strict_validation(
+    changes: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "decision": "NO_SELECTION",
+        "selected_candidate_index": None,
+        "confidence": 0.18,
+        "company_fit": "NOT_SUITABLE",
+        "rationale": "Evidence is insufficient.",
+        "next_action_title": "Identify a specific firm",
+        "next_action_description": "Have a human verify its official website.",
+        "human_review_required": True,
+    }
+
+    with pytest.raises(ValidationError):
+        _OpenAIDecisionWireResult.model_validate(values | changes)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"selected_candidate_index": None},
+        {"company_fit": "NOT_SUITABLE"},
+        {"next_action_title": None},
+        {"next_action_description": None},
+    ],
+)
+def test_wire_select_invariants_remain_strict(changes: dict[str, object]) -> None:
+    values: dict[str, object] = {
+        "decision": "SELECT",
+        "selected_candidate_index": 1,
+        "confidence": 0.8,
+        "company_fit": "HIGH",
+        "rationale": "Strong public evidence.",
+        "next_action_title": "Review candidate",
+        "next_action_description": "Confirm before CRM processing.",
+        "human_review_required": True,
+    }
+
+    with pytest.raises(ValidationError):
+        _OpenAIDecisionWireResult.model_validate(values | changes)
