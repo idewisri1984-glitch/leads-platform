@@ -15,6 +15,7 @@ from app.modules.company_discovery.staging_service_schemas import (
 )
 from app.modules.search_profile import SearchProfileRunOptions
 from app.modules.search_profile.schemas import SearchProfileRead
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 
@@ -244,7 +245,7 @@ def test_stage_profile_help_shows_country_option() -> None:
     result = runner.invoke(cli.app, ["stage-profile", "--help"])
 
     assert result.exit_code == 0
-    assert "--country" in result.output
+    assert "--country" in plain_cli_output(result.output)
 
 
 def test_stage_profile_defaults_to_dry_run_and_serpapi(monkeypatch: pytest.MonkeyPatch) -> None:

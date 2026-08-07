@@ -20,6 +20,7 @@ from app.modules.agent import (
 )
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
 from app.providers.openai_decision import OpenAICompanyFit, OpenAIDecisionKind
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 
@@ -74,10 +75,11 @@ def test_hierarchy_and_required_options() -> None:
     assert root.exit_code == subgroup.exit_code == command.exit_code == 0
     assert "company-select" in root.stdout
     assert "plan" in subgroup.stdout
+    output = plain_cli_output(command.stdout)
     for option in ("--project-id", "--search-profile-id", "--goal", "--output"):
-        assert option in command.stdout
+        assert option in output
     for forbidden in ("--api-key", "--query", "--yes", "--provider", "--model"):
-        assert forbidden not in command.stdout
+        assert forbidden not in output
 
 
 def test_default_text_output_is_ordered_scalar_only(monkeypatch: pytest.MonkeyPatch) -> None:

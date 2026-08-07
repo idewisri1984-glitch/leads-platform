@@ -15,6 +15,7 @@ from app.modules.agent.contact_plan_schemas import (
     AgentContactPlanResult,
 )
 from app.modules.contact_discovery.models import ContactDiscoverySourceType
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 
@@ -107,8 +108,9 @@ def test_help_exposes_contact_plan_options() -> None:
     command = runner.invoke(app, ["agent", "contact-select", "plan", "--help"])
     assert root.exit_code == group.exit_code == command.exit_code == 0
     assert "contact-select" in root.stdout and "plan" in group.stdout
+    output = plain_cli_output(command.stdout)
     for option in ("--project-id", "--company-id", "--goal", "--output"):
-        assert option in command.stdout
+        assert option in output
 
 
 def test_text_and_json_output_are_exact_ordered_and_unicode(

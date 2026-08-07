@@ -17,6 +17,7 @@ from app.modules.task import (
     TaskLifecycleStatus,
     TaskLifecycleTransitionError,
 )
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 
@@ -208,8 +209,9 @@ def test_task_command_set_is_exact() -> None:
 def test_lifecycle_command_help_is_exact(command: str) -> None:
     result = runner.invoke(root_app, ["task", command, "--help"])
     assert result.exit_code == 0
+    output = plain_cli_output(result.output)
     for option in ("--company-id", "--task-id", "--yes", "--help"):
-        assert option in result.output
+        assert option in output
     for forbidden in (
         "--target-status",
         "--status",
@@ -227,7 +229,7 @@ def test_lifecycle_command_help_is_exact(command: str) -> None:
         "--notify",
         "--schedule",
     ):
-        assert forbidden not in result.output
+        assert forbidden not in output
 
 
 def test_executor_signature_and_outcome_contract_are_exact() -> None:

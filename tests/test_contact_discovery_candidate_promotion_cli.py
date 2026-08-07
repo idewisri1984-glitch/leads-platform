@@ -15,6 +15,7 @@ from app.modules.contact_discovery import (
     ContactDiscoveryCandidatePromotionResult,
     ContactDiscoveryCandidateStatus,
 )
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 
@@ -133,7 +134,8 @@ def test_help_registers_promote_and_preserves_existing_commands() -> None:
     assert all(
         command in result.output for command in ("list", "show", "review", "reject", "promote")
     )
-    assert all(option in promote.output for option in ("--company-id", "--candidate-id", "--yes"))
+    output = plain_cli_output(promote.output)
+    assert all(option in output for option in ("--company-id", "--candidate-id", "--yes"))
 
 
 def test_confirmation_is_required_before_any_dependency() -> None:

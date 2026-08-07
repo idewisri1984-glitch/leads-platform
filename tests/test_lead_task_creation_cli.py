@@ -13,6 +13,7 @@ from app.modules.task import (
     LeadTaskCreationNotFoundError,
     LeadTaskCreationResult,
 )
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 
@@ -176,8 +177,9 @@ def test_command_group_and_help_contract_are_exact() -> None:
     }
     result = runner.invoke(root_app, ["task", "create-for-lead", "--help"])
     assert result.exit_code == 0
+    output = plain_cli_output(result.output)
     for option in ("--company-id", "--lead-id", "--title", "--description", "--yes"):
-        assert option in result.output
+        assert option in output
     for forbidden in (
         "--status",
         "--due-at",
@@ -187,7 +189,7 @@ def test_command_group_and_help_contract_are_exact() -> None:
         "--priority",
         "--source",
     ):
-        assert forbidden not in result.output
+        assert forbidden not in output
 
 
 def test_executor_signature_and_outcome_are_exact_and_frozen() -> None:
@@ -614,8 +616,9 @@ def test_legacy_create_is_independent_of_new_executor(
     monkeypatch.setattr(task_cli, "execute_create_task_for_lead", forbidden)
     result = runner.invoke(root_app, ["task", "create", "--help"])
     assert result.exit_code == 0
-    assert "--status" in result.output
-    assert "--due-at" in result.output
+    output = plain_cli_output(result.output)
+    assert "--status" in output
+    assert "--due-at" in output
 
 
 def test_repeated_execution_is_non_idempotent() -> None:

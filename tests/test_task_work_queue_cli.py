@@ -15,6 +15,7 @@ from app.modules.task import (
     TaskWorkQueueItem,
     TaskWorkQueueResult,
 )
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 AS_OF = datetime(2026, 7, 31, 9)
@@ -121,10 +122,11 @@ def test_command_and_executor_signatures_are_exact() -> None:
 def test_queue_help_has_only_approved_options() -> None:
     result = runner.invoke(root_app, ["task", "queue", "--help"])
     assert result.exit_code == 0
+    output = plain_cli_output(result.output)
     for option in ("--company-id", "--as-of", "--days", "--help"):
-        assert option in result.output
+        assert option in output
     for option in ("--yes", "--status", "--timezone", "--now", "--limit", "--force"):
-        assert option not in result.output
+        assert option not in output
 
 
 @pytest.mark.parametrize(
