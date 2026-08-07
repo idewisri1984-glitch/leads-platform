@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DEBUG: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Configure isolated test database
+        run: |
+          printf 'DATABASE_URL=sqlite:///%s/leads-platform-ci.sqlite3\n' \
+            "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Check lock file
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run Ruff
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Run mypy
+        run: uv run mypy app
+
+      - name: Run full test suite
+        run: uv run pytest -p no:cacheprovider
+
+      - name: Configure isolated migration database
+        run: |
+          printf 'DATABASE_URL=sqlite:///%s/leads-platform-alembic.sqlite3\n' \
+            "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Upgrade migrations
+        run: uv run alembic upgrade head
+
+      - name: Report current migration
+        run: uv run alembic current
+
+      - name: Check migration drift
+        run: uv run alembic check
+
+      - name: Verify migration heads
+        run: uv run alembic heads
