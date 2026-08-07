@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import typer
 from sqlalchemy.orm import Session
 
-from app.core.database.session import SessionLocal
+from app.cli._lazy_dependencies import SessionLocal
 from app.modules.contact import ContactRepository
 from app.modules.lead import (
     ContactLeadCreationConsistencyError,

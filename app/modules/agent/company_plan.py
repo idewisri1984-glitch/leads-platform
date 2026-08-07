@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from pydantic import ConfigDict
 from sqlalchemy.exc import SQLAlchemyError
@@ -19,7 +21,9 @@ from app.modules.company_discovery.staging_service_schemas import (
     CompanyDiscoveryStagingRunResult,
 )
 from app.modules.search_profile.schemas import SearchProfileRead, SearchProfileRunOptions
-from app.providers.openai_decision import OpenAIDecisionRequest, OpenAIDecisionResult
+
+if TYPE_CHECKING:
+    from app.providers.openai_decision import OpenAIDecisionRequest, OpenAIDecisionResult
 
 from .company_plan_schemas import AgentCompanyPlanInput, AgentCompanyPlanResult
 from .company_selection import (
@@ -214,6 +218,8 @@ class AgentCompanyPlanService:
         self.decision_factory = decision_factory
 
     def plan(self, plan_input: AgentCompanyPlanInput) -> AgentCompanyPlanResult:
+        from app.providers.openai_decision import OpenAIDecisionResult
+
         data = self._validate_input(plan_input)
         project_record = _translated_call(
             lambda: self.projects.get(data.project_id),

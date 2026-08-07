@@ -1,25 +1,24 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Annotated, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
 
 import typer
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.cli._lazy_dependencies import SessionLocal
 from app.cli.company_discovery_candidates import app as candidate_app
-from app.core.config.settings import settings
-from app.core.database.session import SessionLocal
 from app.modules.company_discovery import (
     CompanyDiscoveryRequest,
-    CompanyDiscoveryService,
     SearchProfileDiscoveryDryRunResult,
     SearchProfileDiscoveryExecutionError,
     SearchProfileDiscoveryPersistenceError,
     SearchProfileDiscoveryPersistenceService,
     SearchProfileDiscoveryPersistResult,
     SearchProfileDiscoveryService,
-    SerpApiDiscoveryProvider,
 )
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
 from app.modules.company_discovery.staging_orchestration import (
@@ -39,7 +38,52 @@ from app.modules.search_profile import (
     SearchProfileRunOptions,
     SearchProfileService,
 )
-from app.providers.serpapi import SerpApiClient, SerpApiError
+
+if TYPE_CHECKING:
+    from app.core.config.settings import Settings
+    from app.modules.company_discovery.serpapi_provider import (
+        SerpApiDiscoveryProvider as SerpApiDiscoveryProviderType,
+    )
+    from app.modules.company_discovery.service import (
+        CompanyDiscoveryService as CompanyDiscoveryServiceType,
+    )
+    from app.providers.serpapi import SerpApiClient as SerpApiClientType
+
+_SETTINGS_UNRESOLVED = object()
+settings: Settings | object = _SETTINGS_UNRESOLVED
+
+
+def _get_settings() -> Settings:
+    global settings
+
+    if settings is _SETTINGS_UNRESOLVED:
+        from app.core.config.settings import settings as configured_settings
+
+        settings = configured_settings
+    return cast("Settings", settings)
+
+
+def SerpApiClient(
+    *, api_key: str | None, base_url: str, timeout_seconds: float
+) -> SerpApiClientType:
+    from app.providers.serpapi import SerpApiClient as Client
+
+    return Client(api_key=api_key, base_url=base_url, timeout_seconds=timeout_seconds)
+
+
+def SerpApiDiscoveryProvider(client: SerpApiClientType) -> SerpApiDiscoveryProviderType:
+    from app.modules.company_discovery.serpapi_provider import (
+        SerpApiDiscoveryProvider as Provider,
+    )
+
+    return Provider(client)
+
+
+def CompanyDiscoveryService(client: SerpApiClientType) -> CompanyDiscoveryServiceType:
+    from app.modules.company_discovery import CompanyDiscoveryService as Service
+
+    return Service(client)
+
 
 app = typer.Typer(help="Company discovery commands.")
 
@@ -119,10 +163,11 @@ def run_search_profile(
         typer.secho(f"Search profile {profile_id} not found.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
+    configured = _get_settings()
     client = SerpApiClient(
-        api_key=settings.serpapi_api_key,
-        base_url=settings.serpapi_base_url,
-        timeout_seconds=settings.serpapi_timeout_seconds,
+        api_key=configured.serpapi_api_key,
+        base_url=configured.serpapi_base_url,
+        timeout_seconds=configured.serpapi_timeout_seconds,
     )
     discovery_provider = SerpApiDiscoveryProvider(client)
     discovery_service = SearchProfileDiscoveryService(SearchProfileQueryGenerator())
@@ -238,6 +283,8 @@ def discover_serpapi(
         typer.Option(help="Project ID required when --persist is used."),
     ] = None,
 ) -> None:
+    from app.providers.serpapi import SerpApiError
+
     if ctx.invoked_subcommand is not None:
         return
 
@@ -268,10 +315,11 @@ def discover_serpapi(
         typer.secho("--project-id is required when --persist is used.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
+    configured = _get_settings()
     client = SerpApiClient(
-        api_key=settings.serpapi_api_key,
-        base_url=settings.serpapi_base_url,
-        timeout_seconds=settings.serpapi_timeout_seconds,
+        api_key=configured.serpapi_api_key,
+        base_url=configured.serpapi_base_url,
+        timeout_seconds=configured.serpapi_timeout_seconds,
     )
     service = CompanyDiscoveryService(client)
 
@@ -494,7 +542,7 @@ def execute_stage_profile(
         [CompanyDiscoveryStagingRepository | None], CompanyDiscoveryStagingService
     ]
     | None = None,
-    provider_factory: Callable[[], SerpApiDiscoveryProvider] | None = None,
+    provider_factory: Callable[[], SerpApiDiscoveryProviderType] | None = None,
 ) -> StageProfileCommandOutcome:
     if isinstance(profile_id, bool) or not isinstance(profile_id, int) or profile_id <= 0:
         return StageProfileCommandOutcome(exit_code=1, error_message="Invalid profile ID.")
@@ -745,10 +793,11 @@ def _invoke_session_method(session: Session, method: Literal["commit", "rollback
     callback()
 
 
-def _build_staging_discovery_provider() -> SerpApiDiscoveryProvider:
+def _build_staging_discovery_provider() -> SerpApiDiscoveryProviderType:
+    configured = _get_settings()
     client = SerpApiClient(
-        api_key=settings.serpapi_api_key,
-        base_url=settings.serpapi_base_url,
-        timeout_seconds=settings.serpapi_timeout_seconds,
+        api_key=configured.serpapi_api_key,
+        base_url=configured.serpapi_base_url,
+        timeout_seconds=configured.serpapi_timeout_seconds,
     )
     return SerpApiDiscoveryProvider(client)

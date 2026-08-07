@@ -13,70 +13,40 @@ from typer import _click as click
 from typer._click.exceptions import UsageError
 from typer.core import TyperCommand
 
-from app.core.database.session import SessionLocal
-from app.modules.agent import (
+from app.cli._lazy_dependencies import SessionLocal
+from app.modules.agent.company_apply import (
     AgentCompanyApplyConfirmationRequiredError,
     AgentCompanyApplyConflictError,
     AgentCompanyApplyConsistencyError,
     AgentCompanyApplyError,
-    AgentCompanyApplyInput,
     AgentCompanyApplyInternalError,
     AgentCompanyApplyInvalidDataError,
     AgentCompanyApplyNotEligibleError,
     AgentCompanyApplyNotFoundError,
     AgentCompanyApplyPersistenceError,
-    AgentCompanyApplyResult,
     AgentCompanyApplyService,
     AgentCompanyApplyStaleHandoffError,
-    AgentCompanyPlanBindingError,
-    AgentCompanyPlanDecisionError,
-    AgentCompanyPlanDiscoveryDataError,
-    AgentCompanyPlanError,
-    AgentCompanyPlanInput,
-    AgentCompanyPlanInternalError,
-    AgentCompanyPlanInvalidDataError,
-    AgentCompanyPlanPersistenceError,
-    AgentCompanyPlanProjectNotFoundError,
-    AgentCompanyPlanResult,
-    AgentCompanyPlanSearchProfileNotFoundError,
-    AgentCompanyPlanSearchProfileNotReadyError,
-    AgentCompanyPlanSearchProviderError,
-    AgentCompanyPlanSelectionError,
-    AgentCompanyPlanService,
-    AgentCompanySelectionService,
+)
+from app.modules.agent.company_apply_schemas import (
+    AgentCompanyApplyInput,
+    AgentCompanyApplyResult,
+)
+from app.modules.agent.contact_apply import (
     AgentContactApplyConfirmationRequiredError,
     AgentContactApplyConflictError,
     AgentContactApplyConsistencyError,
     AgentContactApplyError,
-    AgentContactApplyInput,
     AgentContactApplyInternalError,
     AgentContactApplyInvalidDataError,
     AgentContactApplyNotEligibleError,
     AgentContactApplyNotFoundError,
     AgentContactApplyPersistenceError,
-    AgentContactApplyResult,
     AgentContactApplyService,
     AgentContactApplyStaleHandoffError,
 )
-from app.modules.agent.company_plan import DecisionBoundary
-from app.modules.agent.company_selection import AgentCompanySelectionRepository
-from app.modules.agent.contact_plan import (
-    AgentContactPlanBindingMismatchError,
-    AgentContactPlanCompanyNotFoundError,
-    AgentContactPlanDiscoveryResultError,
-    AgentContactPlanError,
-    AgentContactPlanInternalError,
-    AgentContactPlanInvalidDataError,
-    AgentContactPlanPersistenceError,
-    AgentContactPlanProjectNotFoundError,
-    AgentContactPlanProviderError,
-    AgentContactPlanSelectionConsistencyError,
-    AgentContactPlanService,
-    AgentContactPlanWebsiteMissingError,
-)
-from app.modules.agent.contact_plan_schemas import (
-    AgentContactPlanInput,
-    AgentContactPlanResult,
+from app.modules.agent.contact_apply_schemas import (
+    AgentContactApplyInput,
+    AgentContactApplyResult,
 )
 from app.modules.company.repository import CompanyRepository
 from app.modules.company_discovery.candidate_promotion import (
@@ -108,6 +78,48 @@ from app.modules.search_profile.schemas import SearchQuery
 from app.modules.task.repository import TaskRepository
 
 if TYPE_CHECKING:
+    from app.modules.agent.company_plan import (
+        AgentCompanyPlanBindingError,
+        AgentCompanyPlanDecisionError,
+        AgentCompanyPlanDiscoveryDataError,
+        AgentCompanyPlanError,
+        AgentCompanyPlanInternalError,
+        AgentCompanyPlanInvalidDataError,
+        AgentCompanyPlanPersistenceError,
+        AgentCompanyPlanProjectNotFoundError,
+        AgentCompanyPlanSearchProfileNotFoundError,
+        AgentCompanyPlanSearchProfileNotReadyError,
+        AgentCompanyPlanSearchProviderError,
+        AgentCompanyPlanSelectionError,
+        AgentCompanyPlanService,
+        DecisionBoundary,
+    )
+    from app.modules.agent.company_plan_schemas import (
+        AgentCompanyPlanInput,
+        AgentCompanyPlanResult,
+    )
+    from app.modules.agent.company_selection import (
+        AgentCompanySelectionRepository,
+        AgentCompanySelectionService,
+    )
+    from app.modules.agent.contact_plan import (
+        AgentContactPlanBindingMismatchError,
+        AgentContactPlanCompanyNotFoundError,
+        AgentContactPlanDiscoveryResultError,
+        AgentContactPlanError,
+        AgentContactPlanInternalError,
+        AgentContactPlanInvalidDataError,
+        AgentContactPlanPersistenceError,
+        AgentContactPlanProjectNotFoundError,
+        AgentContactPlanProviderError,
+        AgentContactPlanSelectionConsistencyError,
+        AgentContactPlanService,
+        AgentContactPlanWebsiteMissingError,
+    )
+    from app.modules.agent.contact_plan_schemas import (
+        AgentContactPlanInput,
+        AgentContactPlanResult,
+    )
     from app.modules.contact_discovery.service import ContactDiscoveryProvider
     from app.providers.openai_decision import OpenAIDecisionClient
     from app.providers.serpapi import SerpApiClient
@@ -121,19 +133,45 @@ app.add_typer(contact_select_app, name="contact-select")
 _CONTACT_INVALID = "Agent contact plan data is invalid."
 _CONTACT_INTERNAL = "Agent contact plan failed."
 _CONTACT_OPTIONS = ("--project-id", "--company-id", "--goal", "--output")
-_CONTACT_FIELD_ORDER = tuple(AgentContactPlanResult.model_fields)
-_CONTACT_ERROR_CODES: tuple[tuple[type[AgentContactPlanError], int], ...] = (
-    (AgentContactPlanInvalidDataError, 2),
-    (AgentContactPlanProjectNotFoundError, 3),
-    (AgentContactPlanCompanyNotFoundError, 4),
-    (AgentContactPlanBindingMismatchError, 5),
-    (AgentContactPlanWebsiteMissingError, 6),
-    (AgentContactPlanProviderError, 7),
-    (AgentContactPlanDiscoveryResultError, 8),
-    (AgentContactPlanPersistenceError, 9),
-    (AgentContactPlanSelectionConsistencyError, 10),
-    (AgentContactPlanInternalError, 1),
-)
+
+
+def _load_contact_plan_dependencies() -> None:
+    from app.modules.agent import contact_plan, contact_plan_schemas
+
+    namespace = globals()
+    for name in (
+        "AgentContactPlanBindingMismatchError",
+        "AgentContactPlanCompanyNotFoundError",
+        "AgentContactPlanDiscoveryResultError",
+        "AgentContactPlanError",
+        "AgentContactPlanInternalError",
+        "AgentContactPlanInvalidDataError",
+        "AgentContactPlanPersistenceError",
+        "AgentContactPlanProjectNotFoundError",
+        "AgentContactPlanProviderError",
+        "AgentContactPlanSelectionConsistencyError",
+        "AgentContactPlanService",
+        "AgentContactPlanWebsiteMissingError",
+    ):
+        namespace.setdefault(name, getattr(contact_plan, name))
+    for name in ("AgentContactPlanInput", "AgentContactPlanResult"):
+        namespace.setdefault(name, getattr(contact_plan_schemas, name))
+
+
+def _contact_plan_error_codes() -> tuple[tuple[type[AgentContactPlanError], int], ...]:
+    _load_contact_plan_dependencies()
+    return (
+        (AgentContactPlanInvalidDataError, 2),
+        (AgentContactPlanProjectNotFoundError, 3),
+        (AgentContactPlanCompanyNotFoundError, 4),
+        (AgentContactPlanBindingMismatchError, 5),
+        (AgentContactPlanWebsiteMissingError, 6),
+        (AgentContactPlanProviderError, 7),
+        (AgentContactPlanDiscoveryResultError, 8),
+        (AgentContactPlanPersistenceError, 9),
+        (AgentContactPlanSelectionConsistencyError, 10),
+        (AgentContactPlanInternalError, 1),
+    )
 
 
 class _AgentContactPlanCommand(TyperCommand):
@@ -150,11 +188,13 @@ class _AgentContactPlanCommand(TyperCommand):
 
     @staticmethod
     def _invalid_input() -> Never:
+        _load_contact_plan_dependencies()
         click.echo(_CONTACT_INVALID, err=True)
         raise click.exceptions.Exit(2)
 
 
 def _contact_positive_integer(value: str) -> int:
+    _load_contact_plan_dependencies()
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -165,6 +205,7 @@ def _contact_positive_integer(value: str) -> int:
 
 
 def render_agent_contact_plan(result: AgentContactPlanResult, output: str) -> str:
+    _load_contact_plan_dependencies()
     if type(result) is not AgentContactPlanResult or output not in {"text", "json"}:
         raise AgentContactPlanInternalError(_CONTACT_INTERNAL)
     try:
@@ -178,7 +219,7 @@ def render_agent_contact_plan(result: AgentContactPlanResult, output: str) -> st
     else:
         rendered = "\n".join(
             f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
-            for field in _CONTACT_FIELD_ORDER
+            for field in AgentContactPlanResult.model_fields
         )
     try:
         rendered.encode("utf-8")
@@ -197,6 +238,7 @@ def execute_agent_contact_plan(
     session_factory: _SessionFactory = SessionLocal,
     provider_factory: Callable[[], ContactDiscoveryProvider] | None = None,
 ) -> AgentContactPlanResult:
+    _load_contact_plan_dependencies()
     if provider_factory is None:
         from app.modules.contact_discovery.website_provider import (
             WebsiteContactDiscoveryProvider,
@@ -247,6 +289,7 @@ def plan_contact_selection(
     goal: Annotated[str, typer.Option("--goal", help="Planning goal.")],
     output: Annotated[str, typer.Option("--output", help="Output format: text or json.")] = "text",
 ) -> None:
+    _load_contact_plan_dependencies()
     try:
         if output not in {"text", "json"}:
             raise AgentContactPlanInvalidDataError(_CONTACT_INVALID)
@@ -261,7 +304,11 @@ def plan_contact_selection(
         raise typer.Exit(2) from None
     except AgentContactPlanError as error:
         exit_code = next(
-            (code for error_type, code in _CONTACT_ERROR_CODES if isinstance(error, error_type)),
+            (
+                code
+                for error_type, code in _contact_plan_error_codes()
+                if isinstance(error, error_type)
+            ),
             1,
         )
         typer.echo(str(error), err=True)
@@ -274,21 +321,53 @@ def plan_contact_selection(
 
 _INVALID_MESSAGE = "Agent company plan data is invalid."
 _INTERNAL_MESSAGE = "Agent company plan failed."
-_FIELD_ORDER = tuple(AgentCompanyPlanResult.model_fields)
 _PLAN_OPTIONS = ("--project-id", "--search-profile-id", "--goal", "--output")
-_ERROR_CODES: tuple[tuple[type[AgentCompanyPlanError], int], ...] = (
-    (AgentCompanyPlanInvalidDataError, 2),
-    (AgentCompanyPlanProjectNotFoundError, 3),
-    (AgentCompanyPlanSearchProfileNotFoundError, 3),
-    (AgentCompanyPlanSearchProfileNotReadyError, 4),
-    (AgentCompanyPlanSearchProviderError, 5),
-    (AgentCompanyPlanDiscoveryDataError, 6),
-    (AgentCompanyPlanPersistenceError, 7),
-    (AgentCompanyPlanSelectionError, 8),
-    (AgentCompanyPlanDecisionError, 9),
-    (AgentCompanyPlanBindingError, 10),
-    (AgentCompanyPlanInternalError, 1),
-)
+
+
+def _load_company_plan_dependencies() -> None:
+    from app.modules.agent import company_plan, company_plan_schemas, company_selection
+
+    namespace = globals()
+    for name in (
+        "AgentCompanyPlanBindingError",
+        "AgentCompanyPlanDecisionError",
+        "AgentCompanyPlanDiscoveryDataError",
+        "AgentCompanyPlanError",
+        "AgentCompanyPlanInternalError",
+        "AgentCompanyPlanInvalidDataError",
+        "AgentCompanyPlanPersistenceError",
+        "AgentCompanyPlanProjectNotFoundError",
+        "AgentCompanyPlanSearchProfileNotFoundError",
+        "AgentCompanyPlanSearchProfileNotReadyError",
+        "AgentCompanyPlanSearchProviderError",
+        "AgentCompanyPlanSelectionError",
+        "AgentCompanyPlanService",
+    ):
+        namespace.setdefault(name, getattr(company_plan, name))
+    for name in ("AgentCompanyPlanInput", "AgentCompanyPlanResult"):
+        namespace.setdefault(name, getattr(company_plan_schemas, name))
+    for name in (
+        "AgentCompanySelectionRepository",
+        "AgentCompanySelectionService",
+    ):
+        namespace.setdefault(name, getattr(company_selection, name))
+
+
+def _company_plan_error_codes() -> tuple[tuple[type[AgentCompanyPlanError], int], ...]:
+    _load_company_plan_dependencies()
+    return (
+        (AgentCompanyPlanInvalidDataError, 2),
+        (AgentCompanyPlanProjectNotFoundError, 3),
+        (AgentCompanyPlanSearchProfileNotFoundError, 3),
+        (AgentCompanyPlanSearchProfileNotReadyError, 4),
+        (AgentCompanyPlanSearchProviderError, 5),
+        (AgentCompanyPlanDiscoveryDataError, 6),
+        (AgentCompanyPlanPersistenceError, 7),
+        (AgentCompanyPlanSelectionError, 8),
+        (AgentCompanyPlanDecisionError, 9),
+        (AgentCompanyPlanBindingError, 10),
+        (AgentCompanyPlanInternalError, 1),
+    )
 
 
 class _AgentPlanCommand(TyperCommand):
@@ -417,6 +496,7 @@ def execute_agent_company_plan(
     decision_factory_factory: Callable[[], _OpenAIDecisionFactory] = (_OpenAIDecisionFactory),
     serpapi_client_factory: Callable[..., SerpApiClient] | None = None,
 ) -> AgentCompanyPlanResult:
+    _load_company_plan_dependencies()
     from app.core.config.settings import settings
     from app.providers.serpapi import SerpApiClient
 
@@ -466,6 +546,7 @@ def execute_agent_company_plan(
 
 
 def render_agent_company_plan(result: AgentCompanyPlanResult, output: str) -> str:
+    _load_company_plan_dependencies()
     if type(result) is not AgentCompanyPlanResult or output not in {"text", "json"}:
         raise AgentCompanyPlanInternalError(_INTERNAL_MESSAGE)
     invalid = False
@@ -489,7 +570,7 @@ def render_agent_company_plan(result: AgentCompanyPlanResult, output: str) -> st
     else:
         rendered = "\n".join(
             f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
-            for field in _FIELD_ORDER
+            for field in AgentCompanyPlanResult.model_fields
         )
     encoding_error = False
     try:
@@ -502,6 +583,7 @@ def render_agent_company_plan(result: AgentCompanyPlanResult, output: str) -> st
 
 
 def _parse_positive_integer(value: str) -> int:
+    _load_company_plan_dependencies()
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -527,6 +609,7 @@ def plan_company_selection(
         typer.Option("--output", help="Output format: text or json."),
     ] = "text",
 ) -> None:
+    _load_company_plan_dependencies()
     try:
         if output not in {"text", "json"}:
             raise AgentCompanyPlanInvalidDataError(_INVALID_MESSAGE)
@@ -542,7 +625,11 @@ def plan_company_selection(
         raise typer.Exit(2) from None
     except AgentCompanyPlanError as error:
         exit_code = next(
-            (code for error_type, code in _ERROR_CODES if isinstance(error, error_type)),
+            (
+                code
+                for error_type, code in _company_plan_error_codes()
+                if isinstance(error, error_type)
+            ),
             1,
         )
         typer.echo(str(error), err=True)
