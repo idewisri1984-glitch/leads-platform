@@ -1,5 +1,6 @@
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from inspect import signature
 from math import inf, nan
 from types import SimpleNamespace
 
@@ -14,6 +15,10 @@ from app.modules.agent.contact_plan import (
     AgentContactPlanProviderError,
     AgentContactPlanService,
     AgentContactPlanWebsiteMissingError,
+)
+from app.modules.agent.contact_plan_handoff import (
+    build_agent_contact_plan_handoff_token,
+    canonicalize_handoff_datetime,
 )
 from app.modules.agent.contact_plan_schemas import (
     AgentContactDecision,
@@ -89,6 +94,8 @@ class Repository:
         self.rows: dict[str, ContactDiscoveryCandidateRead] = {}
         self.next_id = 1
         self.states = 0
+        self.state: object | None = None
+        self.checked_at_values: list[datetime] = []
         self.protected: ContactDiscoveryCandidateStatus | None = None
 
     def upsert_candidate(
@@ -182,7 +189,13 @@ class Repository:
 
     def update_state(self, *args: object, **kwargs: object) -> object:
         self.states += 1
-        return object()
+        if self.checked_at_values:
+            kwargs["checked_at"] = self.checked_at_values.pop(0)
+        self.state = SimpleNamespace(company_id=args[0], **kwargs)
+        return self.state
+
+    def get_state_by_company_id(self, company_id: int) -> object | None:
+        return self.state
 
 
 def service(
@@ -601,3 +614,425 @@ def test_proposed_task_description_preserves_complete_maximum_goal(goal: str) ->
     )
     assert f"Goal: {goal}" in (result.proposed_task_description or "")
     assert len(result.proposed_task_description or "") <= 4000
+
+
+def handoff_values(**changes: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "project_id": 1,
+        "company_id": 2,
+        "company_name": "Meyer Davis",
+        "company_website": "https://example.com",
+        "goal": "Find a partner",
+        "provider_name": "website",
+        "discovery_checked_at": datetime(2026, 1, 2, 3, 4, 5, 6, tzinfo=UTC),
+        "candidate_id": 3,
+        "candidate_deduplication_key": "email:will@example.com",
+        "candidate_name": "Will Meyer",
+        "candidate_title": "Founder",
+        "candidate_email": "will@example.com",
+        "candidate_phone": None,
+        "candidate_source_url": "https://example.com/about",
+        "candidate_source_type": ContactDiscoverySourceType.TEAM_PAGE,
+        "candidate_confidence": 0.8,
+        "proposed_lead_title": "Partnership with Meyer Davis",
+        "proposed_task_title": "Review Will Meyer",
+        "proposed_task_description": "Review before outreach.",
+    }
+    return values | changes
+
+
+def test_handoff_builder_is_deterministic_and_canonicalizes_equivalent_datetimes() -> None:
+    expected = build_agent_contact_plan_handoff_token(**handoff_values())
+    assert expected == build_agent_contact_plan_handoff_token(**handoff_values())
+    assert expected == build_agent_contact_plan_handoff_token(
+        **handoff_values(discovery_checked_at=datetime(2026, 1, 2, 3, 4, 5, 6))
+    )
+    assert expected == build_agent_contact_plan_handoff_token(
+        **handoff_values(
+            discovery_checked_at=datetime(
+                2026, 1, 2, 4, 4, 5, 6, tzinfo=timezone(timedelta(hours=1))
+            )
+        )
+    )
+    assert len(expected) == 64 and expected == expected.lower()
+
+
+class DatetimeSubclass(datetime):
+    pass
+
+
+class RaisingTimezone(tzinfo):
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def utcoffset(self, value: datetime | None) -> timedelta | None:
+        raise self.error
+
+    def dst(self, value: datetime | None) -> timedelta | None:
+        return None
+
+
+class InvalidOffsetTimezone(tzinfo):
+    def utcoffset(self, value: datetime | None) -> timedelta | None:
+        return timedelta(hours=24)
+
+    def dst(self, value: datetime | None) -> timedelta | None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (datetime(2026, 8, 6, 13, 46, 6, tzinfo=UTC), "2026-08-06T13:46:06.000000Z"),
+        (datetime(2026, 8, 6, 13, 46, 6, 15939), "2026-08-06T13:46:06.015939Z"),
+        (
+            datetime(2026, 8, 7, 1, 30, tzinfo=timezone(timedelta(hours=2))),
+            "2026-08-06T23:30:00.000000Z",
+        ),
+        (
+            datetime(2026, 8, 6, 22, 30, tzinfo=timezone(-timedelta(hours=3))),
+            "2026-08-07T01:30:00.000000Z",
+        ),
+        (
+            datetime(2027, 1, 1, 1, 0, tzinfo=timezone(timedelta(hours=2))),
+            "2026-12-31T23:00:00.000000Z",
+        ),
+    ],
+)
+def test_datetime_canonicalization_matrix(value: datetime, expected: str) -> None:
+    assert canonicalize_handoff_datetime(value) == expected
+
+
+def test_equivalent_datetime_instants_produce_equal_tokens() -> None:
+    values = (
+        datetime(2026, 8, 6, 13, 46, 6, 15939, tzinfo=UTC),
+        datetime(2026, 8, 6, 13, 46, 6, 15939),
+        datetime(2026, 8, 6, 15, 46, 6, 15939, tzinfo=timezone(timedelta(hours=2))),
+        datetime(2026, 8, 6, 8, 46, 6, 15939, tzinfo=timezone(-timedelta(hours=5))),
+    )
+    canonical = {canonicalize_handoff_datetime(value) for value in values}
+    tokens = {
+        build_agent_contact_plan_handoff_token(**handoff_values(discovery_checked_at=value))
+        for value in values
+    }
+    assert canonical == {"2026-08-06T13:46:06.015939Z"}
+    assert len(tokens) == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        DatetimeSubclass(2026, 1, 1),
+        datetime(2026, 1, 1, tzinfo=InvalidOffsetTimezone()),
+        datetime(2026, 1, 1, tzinfo=RaisingTimezone(TypeError("controlled"))),
+        datetime(2026, 1, 1, tzinfo=RaisingTimezone(RuntimeError("controlled"))),
+    ],
+)
+def test_datetime_validation_rejects_invalid_values_with_value_error(value: datetime) -> None:
+    with pytest.raises(ValueError):
+        canonicalize_handoff_datetime(value)
+    with pytest.raises(ValueError):
+        build_agent_contact_plan_handoff_token(**handoff_values(discovery_checked_at=value))
+
+
+class ControlledBaseException(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(), GeneratorExit(), ControlledBaseException()],
+)
+def test_datetime_validation_preserves_base_exceptions(error: BaseException) -> None:
+    value = datetime(2026, 1, 1, tzinfo=RaisingTimezone(error))
+    with pytest.raises(type(error)) as captured:
+        canonicalize_handoff_datetime(value)
+    assert captured.value is error
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_id", 2),
+        ("company_id", 3),
+        ("company_name", "Other"),
+        ("company_website", "https://other.example"),
+        ("goal", "Other goal"),
+        ("provider_name", "other"),
+        ("discovery_checked_at", datetime(2026, 1, 2, 3, 4, 5, 7, tzinfo=UTC)),
+        ("candidate_id", 4),
+        ("candidate_deduplication_key", "name:will"),
+        ("candidate_name", "Gray Davis"),
+        ("candidate_title", "Principal"),
+        ("candidate_email", None),
+        ("candidate_phone", "+15550100"),
+        ("candidate_source_url", "https://example.com/team"),
+        ("candidate_source_type", ContactDiscoverySourceType.ABOUT_PAGE),
+        ("candidate_confidence", 0.9),
+        ("proposed_lead_title", "Other lead"),
+        ("proposed_task_title", "Other task"),
+        ("proposed_task_description", "Other description"),
+    ],
+)
+def test_handoff_builder_changes_for_every_payload_input(field: str, value: object) -> None:
+    baseline = build_agent_contact_plan_handoff_token(**handoff_values())
+    assert build_agent_contact_plan_handoff_token(**handoff_values(**{field: value})) != baseline
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_id", True),
+        ("candidate_id", 0),
+        ("company_name", " "),
+        ("provider_name", "x" * 101),
+        ("discovery_checked_at", "2026-01-02"),
+        ("candidate_source_type", "TEAM_PAGE"),
+        ("candidate_confidence", 1),
+        ("candidate_confidence", nan),
+        ("candidate_deduplication_key", " "),
+        ("candidate_email", 1),
+    ],
+)
+def test_handoff_builder_rejects_invalid_boundary_values(field: str, value: object) -> None:
+    with pytest.raises(ValueError):
+        build_agent_contact_plan_handoff_token(**handoff_values(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["", "a" * 63, "a" * 65, "A" * 64, "g" * 64, b"a" * 64, 1, True, object()],
+)
+def test_result_rejects_invalid_handoff_tokens(token: object) -> None:
+    values = plan(Provider((candidate_create(2),))).model_dump()
+    with pytest.raises(ValidationError):
+        AgentContactPlanResult(**(values | {"handoff_token": token}))
+
+
+class StringSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        None,
+        "a" * 63,
+        "a" * 65,
+        "A" * 64,
+        "g" * 64,
+        StringSubclass("a" * 64),
+        b"a" * 64,
+        1,
+        True,
+        object(),
+    ],
+)
+@pytest.mark.parametrize("use_model_validate", [False, True])
+def test_select_token_schema_adversarial_matrix(token: object, use_model_validate: bool) -> None:
+    values = plan(Provider((candidate_create(2),))).model_dump()
+    values["handoff_token"] = token
+    with pytest.raises(ValidationError):
+        if use_model_validate:
+            AgentContactPlanResult.model_validate(values)
+        else:
+            AgentContactPlanResult(**values)
+
+
+@pytest.mark.parametrize("use_model_validate", [False, True])
+def test_valid_select_token_is_accepted(use_model_validate: bool) -> None:
+    values = plan(Provider((candidate_create(2),))).model_dump()
+    result = (
+        AgentContactPlanResult.model_validate(values)
+        if use_model_validate
+        else AgentContactPlanResult(**values)
+    )
+    assert result.handoff_token == values["handoff_token"]
+
+
+def test_result_model_remains_frozen_and_forbids_extra_fields() -> None:
+    result = plan(Provider((candidate_create(2),)))
+    with pytest.raises(ValidationError):
+        result.handoff_token = "b" * 64
+    with pytest.raises(ValidationError):
+        AgentContactPlanResult.model_validate(result.model_dump() | {"extra": 1})
+
+
+def test_no_selection_requires_null_handoff_token() -> None:
+    values = plan(Provider()).model_dump()
+    assert values["handoff_token"] is None
+    with pytest.raises(ValidationError):
+        AgentContactPlanResult(**(values | {"handoff_token": "a" * 64}))
+    assert AgentContactPlanResult.model_validate(values).handoff_token is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"state": None},
+        {"company_id": True},
+        {"company_id": "2"},
+        {"company_id": 9},
+        {"provider": "other"},
+        {"provider": ""},
+        {"provider": " website "},
+        {"provider": StringSubclass("website")},
+        {"provider": b"website"},
+        {"provider": None},
+        {"provider": object()},
+        {"discovery_status": ContactDiscoveryStatus.PARTIAL},
+        {"discovery_status": "succeeded"},
+        {"discovery_status": " SUCCEEDED "},
+        {"discovery_status": "UNKNOWN"},
+        {"discovery_status": StringSubclass("SUCCEEDED")},
+        {"discovery_status": b"SUCCEEDED"},
+        {"discovery_status": True},
+        {"discovery_status": 1},
+        {"discovery_status": None},
+        {"discovery_status": object()},
+        {"checked_at": None},
+        {"checked_at": "2026-08-06T13:46:06Z"},
+        {"last_error": "other"},
+        {"last_error": 1},
+    ],
+)
+def test_plan_rejects_invalid_persisted_discovery_state(change: dict[str, object]) -> None:
+    repository = Repository()
+    provider = Provider((candidate_create(2),))
+    if "state" in change:
+        repository.update_state = lambda *args, **kwargs: object()  # type: ignore[method-assign]
+    else:
+        original = repository.update_state
+
+        def update(*args: object, **kwargs: object) -> object:
+            state = original(*args, **kwargs)
+            repository.state = SimpleNamespace(**(vars(state) | change))
+            return repository.state
+
+        repository.update_state = update  # type: ignore[method-assign]
+    with pytest.raises(
+        AgentContactPlanDiscoveryResultError,
+        match=r"^Contact discovery result is invalid\.$",
+    ):
+        plan(provider, repository)
+
+
+class EqualityCompatibleStatus:
+    def __eq__(self, other: object) -> bool:
+        return other == "SUCCEEDED"
+
+
+def test_plan_rejects_equality_compatible_persisted_status() -> None:
+    repository = Repository()
+    original = repository.update_state
+
+    def update(*args: object, **kwargs: object) -> object:
+        state = original(*args, **kwargs)
+        repository.state = SimpleNamespace(
+            **(vars(state) | {"discovery_status": EqualityCompatibleStatus()})
+        )
+        return repository.state
+
+    repository.update_state = update  # type: ignore[method-assign]
+    with pytest.raises(AgentContactPlanDiscoveryResultError):
+        plan(Provider((candidate_create(2),)), repository)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ContactDiscoveryStatus.SUCCEEDED, "SUCCEEDED"],
+)
+def test_plan_accepts_exact_persisted_status_representations(status: object) -> None:
+    repository = Repository()
+    original = repository.update_state
+
+    def update(*args: object, **kwargs: object) -> object:
+        state = original(*args, **kwargs)
+        repository.state = SimpleNamespace(**(vars(state) | {"discovery_status": status}))
+        return repository.state
+
+    repository.update_state = update  # type: ignore[method-assign]
+    assert (
+        plan(Provider((candidate_create(2),)), repository).decision is AgentContactDecision.SELECT
+    )
+
+
+@pytest.mark.parametrize("error", [TypeError("controlled"), RuntimeError("controlled")])
+def test_service_maps_timezone_failures_to_safe_discovery_error(error: Exception) -> None:
+    repository = Repository()
+    original = repository.update_state
+
+    def update(*args: object, **kwargs: object) -> object:
+        state = original(*args, **kwargs)
+        repository.state = SimpleNamespace(
+            **(vars(state) | {"checked_at": datetime(2026, 1, 1, tzinfo=RaisingTimezone(error))})
+        )
+        return repository.state
+
+    repository.update_state = update  # type: ignore[method-assign]
+    with pytest.raises(
+        AgentContactPlanDiscoveryResultError,
+        match=r"^Contact discovery result is invalid\.$",
+    ):
+        plan(Provider((candidate_create(2),)), repository)
+
+
+def test_current_run_checked_at_invalidates_same_candidate_handoff() -> None:
+    repository = Repository()
+    generation_a = datetime(2026, 8, 6, 13, 46, 6, 15939, tzinfo=UTC)
+    generation_b = datetime(2026, 8, 6, 13, 47, 6, 15939, tzinfo=UTC)
+    repository.checked_at_values = [generation_a, generation_b]
+    provider = Provider((candidate_create(2),))
+    first = plan(provider, repository)
+    second = plan(provider, repository)
+    assert first.selected_candidate_id == second.selected_candidate_id
+    stable_fields = (
+        "project_id",
+        "company_id",
+        "selected_contact_name",
+        "selected_contact_title",
+        "selected_contact_email",
+        "selected_contact_phone",
+        "selected_contact_source_url",
+        "selected_contact_source_type",
+        "selected_contact_confidence",
+        "goal",
+        "proposed_lead_title",
+        "proposed_task_title",
+        "proposed_task_description",
+    )
+    assert all(getattr(first, field) == getattr(second, field) for field in stable_fields)
+    assert repository.states == provider.calls == 2
+    assert repository.state is not None
+    assert repository.state.checked_at == generation_b
+    assert first.handoff_token != second.handoff_token
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    [
+        ContactDiscoveryCandidateStatus.DISCOVERED,
+        ContactDiscoveryCandidateStatus.REVIEWED,
+        ContactDiscoveryCandidateStatus.PROMOTED,
+    ],
+)
+def test_handoff_builder_is_lifecycle_independent(
+    lifecycle: ContactDiscoveryCandidateStatus,
+) -> None:
+    assert lifecycle.value
+    assert build_agent_contact_plan_handoff_token(
+        **handoff_values()
+    ) == build_agent_contact_plan_handoff_token(**handoff_values())
+    parameters = signature(build_agent_contact_plan_handoff_token).parameters
+    assert {
+        "discovery_status",
+        "promoted_contact_id",
+        "created_at",
+        "updated_at",
+    }.isdisjoint(parameters)
+
+
+def test_synthetic_meyer_davis_selection_has_handoff_token() -> None:
+    result = plan(Provider((candidate_create(2, name="Will Meyer", title="Founder", email=None),)))
+    assert result.selected_contact_name == "Will Meyer"
+    assert result.handoff_token is not None and len(result.handoff_token) == 64

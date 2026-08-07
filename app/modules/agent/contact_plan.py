@@ -20,6 +20,10 @@ from ..contact_discovery.service import (
     ContactDiscoveryRunResult,
     ContactDiscoveryService,
 )
+from .contact_plan_handoff import (
+    build_agent_contact_plan_handoff_token,
+    canonicalize_handoff_datetime,
+)
 from .contact_plan_schemas import (
     AgentContactDecision,
     AgentContactDiscoveryStatus,
@@ -261,12 +265,15 @@ class AgentContactPlanService:
             except Exception:
                 raise AgentContactPlanPersistenceError(_PERSISTENCE_FAILED) from None
             result = self._validate_discovery(raw, company.id)
+            discovery_checked_at = self._validate_discovery_state(company.id, provider_name, result)
             if result.status is ContactDiscoveryStatus.FAILED:
                 if "provider_invalid_result" in result.errors:
                     raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
                 raise AgentContactPlanProviderError(_PROVIDER_FAILED)
             eligible = self._eligible(result.persisted_candidates, company.id)
-            return self._result(data, company, provider_name, result, eligible)
+            return self._result(
+                data, company, provider_name, result, eligible, discovery_checked_at
+            )
         except BaseException:
             primary = True
             raise
@@ -319,6 +326,33 @@ class AgentContactPlanService:
         if name is None or len(name) > 100:
             raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
         return name
+
+    def _validate_discovery_state(
+        self,
+        company_id: int,
+        provider_name: str,
+        discovery: ContactDiscoveryRunResult,
+    ) -> object:
+        try:
+            state = self.discovery_repository.get_state_by_company_id(company_id)
+            expected_error = discovery.errors[0] if discovery.errors else None
+            if state is None:
+                raise ValueError
+            state_status = _strict_persisted_enum(ContactDiscoveryStatus, state.discovery_status)
+            if (
+                type(state.company_id) is not int
+                or state.company_id != company_id
+                or type(state.provider) is not str
+                or state.provider != provider_name
+                or state_status is not discovery.status
+                or (state.last_error is not None and type(state.last_error) is not str)
+                or state.last_error != expected_error
+            ):
+                raise ValueError
+            canonicalize_handoff_datetime(state.checked_at)
+            return state.checked_at
+        except Exception:
+            raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID) from None
 
     @staticmethod
     def _validate_discovery(raw: object, company_id: int) -> ContactDiscoveryRunResult:
@@ -498,6 +532,7 @@ class AgentContactPlanService:
         provider_name: str,
         discovery: ContactDiscoveryRunResult,
         eligible: tuple[_RankedCandidate, ...],
+        discovery_checked_at: object,
     ) -> AgentContactPlanResult:
         try:
             status = AgentContactDiscoveryStatus(discovery.status)
@@ -543,6 +578,7 @@ class AgentContactPlanService:
                 proposed_lead_title=None,
                 proposed_task_title=None,
                 proposed_task_description=None,
+                handoff_token=None,
             )
         selected = eligible[0]
         lead_title = _bounded(f"Bohemia Bali partnership — {company.name}", 255)
@@ -556,6 +592,27 @@ class AgentContactPlanService:
         )
         description = _bounded(fixed + data.goal, 4000)
         try:
+            handoff_token = build_agent_contact_plan_handoff_token(
+                project_id=data.project_id,
+                company_id=company.id,
+                company_name=company.name,
+                company_website=company.website,
+                goal=data.goal,
+                provider_name=provider_name,
+                discovery_checked_at=discovery_checked_at,
+                candidate_id=selected.candidate.id,
+                candidate_deduplication_key=selected.candidate.deduplication_key,
+                candidate_name=selected.name,
+                candidate_title=selected.title,
+                candidate_email=selected.email,
+                candidate_phone=selected.phone,
+                candidate_source_url=selected.source_url,
+                candidate_source_type=selected.source_type,
+                candidate_confidence=selected.confidence,
+                proposed_lead_title=lead_title,
+                proposed_task_title=task_title,
+                proposed_task_description=description,
+            )
             return AgentContactPlanResult(
                 **common,
                 decision=AgentContactDecision.SELECT,
@@ -574,6 +631,7 @@ class AgentContactPlanService:
                 proposed_lead_title=lead_title,
                 proposed_task_title=task_title,
                 proposed_task_description=description,
+                handoff_token=handoff_token,
             )
         except (ValidationError, TypeError, ValueError):
             raise AgentContactPlanSelectionConsistencyError(_SELECTION_FAILED) from None

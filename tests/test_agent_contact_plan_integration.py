@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from math import inf, nan
 from types import SimpleNamespace
 
@@ -152,11 +153,24 @@ def database(tmp_path) -> Generator[tuple[Engine, int, int]]:
     engine.dispose()
 
 
-def test_full_plan_persists_only_staging_and_is_idempotent(database) -> None:
+def test_full_plan_persists_only_staging_and_is_idempotent(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine, project_id, company_id = database
     instrumented = InstrumentedFactory(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     provider = FakeProvider(company_id)
+    generation_a = datetime(2026, 8, 6, 13, 46, 6, 15939, tzinfo=UTC)
+    generation_b = datetime(2026, 8, 6, 13, 47, 6, 15939, tzinfo=UTC)
+
+    class ControlledDatetime(datetime):
+        values = iter((generation_a, generation_b))
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return next(cls.values)
+
+    monkeypatch.setattr("app.modules.contact_discovery.service.datetime", ControlledDatetime)
     data = AgentContactPlanInput(
         project_id=project_id, company_id=company_id, goal="Find partnership contact"
     )
@@ -166,11 +180,33 @@ def test_full_plan_persists_only_staging_and_is_idempotent(database) -> None:
     assert provider.calls == instrumented.counters.commit_attempts == 1
     assert instrumented.counters.successful_commits == 1
     assert instrumented.counters.rollbacks == 0
+    with factory() as session:
+        state = session.scalar(select(CompanyContactDiscoveryState))
+        assert state is not None
+        checked_at_a = state.checked_at
     second = execute_agent_contact_plan(
         data, session_factory=instrumented, provider_factory=lambda: provider
     )
     assert first.decision is AgentContactDecision.SELECT and first.selected_contact_name == "Buyer"
+    assert first.handoff_token is not None and len(first.handoff_token) == 64
     assert second.selected_candidate_id == first.selected_candidate_id and provider.calls == 2
+    stable_fields = (
+        "project_id",
+        "company_id",
+        "selected_contact_name",
+        "selected_contact_title",
+        "selected_contact_email",
+        "selected_contact_phone",
+        "selected_contact_source_url",
+        "selected_contact_source_type",
+        "selected_contact_confidence",
+        "goal",
+        "proposed_lead_title",
+        "proposed_task_title",
+        "proposed_task_description",
+    )
+    assert all(getattr(first, field) == getattr(second, field) for field in stable_fields)
+    assert second.handoff_token != first.handoff_token
     assert instrumented.counters.commit_attempts == 2
     assert instrumented.counters.successful_commits == 2
     assert instrumented.counters.rollbacks == 0
@@ -185,6 +221,11 @@ def test_full_plan_persists_only_staging_and_is_idempotent(database) -> None:
         )
         assert all(row.promoted_contact_id is None for row in rows)
         assert session.scalar(select(func.count()).select_from(CompanyContactDiscoveryState)) == 1
+        state = session.scalar(select(CompanyContactDiscoveryState))
+        assert state is not None
+        assert checked_at_a == generation_a.replace(tzinfo=None)
+        assert state.checked_at == generation_b.replace(tzinfo=None)
+        assert checked_at_a != state.checked_at
         assert session.scalar(select(func.count()).select_from(Contact)) == 0
         assert session.scalar(select(func.count()).select_from(Lead)) == 0
         assert session.scalar(select(func.count()).select_from(Task)) == 0
@@ -255,6 +296,9 @@ def test_real_provider_narrative_founders_select_and_remain_idempotent(database)
     assert first.selected_contact_name == "Will Meyer"
     assert first.selected_contact_title == "Founder"
     assert first.selected_contact_email is None
+    assert first.selected_contact_source_type is ContactDiscoverySourceType.ABOUT_PAGE
+    assert first.handoff_token is not None and len(first.handoff_token) == 64
+    assert all(character in "0123456789abcdef" for character in first.handoff_token)
     assert first.human_review_required is True
     assert (
         first.contact_mutation_count == first.lead_mutation_count == first.task_mutation_count == 0
@@ -269,6 +313,7 @@ def test_real_provider_narrative_founders_select_and_remain_idempotent(database)
 
     assert provider.calls == 2
     assert second.selected_candidate_id == first.selected_candidate_id
+    assert second.handoff_token != first.handoff_token
     assert instrumented.counters.commit_attempts == 2
     assert instrumented.counters.successful_commits == 2
     assert instrumented.counters.rollbacks == 0

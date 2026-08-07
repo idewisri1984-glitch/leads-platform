@@ -1,4 +1,5 @@
 from enum import StrEnum
+from re import fullmatch
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -107,6 +108,7 @@ class AgentContactPlanResult(BaseModel):
     proposed_lead_title: str | None
     proposed_task_title: str | None
     proposed_task_description: str | None
+    handoff_token: str | None
     human_review_required: Literal[True]
     staging_mutated: Literal[True]
     contact_mutation_count: Literal[0]
@@ -215,6 +217,15 @@ class AgentContactPlanResult(BaseModel):
     def validate_task_description(cls, value: object) -> str | None:
         return _optional(value, _MAX_TASK_DESCRIPTION)
 
+    @field_validator("handoff_token", mode="before")
+    @classmethod
+    def validate_handoff_token(cls, value: object) -> object:
+        if value is not None and (
+            type(value) is not str or fullmatch(r"[0-9a-f]{64}", value) is None
+        ):
+            raise ValueError("Handoff token is invalid.")
+        return value
+
     @model_validator(mode="after")
     def validate_alignment(self) -> Self:
         if self.provider_call_count != 1:
@@ -237,6 +248,7 @@ class AgentContactPlanResult(BaseModel):
             self.proposed_lead_title,
             self.proposed_task_title,
             self.proposed_task_description,
+            self.handoff_token,
         )
         if self.decision is AgentContactDecision.NO_SELECTION:
             if any(value is not None for value in selected_fields):
@@ -252,6 +264,7 @@ class AgentContactPlanResult(BaseModel):
             self.proposed_lead_title,
             self.proposed_task_title,
             self.proposed_task_description,
+            self.handoff_token,
         )
         if any(value is None for value in required) or self.eligible_candidate_count <= 0:
             raise ValueError("SELECT fields are incomplete.")
