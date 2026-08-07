@@ -43,6 +43,19 @@ from app.modules.agent import (
     AgentCompanyPlanSelectionError,
     AgentCompanyPlanService,
     AgentCompanySelectionService,
+    AgentContactApplyConfirmationRequiredError,
+    AgentContactApplyConflictError,
+    AgentContactApplyConsistencyError,
+    AgentContactApplyError,
+    AgentContactApplyInput,
+    AgentContactApplyInternalError,
+    AgentContactApplyInvalidDataError,
+    AgentContactApplyNotEligibleError,
+    AgentContactApplyNotFoundError,
+    AgentContactApplyPersistenceError,
+    AgentContactApplyResult,
+    AgentContactApplyService,
+    AgentContactApplyStaleHandoffError,
 )
 from app.modules.agent.company_plan import DecisionBoundary
 from app.modules.agent.company_selection import AgentCompanySelectionRepository
@@ -78,11 +91,17 @@ from app.modules.company_discovery.staging_orchestration import (
 from app.modules.company_discovery.staging_repository import (
     CompanyDiscoveryStagingRepository,
 )
+from app.modules.contact.repository import ContactRepository
 from app.modules.contact_discovery import (
     ContactDiscoveryProvider,
     ContactDiscoveryRepository,
     WebsiteContactDiscoveryProvider,
 )
+from app.modules.contact_discovery.candidate_promotion import (
+    ContactDiscoveryCandidatePromotionService,
+)
+from app.modules.contact_discovery.candidate_review import ContactDiscoveryCandidateReviewService
+from app.modules.lead.repository import LeadRepository
 from app.modules.project import ProjectRepository
 from app.modules.search_profile import (
     SearchProfileQueryGenerator,
@@ -90,6 +109,7 @@ from app.modules.search_profile import (
     SearchProfileService,
 )
 from app.modules.search_profile.schemas import SearchQuery
+from app.modules.task.repository import TaskRepository
 from app.providers.openai_decision import OpenAIDecisionClient
 from app.providers.serpapi import SerpApiClient
 
@@ -691,6 +711,180 @@ def apply_company_selection(
         raise typer.Exit(exit_code) from None
     except Exception:
         typer.echo(_APPLY_INTERNAL, err=True)
+        raise typer.Exit(1) from None
+    typer.echo(rendered)
+
+
+_CONTACT_APPLY_INVALID = "Agent contact apply data is invalid."
+_CONTACT_APPLY_CONFIRMATION = "Agent contact apply requires --yes."
+_CONTACT_APPLY_INTERNAL = "Agent contact apply failed."
+_CONTACT_APPLY_OPTIONS = (
+    "--project-id",
+    "--company-id",
+    "--candidate-id",
+    "--goal",
+    "--handoff-token",
+    "--yes",
+    "--output",
+)
+_CONTACT_APPLY_FIELD_ORDER = tuple(AgentContactApplyResult.model_fields)
+_CONTACT_APPLY_ERROR_CODES: tuple[tuple[type[AgentContactApplyError], int], ...] = (
+    (AgentContactApplyInvalidDataError, 2),
+    (AgentContactApplyConfirmationRequiredError, 3),
+    (AgentContactApplyNotFoundError, 4),
+    (AgentContactApplyStaleHandoffError, 5),
+    (AgentContactApplyNotEligibleError, 6),
+    (AgentContactApplyConsistencyError, 7),
+    (AgentContactApplyConflictError, 8),
+    (AgentContactApplyPersistenceError, 9),
+    (AgentContactApplyInternalError, 1),
+)
+
+
+class _AgentContactApplyCommand(TyperCommand):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not any(arg in {"--help", "-h"} for arg in args):
+            if any(arg.startswith("--yes=") for arg in args):
+                self._confirmation_required()
+            for option in _CONTACT_APPLY_OPTIONS:
+                occurrences = sum(arg == option or arg.startswith(f"{option}=") for arg in args)
+                if occurrences > 1:
+                    self._invalid_input()
+        try:
+            return super().parse_args(ctx, args)
+        except UsageError:
+            self._invalid_input()
+
+    @staticmethod
+    def _invalid_input() -> Never:
+        click.echo(_CONTACT_APPLY_INVALID, err=True)
+        raise click.exceptions.Exit(2)
+
+    @staticmethod
+    def _confirmation_required() -> Never:
+        click.echo(_CONTACT_APPLY_CONFIRMATION, err=True)
+        raise click.exceptions.Exit(3)
+
+
+def _contact_apply_positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise AgentContactApplyInvalidDataError(_CONTACT_APPLY_INVALID) from None
+    if parsed <= 0 or value.strip() != value:
+        raise AgentContactApplyInvalidDataError(_CONTACT_APPLY_INVALID)
+    return parsed
+
+
+def render_agent_contact_apply(result: AgentContactApplyResult, output: str) -> str:
+    if type(result) is not AgentContactApplyResult or output not in {"text", "json"}:
+        raise AgentContactApplyInternalError(_CONTACT_APPLY_INTERNAL)
+    try:
+        snapshot = {field: getattr(result, field) for field in AgentContactApplyResult.model_fields}
+        validated = AgentContactApplyResult(**snapshot)
+        values = validated.model_dump(mode="json")
+    except (AttributeError, TypeError, ValueError, ValidationError):
+        raise AgentContactApplyInternalError(_CONTACT_APPLY_INTERNAL) from None
+    if output == "json":
+        rendered = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    else:
+        rendered = "\n".join(
+            f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
+            for field in _CONTACT_APPLY_FIELD_ORDER
+        )
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError:
+        raise AgentContactApplyInternalError(_CONTACT_APPLY_INTERNAL) from None
+    return rendered
+
+
+def _execute_agent_contact_apply(
+    data: AgentContactApplyInput,
+    output: str,
+    *,
+    session_factory: _SessionFactory = SessionLocal,
+) -> str:
+    session = session_factory()
+    committed = False
+    primary_active = False
+    try:
+        discovery_repository = ContactDiscoveryRepository(session)
+        contact_repository = ContactRepository(session)
+        service = AgentContactApplyService(
+            company_repository=cast(Any, CompanyRepository(session)),
+            contact_repository=cast(Any, contact_repository),
+            discovery_repository=cast(Any, discovery_repository),
+            review_service=ContactDiscoveryCandidateReviewService(discovery_repository),
+            promotion_service=ContactDiscoveryCandidatePromotionService(
+                discovery_repository, contact_repository
+            ),
+            lead_repository=cast(Any, LeadRepository(session)),
+            task_repository=cast(Any, TaskRepository(session)),
+        )
+        result = service.apply(data)
+        rendered = render_agent_contact_apply(result, output)
+        try:
+            session.commit()
+            committed = True
+        except Exception:
+            raise AgentContactApplyPersistenceError(
+                "Agent contact apply could not be persisted."
+            ) from None
+        return rendered
+    except BaseException:
+        primary_active = True
+        if not committed:
+            _cleanup_preserving_primary(session.rollback)
+        raise
+    finally:
+        if primary_active:
+            _cleanup_preserving_primary(session.close)
+        else:
+            session.close()
+
+
+@contact_select_app.command("apply", cls=_AgentContactApplyCommand)
+def apply_contact_selection(
+    project_id: Annotated[str, typer.Option("--project-id", metavar="INTEGER")],
+    company_id: Annotated[str, typer.Option("--company-id", metavar="INTEGER")],
+    candidate_id: Annotated[str, typer.Option("--candidate-id", metavar="INTEGER")],
+    goal: Annotated[str, typer.Option("--goal")],
+    handoff_token: Annotated[str, typer.Option("--handoff-token")],
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm Contact apply.")] = False,
+    output: Annotated[str, typer.Option("--output", help="Output format: text or json.")] = "text",
+) -> None:
+    if not yes:
+        typer.echo(_CONTACT_APPLY_CONFIRMATION, err=True)
+        raise typer.Exit(3)
+    try:
+        if output not in {"text", "json"}:
+            raise AgentContactApplyInvalidDataError(_CONTACT_APPLY_INVALID)
+        data = AgentContactApplyInput(
+            project_id=_contact_apply_positive_integer(project_id),
+            company_id=_contact_apply_positive_integer(company_id),
+            candidate_id=_contact_apply_positive_integer(candidate_id),
+            goal=goal,
+            handoff_token=handoff_token,
+            confirmed=True,
+        )
+        rendered = _execute_agent_contact_apply(data, output)
+    except ValidationError:
+        typer.echo(_CONTACT_APPLY_INVALID, err=True)
+        raise typer.Exit(2) from None
+    except AgentContactApplyError as error:
+        exit_code = next(
+            (
+                code
+                for error_type, code in _CONTACT_APPLY_ERROR_CODES
+                if isinstance(error, error_type)
+            ),
+            1,
+        )
+        typer.echo(str(error), err=True)
+        raise typer.Exit(exit_code) from None
+    except Exception:
+        typer.echo(_CONTACT_APPLY_INTERNAL, err=True)
         raise typer.Exit(1) from None
     typer.echo(rendered)
 
