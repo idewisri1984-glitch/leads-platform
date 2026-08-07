@@ -95,6 +95,19 @@ __all__ = [
     "AgentCompanySelectionRunNotFoundError",
     "AgentCompanySelectionRunNotReadyError",
     "AgentCompanySelectionService",
+    "AgentContactApplyConflictError",
+    "AgentContactApplyConfirmationRequiredError",
+    "AgentContactApplyConsistencyError",
+    "AgentContactApplyError",
+    "AgentContactApplyInput",
+    "AgentContactApplyInternalError",
+    "AgentContactApplyInvalidDataError",
+    "AgentContactApplyNotEligibleError",
+    "AgentContactApplyNotFoundError",
+    "AgentContactApplyPersistenceError",
+    "AgentContactApplyResult",
+    "AgentContactApplyService",
+    "AgentContactApplyStaleHandoffError",
 ]
 from .company_apply import (
     AgentCompanyApplyConfirmationRequiredError,
@@ -110,3 +123,17 @@ from .company_apply import (
     AgentCompanyApplyStaleHandoffError,
 )
 from .company_apply_schemas import AgentCompanyApplyInput, AgentCompanyApplyResult
+from .contact_apply import (
+    AgentContactApplyConfirmationRequiredError,
+    AgentContactApplyConflictError,
+    AgentContactApplyConsistencyError,
+    AgentContactApplyError,
+    AgentContactApplyInternalError,
+    AgentContactApplyInvalidDataError,
+    AgentContactApplyNotEligibleError,
+    AgentContactApplyNotFoundError,
+    AgentContactApplyPersistenceError,
+    AgentContactApplyService,
+    AgentContactApplyStaleHandoffError,
+)
+from .contact_apply_schemas import AgentContactApplyInput, AgentContactApplyResult

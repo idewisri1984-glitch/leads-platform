@@ -71,6 +71,16 @@ class ContactDiscoveryRepository:
             )
         )
 
+    def get_state_for_update(self, company_id: int) -> CompanyContactDiscoveryState | None:
+        self._validate_positive_id(company_id, "Company")
+        statement = (
+            select(CompanyContactDiscoveryState)
+            .where(CompanyContactDiscoveryState.company_id == company_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        return self.session.scalar(statement)
+
     def get_or_create_state(self, company_id: int) -> tuple[CompanyContactDiscoveryState, bool]:
         existing = self.get_state_by_company_id(company_id)
         if existing is not None:
