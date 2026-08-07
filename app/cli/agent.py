@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import json
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Annotated, Any, Never, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Any, Never, Protocol, cast
 
 import typer
 from pydantic import ValidationError
@@ -11,7 +13,6 @@ from typer import _click as click
 from typer._click.exceptions import UsageError
 from typer.core import TyperCommand
 
-from app.core.config.settings import settings
 from app.core.database.session import SessionLocal
 from app.modules.agent import (
     AgentCompanyApplyConfirmationRequiredError,
@@ -78,11 +79,10 @@ from app.modules.agent.contact_plan_schemas import (
     AgentContactPlanResult,
 )
 from app.modules.company.repository import CompanyRepository
-from app.modules.company_discovery import (
+from app.modules.company_discovery.candidate_promotion import (
     CompanyDiscoveryCandidatePromotionService,
-    CompanyDiscoveryCandidateReviewService,
-    SerpApiDiscoveryProvider,
 )
+from app.modules.company_discovery.candidate_review import CompanyDiscoveryCandidateReviewService
 from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
 from app.modules.company_discovery.schemas import DiscoveryProviderResponse
 from app.modules.company_discovery.staging_orchestration import (
@@ -92,15 +92,11 @@ from app.modules.company_discovery.staging_repository import (
     CompanyDiscoveryStagingRepository,
 )
 from app.modules.contact.repository import ContactRepository
-from app.modules.contact_discovery import (
-    ContactDiscoveryProvider,
-    ContactDiscoveryRepository,
-    WebsiteContactDiscoveryProvider,
-)
 from app.modules.contact_discovery.candidate_promotion import (
     ContactDiscoveryCandidatePromotionService,
 )
 from app.modules.contact_discovery.candidate_review import ContactDiscoveryCandidateReviewService
+from app.modules.contact_discovery.repository import ContactDiscoveryRepository
 from app.modules.lead.repository import LeadRepository
 from app.modules.project import ProjectRepository
 from app.modules.search_profile import (
@@ -110,8 +106,11 @@ from app.modules.search_profile import (
 )
 from app.modules.search_profile.schemas import SearchQuery
 from app.modules.task.repository import TaskRepository
-from app.providers.openai_decision import OpenAIDecisionClient
-from app.providers.serpapi import SerpApiClient
+
+if TYPE_CHECKING:
+    from app.modules.contact_discovery.service import ContactDiscoveryProvider
+    from app.providers.openai_decision import OpenAIDecisionClient
+    from app.providers.serpapi import SerpApiClient
 
 app = typer.Typer(help="Bounded Agent planning commands.")
 company_select_app = typer.Typer(help="Company-selection planning commands.")
@@ -196,8 +195,14 @@ def execute_agent_contact_plan(
     data: AgentContactPlanInput,
     *,
     session_factory: _SessionFactory = SessionLocal,
-    provider_factory: Callable[[], ContactDiscoveryProvider] = (WebsiteContactDiscoveryProvider),
+    provider_factory: Callable[[], ContactDiscoveryProvider] | None = None,
 ) -> AgentContactPlanResult:
+    if provider_factory is None:
+        from app.modules.contact_discovery.website_provider import (
+            WebsiteContactDiscoveryProvider,
+        )
+
+        provider_factory = WebsiteContactDiscoveryProvider
     session = session_factory()
     committed = False
     primary = False
@@ -336,6 +341,14 @@ class _CountedDiscoveryProvider:
         return self._last_query
 
 
+def SerpApiDiscoveryProvider(client: SerpApiClient) -> DiscoveryProvider:
+    from app.modules.company_discovery.serpapi_provider import (
+        SerpApiDiscoveryProvider as Provider,
+    )
+
+    return Provider(client)
+
+
 class _OpenAIDecisionFactory:
     def __init__(self) -> None:
         self._client: OpenAIDecisionClient | None = None
@@ -343,6 +356,9 @@ class _OpenAIDecisionFactory:
     def __call__(self) -> DecisionBoundary:
         if self._client is not None:
             return self._client
+        from app.core.config.settings import settings
+        from app.providers.openai_decision import OpenAIDecisionClient
+
         self._client = OpenAIDecisionClient(
             api_key=settings.openai_api_key,
             model=settings.openai_model,
@@ -399,8 +415,13 @@ def execute_agent_company_plan(
     *,
     session_factory: _SessionFactory = SessionLocal,
     decision_factory_factory: Callable[[], _OpenAIDecisionFactory] = (_OpenAIDecisionFactory),
-    serpapi_client_factory: Callable[..., SerpApiClient] = SerpApiClient,
+    serpapi_client_factory: Callable[..., SerpApiClient] | None = None,
 ) -> AgentCompanyPlanResult:
+    from app.core.config.settings import settings
+    from app.providers.serpapi import SerpApiClient
+
+    if serpapi_client_factory is None:
+        serpapi_client_factory = SerpApiClient
     session = session_factory()
     committer: _DiscoveryCommitter | None = None
     decision_factory = _LazyDecisionFactory(decision_factory_factory)
