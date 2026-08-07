@@ -170,7 +170,9 @@ def test_full_plan_persists_only_staging_and_is_idempotent(database) -> None:
         data, session_factory=instrumented, provider_factory=lambda: provider
     )
     assert first.decision is AgentContactDecision.SELECT and first.selected_contact_name == "Buyer"
+    assert first.handoff_token is not None and len(first.handoff_token) == 64
     assert second.selected_candidate_id == first.selected_candidate_id and provider.calls == 2
+    assert second.handoff_token != first.handoff_token
     assert instrumented.counters.commit_attempts == 2
     assert instrumented.counters.successful_commits == 2
     assert instrumented.counters.rollbacks == 0
@@ -255,6 +257,7 @@ def test_real_provider_narrative_founders_select_and_remain_idempotent(database)
     assert first.selected_contact_name == "Will Meyer"
     assert first.selected_contact_title == "Founder"
     assert first.selected_contact_email is None
+    assert first.handoff_token is not None and len(first.handoff_token) == 64
     assert first.human_review_required is True
     assert (
         first.contact_mutation_count == first.lead_mutation_count == first.task_mutation_count == 0
@@ -269,6 +272,7 @@ def test_real_provider_narrative_founders_select_and_remain_idempotent(database)
 
     assert provider.calls == 2
     assert second.selected_candidate_id == first.selected_candidate_id
+    assert second.handoff_token != first.handoff_token
     assert instrumented.counters.commit_attempts == 2
     assert instrumented.counters.successful_commits == 2
     assert instrumented.counters.rollbacks == 0

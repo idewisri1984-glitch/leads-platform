@@ -49,6 +49,7 @@ def result() -> AgentContactPlanResult:
         proposed_lead_title="Bohemia Bali partnership — Meyer Davis",
         proposed_task_title="Review and prepare outreach to Zoë",
         proposed_task_description="A human must verify Zoë; no outreach has been sent.",
+        handoff_token="a" * 64,
         human_review_required=True,
         staging_mutated=True,
         contact_mutation_count=0,
@@ -92,6 +93,7 @@ def test_text_and_json_output_are_exact_ordered_and_unicode(
     text = invoke()
     payload = invoke("--output", "json")
     assert text.exit_code == payload.exit_code == 0
+    assert f'handoff_token="{"a" * 64}"' in text.stdout
     assert [line.split("=", 1)[0] for line in text.stdout.splitlines()] == list(
         AgentContactPlanResult.model_fields
     )
@@ -108,6 +110,7 @@ def test_text_and_json_output_are_exact_ordered_and_unicode(
     assert payload.stdout == expected and set(json.loads(payload.stdout)) == set(
         AgentContactPlanResult.model_fields
     )
+    assert json.loads(payload.stdout)["handoff_token"] == "a" * 64
 
 
 @pytest.mark.parametrize(
