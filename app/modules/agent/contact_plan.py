@@ -338,7 +338,7 @@ class AgentContactPlanService:
             expected_error = discovery.errors[0] if discovery.errors else None
             if state is None:
                 raise ValueError
-            state_status = _enum(ContactDiscoveryStatus, state.discovery_status)
+            state_status = _strict_persisted_enum(ContactDiscoveryStatus, state.discovery_status)
             if (
                 type(state.company_id) is not int
                 or state.company_id != company_id

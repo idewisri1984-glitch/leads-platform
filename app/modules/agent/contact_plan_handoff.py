@@ -41,7 +41,7 @@ def canonicalize_handoff_datetime(value: object) -> str:
             if value.utcoffset() is None:
                 raise ValueError("discovery_checked_at must have a valid offset.")
             utc_value = value.astimezone(UTC)
-    except (OverflowError, ValueError) as exc:
+    except Exception as exc:
         raise ValueError("discovery_checked_at must have a valid offset.") from exc
     return utc_value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 

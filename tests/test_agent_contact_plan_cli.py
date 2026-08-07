@@ -58,6 +58,31 @@ def result() -> AgentContactPlanResult:
     )
 
 
+def no_selection_result() -> AgentContactPlanResult:
+    values = result().model_dump()
+    values.update(
+        decision=AgentContactDecision.NO_SELECTION,
+        discovery_status=AgentContactDiscoveryStatus.NOT_FOUND,
+        candidate_upsert_count=0,
+        staged_candidate_count=0,
+        eligible_candidate_count=0,
+        selected_candidate_id=None,
+        selected_contact_name=None,
+        selected_contact_title=None,
+        selected_contact_email=None,
+        selected_contact_phone=None,
+        selected_contact_source_url=None,
+        selected_contact_source_type=None,
+        selected_contact_confidence=None,
+        selection_rationale="No eligible candidate",
+        proposed_lead_title=None,
+        proposed_task_title=None,
+        proposed_task_description=None,
+        handoff_token=None,
+    )
+    return AgentContactPlanResult.model_validate(values)
+
+
 def invoke(*extra: str):
     return runner.invoke(
         app,
@@ -111,6 +136,36 @@ def test_text_and_json_output_are_exact_ordered_and_unicode(
         AgentContactPlanResult.model_fields
     )
     assert json.loads(payload.stdout)["handoff_token"] == "a" * 64
+
+
+def test_no_selection_text_and_json_include_null_handoff_in_model_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agent_cli, "execute_agent_contact_plan", lambda data: no_selection_result())
+    text = invoke()
+    payload = invoke("--output", "json")
+    assert text.exit_code == payload.exit_code == 0
+    lines = text.stdout.splitlines()
+    token_index = list(AgentContactPlanResult.model_fields).index("handoff_token")
+    assert lines[token_index] == "handoff_token=null"
+    assert lines[token_index + 1] == "human_review_required=true"
+    parsed = json.loads(payload.stdout)
+    assert parsed["decision"] == "NO_SELECTION"
+    assert parsed["handoff_token"] is None
+    for field in (
+        "selected_candidate_id",
+        "selected_contact_name",
+        "selected_contact_title",
+        "selected_contact_email",
+        "selected_contact_phone",
+        "selected_contact_source_url",
+        "selected_contact_source_type",
+        "selected_contact_confidence",
+        "proposed_lead_title",
+        "proposed_task_title",
+        "proposed_task_description",
+    ):
+        assert parsed[field] is None
 
 
 @pytest.mark.parametrize(
