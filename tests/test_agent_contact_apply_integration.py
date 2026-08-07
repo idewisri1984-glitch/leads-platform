@@ -6,7 +6,10 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database.base import Base
-from app.modules.agent.contact_apply import AgentContactApplyService
+from app.modules.agent.contact_apply import (
+    AgentContactApplyConsistencyError,
+    AgentContactApplyService,
+)
 from app.modules.agent.contact_apply_schemas import AgentContactApplyInput
 from app.modules.agent.contact_plan_contract import build_contact_plan_proposals
 from app.modules.agent.contact_plan_handoff import build_agent_contact_plan_handoff_token
@@ -81,6 +84,33 @@ def _service(session: Session) -> AgentContactApplyService:
         discovery_repository=discovery,
         review_service=ContactDiscoveryCandidateReviewService(discovery),
         promotion_service=ContactDiscoveryCandidatePromotionService(discovery, contacts),
+        lead_repository=LeadRepository(session),
+        task_repository=TaskRepository(session),
+    )
+
+
+class _InvertedPromotionResult:
+    def __init__(self, service: ContactDiscoveryCandidatePromotionService) -> None:
+        self.service = service
+
+    def promote(self, company_id: int, candidate_id: int):
+        result = self.service.promote(company_id, candidate_id)
+        return type(result)(
+            **(result.model_dump() | {"created_contact": not result.created_contact})
+        )
+
+
+def _hostile_service(session: Session) -> AgentContactApplyService:
+    discovery = ContactDiscoveryRepository(session)
+    contacts = ContactRepository(session)
+    return AgentContactApplyService(
+        company_repository=CompanyRepository(session),
+        contact_repository=contacts,
+        discovery_repository=discovery,
+        review_service=ContactDiscoveryCandidateReviewService(discovery),
+        promotion_service=_InvertedPromotionResult(
+            ContactDiscoveryCandidatePromotionService(discovery, contacts)
+        ),  # type: ignore[arg-type]
         lead_repository=LeadRepository(session),
         task_repository=TaskRepository(session),
     )
@@ -201,6 +231,55 @@ def test_late_task_failure_rolls_back_all_service_mutations(database) -> None:
         assert candidate.discovery_status == ContactDiscoveryCandidateStatus.DISCOVERED.value
         assert candidate.promoted_contact_id is None
         assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+        assert verification.scalar(select(func.count()).select_from(Lead)) == 0
+        assert verification.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_hostile_false_reused_result_rolls_back_real_contact_creation(database) -> None:
+    engine, factory, ids = database
+    with factory() as session:
+        data = _input(session, ids)
+        with pytest.raises(AgentContactApplyConsistencyError, match="state is inconsistent"):
+            _hostile_service(session).apply(data)
+        session.rollback()
+    with factory() as verification:
+        candidate = verification.get(ContactDiscoveryCandidate, ids[2])
+        assert candidate is not None
+        assert candidate.discovery_status == ContactDiscoveryCandidateStatus.DISCOVERED.value
+        assert candidate.promoted_contact_id is None
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 0
+        assert verification.scalar(select(func.count()).select_from(Lead)) == 0
+        assert verification.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_hostile_false_created_result_preserves_preexisting_contact(database) -> None:
+    engine, factory, ids = database
+    with factory() as session:
+        contact = ContactRepository(session).create_for_promotion(
+            company_id=ids[1],
+            first_name="Existing",
+            last_name=None,
+            job_title=None,
+            email="ada@example.com",
+            phone=None,
+            source="CONTACT_DISCOVERY",
+            external_id="preexisting",
+            status="NEW",
+        )
+        contact_id = contact.id
+        session.commit()
+    with factory() as session:
+        data = _input(session, ids)
+        with pytest.raises(AgentContactApplyConsistencyError, match="state is inconsistent"):
+            _hostile_service(session).apply(data)
+        session.rollback()
+    with factory() as verification:
+        candidate = verification.get(ContactDiscoveryCandidate, ids[2])
+        assert candidate is not None
+        assert candidate.discovery_status == ContactDiscoveryCandidateStatus.DISCOVERED.value
+        assert candidate.promoted_contact_id is None
+        assert verification.get(Contact, contact_id) is not None
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 1
         assert verification.scalar(select(func.count()).select_from(Lead)) == 0
         assert verification.scalar(select(func.count()).select_from(Task)) == 0
 

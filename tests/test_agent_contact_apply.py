@@ -8,9 +8,11 @@ from pydantic import ValidationError
 from app.modules.agent import (
     AgentContactApplyConfirmationRequiredError,
     AgentContactApplyConflictError,
+    AgentContactApplyConsistencyError,
     AgentContactApplyInput,
     AgentContactApplyInvalidDataError,
     AgentContactApplyNotEligibleError,
+    AgentContactApplyPersistenceError,
     AgentContactApplyResult,
     AgentContactApplyService,
     AgentContactApplyStaleHandoffError,
@@ -70,6 +72,8 @@ class Dependencies:
             10 if status is ContactDiscoveryCandidateStatus.PROMOTED else None
         )
         self.contact = SimpleNamespace(id=10, company_id=2)
+        self.promotion_duplicate: Any = None
+        self.declared_created_contact: bool | None = None
         self.leads: list[Any] = []
         self.tasks: list[Any] = []
 
@@ -91,6 +95,10 @@ class Dependencies:
     def get_for_company(self, company_id: int, contact_id: int) -> Any:
         self.events.append("contact")
         return self.contact
+
+    def find_promotion_duplicate_by_email(self, company_id: int, normalized_email: str) -> Any:
+        self.events.append("contact-duplicate")
+        return self.promotion_duplicate
 
     def mark_reviewed(self, company_id: int, candidate_id: int) -> Any:
         self.events.append("review")
@@ -114,7 +122,9 @@ class Dependencies:
             contact_id=10,
             previous_status=previous,
             current_status=ContactDiscoveryCandidateStatus.PROMOTED,
-            created_contact=changed,
+            created_contact=(
+                changed if self.declared_created_contact is None else self.declared_created_contact
+            ),
             changed=changed,
         )
 
@@ -302,6 +312,89 @@ def test_repeat_apply_reuses_exact_materialization() -> None:
         False,
     )
     assert second.staging_mutated is second.crm_mutated is False
+
+
+@pytest.mark.parametrize(
+    ("preexisting", "declared_created", "raises"),
+    [
+        (False, True, False),
+        (True, False, False),
+        (False, False, True),
+        (True, True, True),
+    ],
+)
+def test_contact_creation_outcome_uses_authoritative_prestate(
+    preexisting: bool, declared_created: bool, raises: bool
+) -> None:
+    deps = Dependencies(ContactDiscoveryCandidateStatus.REVIEWED)
+    deps.promotion_duplicate = deps.contact if preexisting else None
+    deps.declared_created_contact = declared_created
+    if raises:
+        with pytest.raises(AgentContactApplyConsistencyError, match="state is inconsistent"):
+            _service(deps).apply(_input(deps))
+        assert "lead-create" not in deps.events and "task-create" not in deps.events
+        return
+    result = _service(deps).apply(_input(deps))
+    assert result.contact_created is (not preexisting)
+    assert result.contact_reused is preexisting
+    assert result.contact_mutation_count == int(not preexisting)
+
+
+def test_authoritative_contact_identity_and_scope_are_strict() -> None:
+    deps = Dependencies(ContactDiscoveryCandidateStatus.REVIEWED)
+    deps.promotion_duplicate = deps.contact
+    deps.declared_created_contact = False
+    deps.contact.company_id = 9
+    with pytest.raises(AgentContactApplyConsistencyError):
+        _service(deps).apply(_input(deps))
+
+    deps = Dependencies(ContactDiscoveryCandidateStatus.REVIEWED)
+    deps.promotion_duplicate = SimpleNamespace(id="10", company_id=2)
+    deps.declared_created_contact = False
+    with pytest.raises(AgentContactApplyConsistencyError):
+        _service(deps).apply(_input(deps))
+
+
+def test_promotion_result_contact_id_must_match_authoritative_contact() -> None:
+    deps = Dependencies(ContactDiscoveryCandidateStatus.REVIEWED)
+    deps.promotion_duplicate = deps.contact
+    deps.declared_created_contact = False
+    original = deps.promote
+
+    def mismatched(company_id: int, candidate_id: int) -> Any:
+        result = original(company_id, candidate_id)
+        return ContactDiscoveryCandidatePromotionResult(
+            **(result.model_dump() | {"contact_id": 11})
+        )
+
+    deps.promote = cast(Any, mismatched)
+    with pytest.raises(AgentContactApplyConsistencyError):
+        _service(deps).apply(_input(deps))
+
+
+def test_constructed_promotion_result_and_repository_failure_are_sanitized() -> None:
+    deps = Dependencies(ContactDiscoveryCandidateStatus.REVIEWED)
+    deps.promote = cast(
+        Any,
+        lambda company_id, candidate_id: ContactDiscoveryCandidatePromotionResult.model_construct(
+            candidate_id=3,
+            company_id=2,
+            contact_id="10",
+            previous_status=ContactDiscoveryCandidateStatus.REVIEWED,
+            current_status=ContactDiscoveryCandidateStatus.PROMOTED,
+            created_contact=True,
+            changed=True,
+        ),
+    )
+    with pytest.raises(AgentContactApplyConsistencyError):
+        _service(deps).apply(_input(deps))
+
+    deps = Dependencies(ContactDiscoveryCandidateStatus.REVIEWED)
+    deps.find_promotion_duplicate_by_email = cast(
+        Any, lambda company_id, normalized_email: (_ for _ in ()).throw(RuntimeError("secret"))
+    )
+    with pytest.raises(AgentContactApplyPersistenceError, match="could not be persisted"):
+        _service(deps).apply(_input(deps))
 
 
 @pytest.mark.parametrize(

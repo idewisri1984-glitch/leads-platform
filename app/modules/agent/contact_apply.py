@@ -31,6 +31,7 @@ from ..contact_discovery.models import (
     ContactDiscoverySourceType,
     ContactDiscoveryStatus,
 )
+from ..contact_discovery.normalization import normalize_discovered_email
 from .contact_apply_schemas import AgentContactApplyInput, AgentContactApplyResult
 from .contact_plan_contract import build_contact_plan_proposals, normalize_contact_plan_text
 from .contact_plan_handoff import (
@@ -151,6 +152,10 @@ class _ContactRepository(Protocol):
     def acquire_promotion_scope(self, company_id: int) -> None: ...
 
     def get_for_company(self, company_id: int, contact_id: int) -> _ContactRecord | None: ...
+
+    def find_promotion_duplicate_by_email(
+        self, company_id: int, normalized_email: str
+    ) -> _ContactRecord | None: ...
 
 
 class _DiscoveryRepository(Protocol):
@@ -318,6 +323,7 @@ class AgentContactApplyService:
         if candidate.status is ContactDiscoveryCandidateStatus.REJECTED:
             raise AgentContactApplyNotEligibleError(_NOT_ELIGIBLE)
 
+        preexisting_contact_id = self._preexisting_contact_id(candidate, data.company_id)
         before = candidate.status
         reviewed = False
         if before is ContactDiscoveryCandidateStatus.DISCOVERED:
@@ -344,6 +350,11 @@ class AgentContactApplyService:
             lambda: self.contact_repository.get_for_company(data.company_id, promotion.contact_id)
         )
         contact_id = self._validate_contact(contact_record, data.company_id, promotion.contact_id)
+        contact_created = preexisting_contact_id is None
+        if (
+            preexisting_contact_id is not None and preexisting_contact_id != contact_id
+        ) or promotion.created_contact is not contact_created:
+            raise AgentContactApplyConsistencyError(_INCONSISTENT)
         lead, lead_created = self._materialize_lead(data.company_id, contact_id)
         lead_id = lead.id
         if type(lead_id) is not int:
@@ -364,16 +375,16 @@ class AgentContactApplyService:
                 candidate_status_after=ContactDiscoveryCandidateStatus.PROMOTED,
                 candidate_reviewed=reviewed,
                 candidate_promoted=promoted,
-                contact_created=promotion.created_contact,
-                contact_reused=not promotion.created_contact,
+                contact_created=contact_created,
+                contact_reused=not contact_created,
                 lead_created=lead_created,
                 lead_reused=not lead_created,
                 task_created=task_created,
                 task_reused=not task_created,
                 staging_mutated=reviewed or promoted,
-                crm_mutated=promotion.created_contact or lead_created or task_created,
+                crm_mutated=contact_created or lead_created or task_created,
                 network_call_count=0,
-                contact_mutation_count=int(promotion.created_contact),
+                contact_mutation_count=int(contact_created),
                 lead_mutation_count=int(lead_created),
                 task_mutation_count=int(task_created),
                 handoff_verified=True,
@@ -576,6 +587,59 @@ class AgentContactApplyService:
             raise AgentContactApplyConsistencyError(_INCONSISTENT) from None
         except Exception:
             raise AgentContactApplyPersistenceError(_PERSISTENCE) from None
+
+    def _preexisting_contact_id(self, candidate: _CandidateSnapshot, company_id: int) -> int | None:
+        if candidate.status is ContactDiscoveryCandidateStatus.PROMOTED:
+            contact_id = candidate.promoted_contact_id
+            if contact_id is None:
+                raise AgentContactApplyConsistencyError(_INCONSISTENT)
+            valid_contact_id = contact_id
+            record = _repository_call(
+                lambda: self.contact_repository.get_for_company(company_id, valid_contact_id)
+            )
+            return self._validate_contact(record, company_id, valid_contact_id)
+
+        canonical_email = self._canonical_candidate_email(candidate)
+        if canonical_email is None:
+            return None
+        record = _repository_call(
+            lambda: self.contact_repository.find_promotion_duplicate_by_email(
+                company_id, canonical_email
+            )
+        )
+        if record is None:
+            return None
+        try:
+            record_contact_id = record.id
+        except AttributeError:
+            raise AgentContactApplyConsistencyError(_INCONSISTENT) from None
+        if type(record_contact_id) is not int or record_contact_id <= 0:
+            raise AgentContactApplyConsistencyError(_INCONSISTENT)
+        return self._validate_contact(record, company_id, record_contact_id)
+
+    @staticmethod
+    def _canonical_candidate_email(candidate: _CandidateSnapshot) -> str | None:
+        try:
+            raw_email = (
+                normalize_discovered_email(candidate.email) if candidate.email is not None else None
+            )
+            stored_email = (
+                normalize_discovered_email(candidate.normalized_email)
+                if candidate.normalized_email is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            raise AgentContactApplyConsistencyError(_INCONSISTENT) from None
+        if (
+            (candidate.email is not None and raw_email is None)
+            or (
+                candidate.normalized_email is not None
+                and stored_email != candidate.normalized_email
+            )
+            or (raw_email is not None and stored_email is not None and raw_email != stored_email)
+        ):
+            raise AgentContactApplyConsistencyError(_INCONSISTENT)
+        return stored_email or raw_email
 
     @staticmethod
     def _validate_promotion(
