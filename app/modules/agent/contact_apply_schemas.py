@@ -159,10 +159,11 @@ class AgentContactApplyResult(BaseModel):
         ):
             if created == reused:
                 raise ValueError("Materialization outcome is inconsistent.")
-        if self.network_call_count != 0 or (
-            self.contact_mutation_count != int(self.contact_created)
+        if (
+            self.network_call_count != 0
+            or self.contact_mutation_count != int(self.contact_created)
             or self.lead_mutation_count != int(self.lead_created)
-            or self.task_mutation_count != int(self.task_created)
+            or self.task_mutation_count not in {int(self.task_created), 1}
         ):
             raise ValueError("Mutation counts are inconsistent.")
         expected = {
@@ -177,7 +178,9 @@ class AgentContactApplyResult(BaseModel):
             raise ValueError("Candidate lifecycle is inconsistent.")
         if self.staging_mutated != (self.candidate_reviewed or self.candidate_promoted):
             raise ValueError("Staging mutation state is inconsistent.")
-        if self.crm_mutated != (self.contact_created or self.lead_created or self.task_created):
+        if self.crm_mutated != bool(
+            self.contact_mutation_count or self.lead_mutation_count or self.task_mutation_count
+        ):
             raise ValueError("CRM mutation state is inconsistent.")
         return self
 

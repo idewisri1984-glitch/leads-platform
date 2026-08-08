@@ -7,11 +7,16 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database.base import Base
 from app.modules.agent.contact_apply import (
+    AgentContactApplyConflictError,
     AgentContactApplyConsistencyError,
     AgentContactApplyService,
+    AgentContactApplyStaleHandoffError,
 )
 from app.modules.agent.contact_apply_schemas import AgentContactApplyInput
-from app.modules.agent.contact_plan_contract import build_contact_plan_proposals
+from app.modules.agent.contact_plan_contract import (
+    build_contact_plan_proposals,
+    build_legacy_contact_plan_task_description,
+)
 from app.modules.agent.contact_plan_handoff import build_agent_contact_plan_handoff_token
 from app.modules.company.models import Company
 from app.modules.company.repository import CompanyRepository
@@ -116,7 +121,12 @@ def _hostile_service(session: Session) -> AgentContactApplyService:
     )
 
 
-def _input(session: Session, ids: tuple[int, int, int]) -> AgentContactApplyInput:
+def _input(
+    session: Session,
+    ids: tuple[int, int, int],
+    *,
+    legacy_description: bool = False,
+) -> AgentContactApplyInput:
     project_id, company_id, candidate_id = ids
     company = session.get(Company, company_id)
     state = session.scalar(
@@ -156,7 +166,16 @@ def _input(session: Session, ids: tuple[int, int, int]) -> AgentContactApplyInpu
         candidate_confidence=float(candidate.confidence) / 100.0,
         proposed_lead_title=proposals.lead_title,
         proposed_task_title=proposals.task_title,
-        proposed_task_description=proposals.task_description,
+        proposed_task_description=(
+            build_legacy_contact_plan_task_description(
+                company_name=company.name,
+                candidate_name=candidate.name,
+                candidate_title=candidate.title,
+                goal="Partner",
+            )
+            if legacy_description
+            else proposals.task_description
+        ),
     )
     return AgentContactApplyInput(
         project_id=project_id,
@@ -207,8 +226,145 @@ def test_fresh_apply_and_repeat_are_transactional_and_idempotent(database) -> No
             assert session.scalar(select(func.count()).select_from(Contact)) == 1
             assert session.scalar(select(func.count()).select_from(Lead)) == 1
             assert session.scalar(select(func.count()).select_from(Task)) == 1
+            task = session.scalar(select(Task))
+            assert task is not None
+            assert "review and prepare personalized outreach" in (task.description or "")
+            assert "no Lead" not in (task.description or "")
+            assert "no Task" not in (task.description or "")
     finally:
         event.remove(Session, "after_commit", count_commit)
+
+
+def _seed_legacy_materialization(session: Session, ids: tuple[int, int, int]) -> tuple[int, str]:
+    _, company_id, candidate_id = ids
+    candidate = session.get(ContactDiscoveryCandidate, candidate_id)
+    assert candidate is not None
+    contact = ContactRepository(session).create_for_promotion(
+        company_id=company_id,
+        first_name="Ada",
+        last_name="Lovelace",
+        job_title="Founder",
+        email="ada@example.com",
+        phone="+1 555 0100",
+        source="CONTACT_DISCOVERY",
+        external_id="legacy-stage4e",
+        status="NEW",
+    )
+    candidate.discovery_status = ContactDiscoveryCandidateStatus.PROMOTED.value
+    candidate.promoted_contact_id = contact.id
+    lead = LeadRepository(session).create_for_contact(
+        company_id=company_id,
+        contact_id=contact.id,
+        status="NEW",
+        source=None,
+    )
+    proposals = build_contact_plan_proposals(
+        company_name="Acme",
+        candidate_name="Ada Lovelace",
+        candidate_title="Founder",
+        goal="Partner",
+    )
+    legacy = build_legacy_contact_plan_task_description(
+        company_name="Acme",
+        candidate_name="Ada Lovelace",
+        candidate_title="Founder",
+        goal="Partner",
+    )
+    task = TaskRepository(session).create_for_lead(
+        lead_id=lead.id,
+        title=proposals.task_title,
+        description=legacy,
+    )
+    session.commit()
+    return task.id, legacy
+
+
+def test_legacy_task_is_reused_and_normalized_without_duplicate(database) -> None:
+    _, factory, ids = database
+    with factory() as session:
+        task_id, legacy = _seed_legacy_materialization(session, ids)
+    with factory() as session:
+        data = _input(session, ids)
+        result = _service(session).apply(data)
+        assert result.task_id == task_id
+        assert (result.task_created, result.task_reused) == (False, True)
+        assert (result.task_mutation_count, result.crm_mutated) == (1, True)
+        session.commit()
+    with factory() as session:
+        tasks = list(session.scalars(select(Task)))
+        assert len(tasks) == 1
+        assert tasks[0].id == task_id
+        assert tasks[0].description != legacy
+        assert "no Lead" not in (tasks[0].description or "")
+        assert "no Task" not in (tasks[0].description or "")
+
+
+def test_pre_fix_description_token_is_stale_before_mutation(database) -> None:
+    _, factory, ids = database
+    with factory() as session:
+        data = _input(session, ids, legacy_description=True)
+        with pytest.raises(AgentContactApplyStaleHandoffError, match="handoff is stale"):
+            _service(session).apply(data)
+        session.rollback()
+    with factory() as session:
+        candidate = session.get(ContactDiscoveryCandidate, ids[2])
+        assert candidate is not None
+        assert candidate.discovery_status == ContactDiscoveryCandidateStatus.DISCOVERED.value
+        assert candidate.promoted_contact_id is None
+        assert session.scalar(select(func.count()).select_from(Contact)) == 0
+        assert session.scalar(select(func.count()).select_from(Lead)) == 0
+        assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_legacy_normalization_rolls_back_after_late_validation_failure(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, factory, ids = database
+    with factory() as session:
+        task_id, legacy = _seed_legacy_materialization(session, ids)
+    with factory() as session:
+        service = _service(session)
+
+        def fail_validation(*values: object) -> None:
+            raise AgentContactApplyConsistencyError("Agent contact apply state is inconsistent.")
+
+        monkeypatch.setattr(service, "_validate_task", fail_validation)
+        with pytest.raises(AgentContactApplyConsistencyError):
+            service.apply(_input(session, ids))
+        session.rollback()
+    with factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        assert task.description == legacy
+        assert session.scalar(select(func.count()).select_from(Task)) == 1
+
+
+def test_ambiguous_legacy_and_current_tasks_are_rejected_without_normalization(database) -> None:
+    _, factory, ids = database
+    with factory() as session:
+        task_id, legacy = _seed_legacy_materialization(session, ids)
+        legacy_task = session.get(Task, task_id)
+        assert legacy_task is not None
+        proposals = build_contact_plan_proposals(
+            company_name="Acme",
+            candidate_name="Ada Lovelace",
+            candidate_title="Founder",
+            goal="Partner",
+        )
+        TaskRepository(session).create_for_lead(
+            lead_id=legacy_task.lead_id,
+            title=proposals.task_title,
+            description=proposals.task_description,
+        )
+        session.commit()
+    with factory() as session:
+        with pytest.raises(AgentContactApplyConflictError, match="conflicting CRM state"):
+            _service(session).apply(_input(session, ids))
+        session.rollback()
+    with factory() as session:
+        tasks = list(session.scalars(select(Task).order_by(Task.id)))
+        assert len(tasks) == 2
+        assert tasks[0].description == legacy
 
 
 def test_late_task_failure_rolls_back_all_service_mutations(database) -> None:

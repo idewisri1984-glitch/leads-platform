@@ -26,6 +26,30 @@ class ContactPlanProposals:
     task_description: str
 
 
+def build_legacy_contact_plan_task_description(
+    *,
+    company_name: object,
+    candidate_name: object,
+    candidate_title: object,
+    goal: object,
+) -> str:
+    """Build the exact pre-Stage-4E Task description for bounded legacy reuse."""
+    company = normalize_contact_plan_text(company_name, required=True)
+    name = normalize_contact_plan_text(candidate_name, required=True)
+    title = normalize_contact_plan_text(candidate_title)
+    normalized_goal = normalize_contact_plan_text(goal, required=True)
+    if company is None or name is None or normalized_goal is None:
+        raise ValueError("Contact-plan proposal data is invalid.")
+    title_detail = f" with title {title}" if title else ""
+    fixed = (
+        "A human must verify this contact before any action. No outreach has been sent, "
+        "and no Lead or Task has been created. "
+        f"Selected person: {name}{title_detail}. Company: {company}. "
+        "Prepare a personalized Bohemia Bali partnership message. Goal: "
+    )
+    return bounded_contact_plan_text(fixed + normalized_goal, 4000)
+
+
 def build_contact_plan_proposals(
     *,
     company_name: object,
@@ -43,10 +67,9 @@ def build_contact_plan_proposals(
     task_title = bounded_contact_plan_text(f"Review and prepare outreach to {name}", 255)
     title_detail = f" with title {title}" if title else ""
     fixed = (
-        "A human must verify this contact before any action. No outreach has been sent, "
-        "and no Lead or Task has been created. "
-        f"Selected person: {name}{title_detail}. Company: {company}. "
-        "Prepare a personalized Bohemia Bali partnership message. Goal: "
+        f"Next operator action: review and prepare personalized outreach to {name}{title_detail} "
+        f"at {company}. The resulting Task is the actionable follow-up for the resulting Lead. "
+        "Use the selected Contact, Company, and Agent goal as authoritative context. Goal: "
     )
     return ContactPlanProposals(
         lead_title=lead_title,
@@ -58,6 +81,7 @@ def build_contact_plan_proposals(
 __all__ = [
     "ContactPlanProposals",
     "bounded_contact_plan_text",
+    "build_legacy_contact_plan_task_description",
     "build_contact_plan_proposals",
     "normalize_contact_plan_text",
 ]

@@ -33,7 +33,11 @@ from ..contact_discovery.models import (
 )
 from ..contact_discovery.normalization import normalize_discovered_email
 from .contact_apply_schemas import AgentContactApplyInput, AgentContactApplyResult
-from .contact_plan_contract import build_contact_plan_proposals, normalize_contact_plan_text
+from .contact_plan_contract import (
+    build_contact_plan_proposals,
+    build_legacy_contact_plan_task_description,
+    normalize_contact_plan_text,
+)
 from .contact_plan_handoff import (
     build_agent_contact_plan_handoff_token,
     canonicalize_handoff_datetime,
@@ -292,6 +296,12 @@ class AgentContactApplyService:
             candidate_title=candidate.title,
             goal=data.goal,
         )
+        legacy_task_description = build_legacy_contact_plan_task_description(
+            company_name=company.name,
+            candidate_name=candidate.name,
+            candidate_title=candidate.title,
+            goal=data.goal,
+        )
         try:
             expected_token = build_agent_contact_plan_handoff_token(
                 project_id=data.project_id,
@@ -359,8 +369,11 @@ class AgentContactApplyService:
         lead_id = lead.id
         if type(lead_id) is not int:
             raise AgentContactApplyConsistencyError(_INCONSISTENT)
-        task, task_created = self._materialize_task(
-            lead_id, proposals.task_title, proposals.task_description
+        task, task_created, task_normalized = self._materialize_task(
+            lead_id,
+            proposals.task_title,
+            proposals.task_description,
+            legacy_task_description,
         )
         promoted = before is not ContactDiscoveryCandidateStatus.PROMOTED
         try:
@@ -382,11 +395,11 @@ class AgentContactApplyService:
                 task_created=task_created,
                 task_reused=not task_created,
                 staging_mutated=reviewed or promoted,
-                crm_mutated=contact_created or lead_created or task_created,
+                crm_mutated=contact_created or lead_created or task_created or task_normalized,
                 network_call_count=0,
                 contact_mutation_count=int(contact_created),
                 lead_mutation_count=int(lead_created),
-                task_mutation_count=int(task_created),
+                task_mutation_count=int(task_created or task_normalized),
                 handoff_verified=True,
                 human_confirmation_required=True,
                 human_confirmation_received=True,
@@ -725,8 +738,12 @@ class AgentContactApplyService:
             raise AgentContactApplyConflictError(_CONFLICT)
 
     def _materialize_task(
-        self, lead_id: int, title: str, description: str
-    ) -> tuple[_TaskRecord, bool]:
+        self,
+        lead_id: int,
+        title: str,
+        description: str,
+        legacy_description: str,
+    ) -> tuple[_TaskRecord, bool, bool]:
         existing = _repository_call(lambda: self.task_repository.get_by_lead(lead_id))
         if type(existing) is not list:
             raise AgentContactApplyConsistencyError(_INCONSISTENT)
@@ -742,8 +759,37 @@ class AgentContactApplyService:
             if created
             else existing[0]
         )
+        normalized = False
+        if not created and self._is_legacy_task(task, lead_id, title, legacy_description):
+            try:
+                task.description = description
+            except (AttributeError, TypeError, ValueError):
+                raise AgentContactApplyConflictError(_CONFLICT) from None
+            normalized = True
         self._validate_task(task, lead_id, title, description)
-        return task, created
+        return task, created, normalized
+
+    @staticmethod
+    def _is_legacy_task(
+        task: _TaskRecord,
+        lead_id: int,
+        title: str,
+        legacy_description: str,
+    ) -> bool:
+        try:
+            return (
+                type(task.lead_id) is int
+                and task.lead_id == lead_id
+                and type(task.title) is str
+                and task.title == title
+                and type(task.description) is str
+                and task.description == legacy_description
+                and type(task.status) is str
+                and task.status == "TODO"
+                and task.due_at is None
+            )
+        except AttributeError:
+            return False
 
     @staticmethod
     def _validate_task(task: _TaskRecord, lead_id: int, title: str, description: str) -> None:

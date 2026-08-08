@@ -17,7 +17,10 @@ from app.modules.agent import (
     AgentContactApplyService,
     AgentContactApplyStaleHandoffError,
 )
-from app.modules.agent.contact_plan_contract import build_contact_plan_proposals
+from app.modules.agent.contact_plan_contract import (
+    build_contact_plan_proposals,
+    build_legacy_contact_plan_task_description,
+)
 from app.modules.agent.contact_plan_handoff import build_agent_contact_plan_handoff_token
 from app.modules.contact_discovery.candidate_promotion_schemas import (
     ContactDiscoveryCandidatePromotionResult,
@@ -270,10 +273,94 @@ def test_shared_proposals_preserve_exact_stage4a_semantics() -> None:
     assert result.lead_title == "Bohemia Bali partnership — Acme"
     assert result.task_title == "Review and prepare outreach to Ada Lovelace"
     assert result.task_description == (
+        "Next operator action: review and prepare personalized outreach to Ada Lovelace with "
+        "title Founder at Acme. The resulting Task is the actionable follow-up for the resulting "
+        "Lead. Use the selected Contact, Company, and Agent goal as authoritative context. "
+        "Goal: Partner"
+    )
+    assert "review and prepare personalized outreach" in result.task_description
+    assert "no Lead" not in result.task_description
+    assert "no Task" not in result.task_description
+    for forbidden in (
+        "handoff token",
+        "database_url",
+        "sqlite://",
+        "provider prompt",
+        "api key",
+        "smtp",
+        "<html",
+        "contact_id",
+        "lead_id",
+        "task_id",
+    ):
+        assert forbidden not in result.task_description.lower()
+    assert (
+        build_contact_plan_proposals(
+            company_name="Acme",
+            candidate_name="Ada Lovelace",
+            candidate_title="Founder",
+            goal="Partner",
+        )
+        == result
+    )
+
+
+def test_legacy_task_description_is_an_exact_bounded_compatibility_contract() -> None:
+    assert build_legacy_contact_plan_task_description(
+        company_name="Acme",
+        candidate_name="Ada Lovelace",
+        candidate_title="Founder",
+        goal="Partner",
+    ) == (
         "A human must verify this contact before any action. No outreach has been sent, "
         "and no Lead or Task has been created. Selected person: Ada Lovelace with title Founder. "
         "Company: Acme. Prepare a personalized Bohemia Bali partnership message. Goal: Partner"
     )
+
+
+def test_exact_legacy_task_is_reused_and_normalized_truthfully() -> None:
+    deps = Dependencies(ContactDiscoveryCandidateStatus.PROMOTED)
+    proposals = build_contact_plan_proposals(
+        company_name="Acme",
+        candidate_name="Ada Lovelace",
+        candidate_title="Founder",
+        goal="Partner",
+    )
+    legacy = build_legacy_contact_plan_task_description(
+        company_name="Acme",
+        candidate_name="Ada Lovelace",
+        candidate_title="Founder",
+        goal="Partner",
+    )
+    deps.leads.append(
+        SimpleNamespace(
+            id=20,
+            company_id=2,
+            contact_id=10,
+            status="NEW",
+            source=None,
+            notes=None,
+        )
+    )
+    task = SimpleNamespace(
+        id=30,
+        lead_id=20,
+        title=proposals.task_title,
+        description=legacy,
+        status="TODO",
+        due_at=None,
+    )
+    deps.tasks.append(task)
+
+    first = _service(deps).apply(_input(deps))
+    assert first.task_id == 30
+    assert (first.task_created, first.task_reused) == (False, True)
+    assert (first.task_mutation_count, first.crm_mutated) == (1, True)
+    assert task.description == proposals.task_description
+
+    second = _service(deps).apply(_input(deps))
+    assert second.task_id == 30
+    assert (second.task_mutation_count, second.crm_mutated) == (0, False)
 
 
 @pytest.mark.parametrize(

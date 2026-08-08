@@ -593,8 +593,9 @@ def test_proposed_text_is_bounded_truthful_and_no_status_changes_occur() -> None
     assert len(result.proposed_task_title or "") <= 255
     assert len(result.proposed_task_description or "") <= 4000
     text = result.proposed_task_description or ""
-    assert "human must verify" in text and "No outreach has been sent" in text
-    assert "no Lead or Task has been created" in text
+    assert "Next operator action" in text
+    assert "actionable follow-up" in text
+    assert "no Lead" not in text and "no Task" not in text
     assert (
         result.contact_mutation_count
         == result.lead_mutation_count
