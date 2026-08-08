@@ -13,7 +13,6 @@ from app.core.database.base import Base
 from app.modules.agent.contact_apply import (
     AgentContactApplyConflictError,
     AgentContactApplyConsistencyError,
-    AgentContactApplyPersistenceError,
     AgentContactApplyService,
     AgentContactApplyStaleHandoffError,
 )
@@ -576,70 +575,6 @@ def test_matching_task_on_another_lead_for_target_contact_is_not_reused(database
         assert target.description == legacy
         assert foreign.description == proposals.task_description
         assert session.scalar(select(func.count()).select_from(Task)) == 2
-
-
-def test_caller_commit_failure_after_legacy_normalization_rolls_back(
-    database,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _, factory, ids = database
-    with factory() as setup:
-        task_id, legacy = _seed_legacy_materialization(setup, ids)
-    session = factory()
-    real_rollback = session.rollback
-    real_close = session.close
-    calls = {"commit": 0, "rollback": 0, "close": 0}
-    proposals = build_contact_plan_proposals(
-        company_name="Acme",
-        candidate_name="Ada Lovelace",
-        candidate_title="Founder",
-        goal="Partner",
-    )
-
-    def fail_commit() -> None:
-        calls["commit"] += 1
-        task = session.get(Task, task_id)
-        assert task is not None
-        assert task.description == proposals.task_description
-        raise RuntimeError("controlled commit failure")
-
-    def rollback() -> None:
-        calls["rollback"] += 1
-        real_rollback()
-
-    def close() -> None:
-        calls["close"] += 1
-        real_close()
-
-    monkeypatch.setattr(session, "commit", fail_commit)
-    monkeypatch.setattr(session, "rollback", rollback)
-    monkeypatch.setattr(session, "close", close)
-    try:
-        result = _service(session).apply(_input(session, ids))
-        assert (result.task_created, result.task_reused) == (False, True)
-        assert (result.task_mutation_count, result.crm_mutated) == (1, True)
-        with pytest.raises(
-            AgentContactApplyPersistenceError,
-            match="^Agent contact apply could not be persisted\\.$",
-        ) as captured:
-            try:
-                session.commit()
-            except RuntimeError:
-                session.rollback()
-                raise AgentContactApplyPersistenceError(
-                    "Agent contact apply could not be persisted."
-                ) from None
-        assert "controlled commit failure" not in str(captured.value)
-    finally:
-        session.close()
-    assert calls == {"commit": 1, "rollback": 1, "close": 1}
-    assert capsys.readouterr().out == ""
-    with factory() as verification:
-        task = verification.get(Task, task_id)
-        assert task is not None
-        assert task.description == legacy
-        assert verification.scalar(select(func.count()).select_from(Task)) == 1
 
 
 def test_pre_fix_description_token_is_stale_before_mutation(database) -> None:

@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,7 +11,11 @@ from typer.testing import CliRunner
 import app.cli.agent as agent_cli
 from app.cli.main import app
 from app.core.database.base import Base
-from app.modules.agent.contact_plan_contract import build_contact_plan_proposals
+from app.modules.agent.contact_apply_schemas import AgentContactApplyResult
+from app.modules.agent.contact_plan_contract import (
+    build_contact_plan_proposals,
+    build_legacy_contact_plan_task_description,
+)
 from app.modules.agent.contact_plan_handoff import build_agent_contact_plan_handoff_token
 from app.modules.company.models import Company
 from app.modules.contact.models import Contact
@@ -161,6 +166,15 @@ def _arguments(ids: dict[str, int], token: str, *, goal: str = GOAL) -> list[str
 
 class _Counts:
     def __init__(self) -> None:
+        self.sessions = 0
+        self.commits = 0
+        self.rollbacks = 0
+        self.closes = 0
+        self.commit_failure = False
+        self.before_commit: Callable[[Session], None] | None = None
+
+    def reset(self) -> None:
+        self.sessions = 0
         self.commits = 0
         self.rollbacks = 0
         self.closes = 0
@@ -171,11 +185,15 @@ def _install_real_executor(
     factory: sessionmaker[Session],
     *,
     commit_failure: bool = False,
+    before_commit: Callable[[Session], None] | None = None,
 ) -> _Counts:
     counts = _Counts()
+    counts.commit_failure = commit_failure
+    counts.before_commit = before_commit
     real_execute = agent_cli._execute_agent_contact_apply
 
     def session_factory() -> Session:
+        counts.sessions += 1
         session = factory()
         real_commit = session.commit
         real_rollback = session.rollback
@@ -183,7 +201,9 @@ def _install_real_executor(
 
         def commit() -> None:
             counts.commits += 1
-            if commit_failure:
+            if counts.before_commit is not None:
+                counts.before_commit(session)
+            if counts.commit_failure:
                 raise RuntimeError("controlled commit failure")
             real_commit()
 
@@ -373,3 +393,160 @@ def test_commit_failure_has_no_success_output_and_no_retry(
     assert outcome.stderr == "Agent contact apply could not be persisted.\n"
     assert _counts(factory) == (0, 0, 0)
     assert (counts.commits, counts.rollbacks, counts.closes) == (1, 1, 1)
+
+
+def test_caller_commit_failure_after_legacy_normalization_rolls_back(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory, ids = database
+    token = _token(factory, ids)
+    counts = _install_real_executor(monkeypatch, factory)
+
+    seeded = runner.invoke(app, _arguments(ids, token))
+    assert seeded.exit_code == 0
+    seeded_payload = json.loads(seeded.stdout)
+    contact_id = seeded_payload["contact_id"]
+    lead_id = seeded_payload["lead_id"]
+    task_id = seeded_payload["task_id"]
+    proposals = build_contact_plan_proposals(
+        company_name="Acme",
+        candidate_name="Ada Lovelace",
+        candidate_title="Founder",
+        goal=GOAL,
+    )
+    legacy_description = build_legacy_contact_plan_task_description(
+        company_name="Acme",
+        candidate_name="Ada Lovelace",
+        candidate_title="Founder",
+        goal=GOAL,
+    )
+    with factory() as setup:
+        task = setup.get(Task, task_id)
+        contact = setup.get(Contact, contact_id)
+        lead = setup.get(Lead, lead_id)
+        candidate = setup.get(ContactDiscoveryCandidate, ids["candidate"])
+        assert task is not None and contact is not None and lead is not None
+        assert candidate is not None
+        assert task.title == proposals.task_title
+        assert task.description == proposals.task_description
+        assert task.status == "TODO"
+        assert task.due_at is None
+        task.description = legacy_description
+        setup.commit()
+        contact_state = (
+            contact.company_id,
+            contact.first_name,
+            contact.last_name,
+            contact.job_title,
+            contact.email,
+            contact.phone,
+            contact.source,
+            contact.external_id,
+            contact.status,
+        )
+        lead_state = (lead.company_id, lead.contact_id, lead.status, lead.source, lead.notes)
+        candidate_state = (
+            candidate.discovery_status,
+            candidate.promoted_contact_id,
+            candidate.name,
+            candidate.title,
+            candidate.email,
+            candidate.phone,
+            candidate.deduplication_key,
+        )
+
+    observations = {"render_calls": 0, "commit_observations": 0}
+    rendered_results: list[str] = []
+    real_render = agent_cli.render_agent_contact_apply
+
+    def render(result: AgentContactApplyResult, output: str) -> str:
+        observations["render_calls"] += 1
+        assert result.contact_id == contact_id
+        assert result.lead_id == lead_id
+        assert result.task_id == task_id
+        assert (result.contact_created, result.lead_created, result.task_created) == (
+            False,
+            False,
+            False,
+        )
+        assert (result.contact_reused, result.lead_reused, result.task_reused) == (
+            True,
+            True,
+            True,
+        )
+        assert (result.task_mutation_count, result.crm_mutated) == (1, True)
+        rendered = real_render(result, output)
+        rendered_results.append(rendered)
+        return rendered
+
+    def observe_normalized_state(session: Session) -> None:
+        observations["commit_observations"] += 1
+        assert observations["render_calls"] == 1
+        assert len(rendered_results) == 1
+        payload = json.loads(rendered_results[0])
+        assert payload["task_id"] == task_id
+        tasks = session.scalars(select(Task).where(Task.lead_id == lead_id)).all()
+        assert len(tasks) == 1
+        assert tasks[0].id == task_id
+        assert tasks[0].description == proposals.task_description
+        assert tasks[0].description != legacy_description
+
+    monkeypatch.setattr(agent_cli, "render_agent_contact_apply", render)
+    counts.reset()
+    counts.commit_failure = True
+    counts.before_commit = observe_normalized_state
+
+    outcome = runner.invoke(app, _arguments(ids, token))
+
+    assert outcome.exit_code == 9
+    assert outcome.stdout == ""
+    assert outcome.stderr == "Agent contact apply could not be persisted.\n"
+    assert "controlled commit failure" not in outcome.stderr
+    assert "Traceback" not in outcome.stderr
+    assert observations == {"render_calls": 1, "commit_observations": 1}
+    assert len(rendered_results) == 1
+    assert counts.sessions == 1
+    assert (counts.commits, counts.rollbacks, counts.closes) == (1, 1, 1)
+
+    with factory() as verification:
+        task = verification.get(Task, task_id)
+        contact = verification.get(Contact, contact_id)
+        lead = verification.get(Lead, lead_id)
+        candidate = verification.get(ContactDiscoveryCandidate, ids["candidate"])
+        assert task is not None and contact is not None and lead is not None
+        assert candidate is not None
+        assert task.id == task_id
+        assert task.description == legacy_description
+        assert task.description != proposals.task_description
+        tasks = verification.scalars(select(Task).where(Task.lead_id == lead_id)).all()
+        assert len(tasks) == 1
+        assert (
+            contact.company_id,
+            contact.first_name,
+            contact.last_name,
+            contact.job_title,
+            contact.email,
+            contact.phone,
+            contact.source,
+            contact.external_id,
+            contact.status,
+        ) == contact_state
+        assert (
+            lead.company_id,
+            lead.contact_id,
+            lead.status,
+            lead.source,
+            lead.notes,
+        ) == lead_state
+        assert (
+            candidate.discovery_status,
+            candidate.promoted_contact_id,
+            candidate.name,
+            candidate.title,
+            candidate.email,
+            candidate.phone,
+            candidate.deduplication_key,
+        ) == candidate_state
+        assert verification.scalar(select(func.count()).select_from(Contact)) == 1
+        assert verification.scalar(select(func.count()).select_from(Lead)) == 1
+        assert verification.scalar(select(func.count()).select_from(Task)) == 1
