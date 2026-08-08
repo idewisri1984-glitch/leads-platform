@@ -18,6 +18,7 @@ from app.modules.agent import (
     AgentCompanyApplyStaleHandoffError,
 )
 from app.modules.company_discovery.models import CompanyDiscoveryCandidateStatus
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 COMMAND = ["agent", "company-select", "apply"]
@@ -187,7 +188,8 @@ def test_additional_invalid_identifier_forms_are_rejected(value: str) -> None:
 def test_apply_help_is_successful_without_confirmation() -> None:
     result = runner.invoke(app, COMMAND + ["--help"])
     assert result.exit_code == 0
-    assert "--yes" in result.stdout
+    output = plain_cli_output(result.stdout)
+    assert "--yes" in output
 
 
 def test_unknown_option_is_rejected_before_executor(monkeypatch: pytest.MonkeyPatch) -> None:

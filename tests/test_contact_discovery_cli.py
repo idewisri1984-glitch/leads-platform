@@ -31,6 +31,7 @@ from app.modules.contact_discovery.service import (
 )
 from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
 from app.modules.project.models import Project
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 
@@ -206,10 +207,11 @@ def test_command_is_registered_with_required_safe_options_only() -> None:
     command = runner.invoke(main_app, ["contact-discovery", "run", "--help"])
     assert root.exit_code == command.exit_code == 0
     assert "contact-discovery" in root.output
+    output = plain_cli_output(command.output)
     for option in ("--company-id", "--persist", "--yes"):
-        assert option in command.output
+        assert option in output
     for forbidden in ("--website", "--limit", "--status", "--project-id", "--recent"):
-        assert forbidden not in command.output
+        assert forbidden not in output
 
 
 @pytest.mark.parametrize(
