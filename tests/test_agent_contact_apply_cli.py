@@ -17,6 +17,7 @@ from app.modules.agent import (
     AgentContactApplyStaleHandoffError,
 )
 from app.modules.contact_discovery.models import ContactDiscoveryCandidateStatus
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 COMMAND = ["agent", "contact-select", "apply"]
@@ -241,6 +242,7 @@ def test_invalid_values_are_rejected_without_transforming_input(option: str, val
 def test_help_is_valid_and_lists_required_contract() -> None:
     outcome = runner.invoke(app, COMMAND + ["--help"])
     assert outcome.exit_code == 0
+    output = plain_cli_output(outcome.stdout)
     for option in (
         "--project-id",
         "--company-id",
@@ -250,7 +252,7 @@ def test_help_is_valid_and_lists_required_contract() -> None:
         "--yes",
         "--output",
     ):
-        assert option in outcome.stdout
+        assert option in output
 
 
 def test_renderer_is_exact_strict_compact_and_unicode() -> None:
