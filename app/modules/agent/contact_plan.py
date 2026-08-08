@@ -20,6 +20,12 @@ from ..contact_discovery.service import (
     ContactDiscoveryRunResult,
     ContactDiscoveryService,
 )
+from .contact_plan_contract import (
+    build_contact_plan_proposals,
+)
+from .contact_plan_contract import (
+    normalize_contact_plan_text as _text,
+)
 from .contact_plan_handoff import (
     build_agent_contact_plan_handoff_token,
     canonicalize_handoff_datetime,
@@ -161,28 +167,10 @@ class _RankedCandidate:
     role_priority: int
 
 
-def _text(value: object, *, required: bool = False) -> str | None:
-    if value is None:
-        if required:
-            raise ValueError
-        return None
-    if type(value) is not str:
-        raise ValueError
-    value.encode("utf-8")
-    normalized = " ".join(value.split())
-    if required and not normalized:
-        raise ValueError
-    return normalized or None
-
-
 def _enum[T](enum_type: type[T], value: object) -> T:
     if isinstance(value, enum_type):
         return value
     return enum_type(value)  # type: ignore[call-arg]
-
-
-def _bounded(value: str, maximum: int) -> str:
-    return value if len(value) <= maximum else value[:maximum].rstrip()
 
 
 def _phrase_tokens(value: str) -> tuple[str, ...]:
@@ -581,16 +569,15 @@ class AgentContactPlanService:
                 handoff_token=None,
             )
         selected = eligible[0]
-        lead_title = _bounded(f"Bohemia Bali partnership — {company.name}", 255)
-        task_title = _bounded(f"Review and prepare outreach to {selected.name}", 255)
-        title_detail = f" with title {selected.title}" if selected.title else ""
-        fixed = (
-            "A human must verify this contact before any action. No outreach has been sent, "
-            "and no Lead or Task has been created. "
-            f"Selected person: {selected.name}{title_detail}. Company: {company.name}. "
-            "Prepare a personalized Bohemia Bali partnership message. Goal: "
+        proposals = build_contact_plan_proposals(
+            company_name=company.name,
+            candidate_name=selected.name,
+            candidate_title=selected.title,
+            goal=data.goal,
         )
-        description = _bounded(fixed + data.goal, 4000)
+        lead_title = proposals.lead_title
+        task_title = proposals.task_title
+        description = proposals.task_description
         try:
             handoff_token = build_agent_contact_plan_handoff_token(
                 project_id=data.project_id,

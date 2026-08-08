@@ -6,7 +6,7 @@ from typing import Any, Literal, Protocol, cast
 import typer
 from sqlalchemy.orm import Session
 
-from app.core.database.session import SessionLocal
+from app.cli._lazy_dependencies import SessionLocal
 from app.modules.company.repository import CompanyRepository
 from app.modules.company_discovery import (
     CompanyDiscoveryCandidateNotEligibleError,

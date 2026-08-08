@@ -2,7 +2,7 @@ from typing import Annotated
 
 import typer
 
-from app.core.database.session import SessionLocal
+from app.cli._lazy_dependencies import SessionLocal
 from app.modules.company_enrichment import (
     CompanyEnrichmentRepository,
     CompanyEnrichmentRunResult,

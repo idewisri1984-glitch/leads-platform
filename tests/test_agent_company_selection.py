@@ -164,6 +164,19 @@ def test_package_exports_are_exact() -> None:
         "AgentCompanySelectionRunNotFoundError",
         "AgentCompanySelectionRunNotReadyError",
         "AgentCompanySelectionService",
+        "AgentContactApplyConflictError",
+        "AgentContactApplyConfirmationRequiredError",
+        "AgentContactApplyConsistencyError",
+        "AgentContactApplyError",
+        "AgentContactApplyInput",
+        "AgentContactApplyInternalError",
+        "AgentContactApplyInvalidDataError",
+        "AgentContactApplyNotEligibleError",
+        "AgentContactApplyNotFoundError",
+        "AgentContactApplyPersistenceError",
+        "AgentContactApplyResult",
+        "AgentContactApplyService",
+        "AgentContactApplyStaleHandoffError",
     ]
     assert all(hasattr(agent_package, name) for name in agent_package.__all__)
     stage_2c_exports = agent_package.__all__[:13]

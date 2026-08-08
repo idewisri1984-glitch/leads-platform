@@ -3,7 +3,7 @@ from typing import Annotated, Never
 import typer
 from pydantic import ValidationError
 
-from app.core.database.session import SessionLocal
+from app.cli._lazy_dependencies import SessionLocal
 from app.modules.search_profile import (
     SearchProfileCreate,
     SearchProfileQueryGenerationError,

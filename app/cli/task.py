@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import typer
 from sqlalchemy.orm import Session
 
-from app.core.database.session import SessionLocal
+from app.cli._lazy_dependencies import SessionLocal
 from app.modules.lead import LeadRepository
 from app.modules.task import (
     LeadTaskCreationConsistencyError,

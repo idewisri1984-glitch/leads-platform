@@ -1,21 +1,27 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from sqlalchemy.orm import Session
 
+from app.cli._lazy_dependencies import SessionLocal
 from app.cli.contact_discovery_candidates import app as candidate_app
-from app.core.database.session import SessionLocal
 from app.modules.company.repository import CompanyRepository
 from app.modules.contact_discovery.models import ContactDiscoveryStatus
 from app.modules.contact_discovery.repository import ContactDiscoveryRepository
-from app.modules.contact_discovery.service import (
-    ContactDiscoveryProvider,
-    ContactDiscoveryRunResult,
-    ContactDiscoveryService,
-)
-from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProvider
+
+if TYPE_CHECKING:
+    from app.modules.contact_discovery.service import (
+        ContactDiscoveryProvider,
+        ContactDiscoveryRunResult,
+    )
+    from app.modules.contact_discovery.service import (
+        ContactDiscoveryService as ContactDiscoveryServiceType,
+    )
+
 
 _COMPANY_NOT_FOUND = "company_not_found"
 _COMPANY_WEBSITE_MISSING = "company_website_missing"
@@ -26,10 +32,29 @@ _MAX_DISPLAY_ERRORS = 20
 _MAX_DISPLAY_VALUE_LENGTH = 160
 
 SessionFactory = Callable[[], Session]
-ProviderFactory = Callable[[], ContactDiscoveryProvider]
+ProviderFactory = Callable[[], "ContactDiscoveryProvider"]
 ServiceFactory = Callable[
-    [ContactDiscoveryRepository, ContactDiscoveryProvider], ContactDiscoveryService
+    [ContactDiscoveryRepository, "ContactDiscoveryProvider"],
+    "ContactDiscoveryServiceType",
 ]
+
+
+def WebsiteContactDiscoveryProvider() -> ContactDiscoveryProvider:
+    from app.modules.contact_discovery.website_provider import (
+        WebsiteContactDiscoveryProvider as Provider,
+    )
+
+    return Provider()
+
+
+def ContactDiscoveryService(
+    repository: ContactDiscoveryRepository,
+    provider: ContactDiscoveryProvider,
+) -> ContactDiscoveryServiceType:
+    from app.modules.contact_discovery.service import ContactDiscoveryService as Service
+
+    return Service(repository, provider)
+
 
 app = typer.Typer(help="Contact discovery commands.")
 app.add_typer(candidate_app, name="candidate")
@@ -97,8 +122,13 @@ def execute_contact_discovery(
         )
 
     make_session = session_factory or SessionLocal
-    make_provider = provider_factory or WebsiteContactDiscoveryProvider
-    make_service = service_factory or ContactDiscoveryService
+    make_provider: ProviderFactory
+    if provider_factory is None:
+        make_provider = WebsiteContactDiscoveryProvider
+    else:
+        make_provider = provider_factory
+    make_service: ServiceFactory
+    make_service = ContactDiscoveryService if service_factory is None else service_factory
 
     try:
         session = make_session()

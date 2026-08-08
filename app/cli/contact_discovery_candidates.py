@@ -5,7 +5,7 @@ from typing import Literal
 import typer
 from sqlalchemy.orm import Session
 
-from app.core.database.session import SessionLocal
+from app.cli._lazy_dependencies import SessionLocal
 from app.modules.company.repository import CompanyRepository
 from app.modules.contact.repository import ContactRepository
 from app.modules.contact_discovery import (
