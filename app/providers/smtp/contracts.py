@@ -3,10 +3,11 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
-from app.modules.contact_discovery.normalization import normalize_discovered_email
-
 _STRICT = ConfigDict(frozen=True, extra="forbid", strict=True)
-_LOCAL_TEST_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_LOCAL_TEST_HOST = "127.0.0.1"
+_DOT_ATOM_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-/=?^_`{|}~."
+)
 
 
 class SMTPSecurityMode(StrEnum):
@@ -27,19 +28,42 @@ def _bounded_header(value: object, maximum: int, *, optional: bool = False) -> s
     return value
 
 
+def _is_dot_atom(value: str, *, maximum: int) -> bool:
+    return (
+        1 <= len(value) <= maximum
+        and value.isascii()
+        and not value.startswith(".")
+        and not value.endswith(".")
+        and ".." not in value
+        and all(character in _DOT_ATOM_CHARACTERS for character in value)
+    )
+
+
+def _is_domain(value: str, *, require_dot: bool) -> bool:
+    if not 1 <= len(value) <= 253 or not value.isascii():
+        return False
+    labels = value.split(".")
+    if require_dot and len(labels) < 2:
+        return False
+    return all(
+        1 <= len(label) <= 63
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in label)
+        for label in labels
+    )
+
+
 def _smtp_address(value: object) -> str:
+    """Validate the supported conservative ASCII SMTP mailbox subset."""
     header = _bounded_header(value, 254)
     assert header is not None
-    try:
-        normalized = normalize_discovered_email(header)
-    except (TypeError, ValueError):
-        normalized = None
-    if normalized is None or not normalized.isascii():
+    if header.count("@") != 1:
         raise ValueError("SMTP address is invalid.")
-    local_part, domain = normalized.rsplit("@", 1)
-    if len(local_part) > 64 or len(domain) > 253:
+    local_part, domain = header.split("@", 1)
+    if not _is_dot_atom(local_part, maximum=64) or not _is_domain(domain, require_dot=True):
         raise ValueError("SMTP address is invalid.")
-    return normalized
+    return header.casefold()
 
 
 class SMTPTransportConfig(BaseModel):
@@ -92,7 +116,7 @@ class SMTPTransportConfig(BaseModel):
         if (self.username is None) != (self.password is None):
             raise ValueError("SMTP credentials are incomplete.")
         if self.security_mode is SMTPSecurityMode.PLAINTEXT_LOCAL_TEST_ONLY and (
-            self.host not in _LOCAL_TEST_HOSTS or self.username is not None
+            self.host != _LOCAL_TEST_HOST or self.username is not None
         ):
             raise ValueError("Plaintext SMTP is restricted to unauthenticated local tests.")
         return self
@@ -161,13 +185,19 @@ class SMTPMessageEnvelope(BaseModel):
     @classmethod
     def validate_message_id(cls, value: object) -> str | None:
         message_id = _bounded_header(value, 255, optional=True)
-        if message_id is not None and (
-            not message_id.startswith("<")
-            or not message_id.endswith(">")
-            or message_id.count("@") != 1
-            or not message_id.isascii()
-        ):
-            raise ValueError("SMTP Message-ID is invalid.")
+        if message_id is not None:
+            if (
+                not message_id.startswith("<")
+                or not message_id.endswith(">")
+                or message_id.count("@") != 1
+                or not message_id.isascii()
+            ):
+                raise ValueError("SMTP Message-ID is invalid.")
+            local_part, domain = message_id[1:-1].split("@", 1)
+            if not _is_dot_atom(local_part, maximum=64) or not _is_domain(
+                domain, require_dot=False
+            ):
+                raise ValueError("SMTP Message-ID is invalid.")
         return message_id
 
     @field_validator("date", mode="before")
