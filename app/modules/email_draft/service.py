@@ -160,7 +160,7 @@ class EmailDraftService:
         except EmailDraftProviderError:
             raise EmailDraftGenerationError(_PROVIDER) from None
         result = self._validated_result(raw_result, data)
-        fresh_context = self._context(self._load_records(data))
+        fresh_context = self._context(self._load_records(data, populate_existing=True))
         fresh_fingerprint = build_context_fingerprint(fresh_context, data)
         if fresh_fingerprint != fingerprint:
             raise EmailDraftStaleContextError(_STALE)
@@ -228,7 +228,7 @@ class EmailDraftService:
             value_proposition=self._value_from_fingerprint(draft),
             prompt_version=draft.prompt_version,
         )
-        context = self._context(self._load_records(generation))
+        context = self._context(self._load_records(generation, populate_existing=True))
         if build_context_fingerprint(context, generation) != draft.context_fingerprint:
             raise EmailDraftStaleContextError(_STALE)
         now = datetime.now(UTC)
@@ -263,12 +263,14 @@ class EmailDraftService:
     def _value_from_fingerprint(draft: EmailDraft) -> str | None:
         return draft.generation_value_proposition
 
-    def _load_records(self, data: EmailDraftGenerationInput) -> EmailDraftSourceRecords:
-        project = self.session.get(Project, data.project_id)
-        company = self.session.get(Company, data.company_id)
-        contact = self.session.get(Contact, data.contact_id)
-        lead = self.session.get(Lead, data.lead_id)
-        task = self.session.get(Task, data.task_id)
+    def _load_records(
+        self, data: EmailDraftGenerationInput, *, populate_existing: bool = False
+    ) -> EmailDraftSourceRecords:
+        project = self.session.get(Project, data.project_id, populate_existing=populate_existing)
+        company = self.session.get(Company, data.company_id, populate_existing=populate_existing)
+        contact = self.session.get(Contact, data.contact_id, populate_existing=populate_existing)
+        lead = self.session.get(Lead, data.lead_id, populate_existing=populate_existing)
+        task = self.session.get(Task, data.task_id, populate_existing=populate_existing)
         if project is None or company is None or contact is None or lead is None or task is None:
             raise EmailDraftNotFoundError(_NOT_FOUND)
         if (
