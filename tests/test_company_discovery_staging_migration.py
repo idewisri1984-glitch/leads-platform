@@ -7,6 +7,7 @@ from pathlib import Path
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _RUN_TABLE = "company_discovery_runs"
 _CANDIDATE_TABLE = "company_discovery_candidates"
+_HEAD = "93dfda21cf4f"
 
 
 def alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -75,18 +76,18 @@ def test_f7b_migration_upgrade_downgrade_and_reupgrade(tmp_path: Path) -> None:
 
     alembic(database, "upgrade", "head")
     assert {_RUN_TABLE, _CANDIDATE_TABLE} <= table_names(database)
-    assert current_revision(database) == "9d6e7f8091a2"
+    assert current_revision(database) == _HEAD
     _assert_direct_sql_defaults(database)
 
 
 def test_full_migration_round_trip(tmp_path: Path) -> None:
     database = tmp_path / "f7b-full-round-trip.sqlite"
     alembic(database, "upgrade", "head")
-    assert current_revision(database) == "9d6e7f8091a2"
+    assert current_revision(database) == _HEAD
     alembic(database, "downgrade", "base")
     assert table_names(database) <= {"alembic_version"}
     alembic(database, "upgrade", "head")
-    assert current_revision(database) == "9d6e7f8091a2"
+    assert current_revision(database) == _HEAD
     assert {_RUN_TABLE, _CANDIDATE_TABLE} <= table_names(database)
 
 

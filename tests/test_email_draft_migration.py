@@ -6,6 +6,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 _REVISION = "9d6e7f8091a2"
+_HEAD = "93dfda21cf4f"
 
 
 def alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -58,5 +59,5 @@ def test_email_draft_migration_round_trip(tmp_path: Path) -> None:
             is None
         )
     alembic(database, "upgrade", "head")
-    assert revision(database) == _REVISION
+    assert revision(database) == _HEAD
     alembic(database, "check")
