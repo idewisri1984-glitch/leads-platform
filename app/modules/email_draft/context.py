@@ -14,8 +14,12 @@ from .schemas import (
 )
 
 EMAIL_DRAFT_PROMPT_VERSION = "email-outreach-draft-v1"
-_TAG = re.compile(r"<[^>]*>")
+_TAG = re.compile(r"<!--.*?-->|<\s*/?\s*[A-Za-z][^>]*>", re.DOTALL)
+_DANGEROUS_MARKUP = re.compile(
+    r"<\s*/?\s*(?:script|style|form|iframe)\b[^>]*>?", re.IGNORECASE | re.DOTALL
+)
 _SPACE = re.compile(r"[ \t\f\v]+")
+_ENTITY_DECODE_LIMIT = 2
 
 
 class EmailDraftContextError(ValueError):
@@ -36,7 +40,14 @@ def sanitize_context_data(value: object, maximum: int) -> str | None:
         return None
     if type(value) is not str:
         raise EmailDraftContextError("Email draft context is invalid.")
-    text = html.unescape(_TAG.sub(" ", value))
+    text = value
+    for _ in range(_ENTITY_DECODE_LIMIT):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    text = _DANGEROUS_MARKUP.sub(" ", text)
+    text = _TAG.sub(" ", text)
     text = "\n".join(_SPACE.sub(" ", line).strip() for line in text.splitlines()).strip()
     text = "\n".join(line for line in text.splitlines() if line)
     if not text:
