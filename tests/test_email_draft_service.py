@@ -127,6 +127,29 @@ def generation(ids: tuple[int, ...], **changes: object) -> EmailDraftGenerationI
     return EmailDraftGenerationInput(**values)
 
 
+def provider_request(session: Session, ids: tuple[int, ...]) -> EmailDraftProviderRequest:
+    context = build_email_personalization_context(
+        EmailDraftSourceRecords(
+            session.get(Project, ids[0]),
+            session.get(Company, ids[1]),
+            session.get(Contact, ids[2]),
+            session.get(Lead, ids[3]),
+            session.get(Task, ids[4]),
+        )
+    )
+    data = generation(ids)
+    return EmailDraftProviderRequest(
+        context=context,
+        sender_name=data.sender_name,
+        sender_company=data.sender_company,
+        language=data.language,
+        tone=data.tone,
+        purpose=data.purpose,
+        value_proposition=data.value_proposition,
+        prompt_version=data.prompt_version,
+    )
+
+
 def service(session: Session, generator: object | None = None) -> EmailDraftService:
     return EmailDraftService(
         session=session,
@@ -162,6 +185,60 @@ def test_context_is_minimized_sanitized_unicode_and_deterministic(session: Sessi
     first = build_context_fingerprint(context, generation(ids))
     second = build_context_fingerprint(context, generation(ids))
     assert first == second and len(first) == 64
+
+
+def test_fake_provider_uses_available_operational_personalization(session: Session) -> None:
+    ids = seed(session)
+    result = FakeEmailDraftGenerator().generate(provider_request(session, ids))
+    assert "Founder at Meyer & Co" in result.text_body
+    assert "Meyer & Co operates in Design in Ubud, Indonesia" in result.text_body
+    assert "Prepare thoughtful outreach" in result.text_body
+    assert "Use supplied business context only." in result.text_body
+    assert "Introduce a relevant workflow improvement" in result.text_body
+    assert "We help design teams qualify opportunities efficiently." in result.text_body
+    assert "Alex from Bali Leads" in result.text_body
+
+
+def test_fake_provider_task_context_materially_changes_body(session: Session) -> None:
+    ids = seed(session)
+    request = provider_request(session, ids)
+    changed = request.model_copy(
+        update={
+            "context": request.context.model_copy(
+                update={"task_description_data": "Focus on sustainable sourcing criteria."}
+            )
+        }
+    )
+    generator = FakeEmailDraftGenerator()
+    original_result = generator.generate(request)
+    changed_result = generator.generate(changed)
+    assert "Use supplied business context only." in original_result.text_body
+    assert "Focus on sustainable sourcing criteria." in changed_result.text_body
+    assert original_result.text_body != changed_result.text_body
+
+
+def test_fake_provider_is_deterministic(session: Session) -> None:
+    ids = seed(session)
+    request = provider_request(session, ids)
+    generator = FakeEmailDraftGenerator()
+    first = generator.generate(request)
+    second = generator.generate(request)
+    assert (first.subject, first.text_body) == (second.subject, second.text_body)
+
+
+def test_fake_provider_does_not_fabricate_relationships(session: Session) -> None:
+    ids = seed(session)
+    body = FakeEmailDraftGenerator().generate(provider_request(session, ids)).text_body.lower()
+    for unsupported_claim in (
+        "we spoke",
+        "following our meeting",
+        "previous meeting",
+        "your upcoming project",
+        "your budget",
+        "your timeline",
+        "referred",
+    ):
+        assert unsupported_claim not in body
 
 
 @pytest.mark.parametrize("email", [None, "", "x", "ada @example.com"])

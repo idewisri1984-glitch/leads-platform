@@ -1,4 +1,5 @@
 import json
+import smtplib
 from collections.abc import Iterator
 
 import pytest
@@ -34,13 +35,22 @@ def seed(factory: sessionmaker[Session]) -> tuple[int, ...]:
         project = Project(name="Project")
         session.add(project)
         session.flush()
-        company = Company(project_id=project.id, name="Company", status="NEW")
+        company = Company(
+            project_id=project.id,
+            name="Pacific Design Atelier",
+            city="Los Angeles",
+            country="United States",
+            industry="Interior Design",
+            status="NEW",
+        )
         session.add(company)
         session.flush()
         contact = Contact(
             company_id=company.id,
-            first_name="Ada",
-            email="ada@example.com",
+            first_name="Jordan",
+            last_name="Lee",
+            job_title="Purchasing Director",
+            email="jordan@example.com",
             status="NEW",
         )
         session.add(contact)
@@ -48,7 +58,12 @@ def seed(factory: sessionmaker[Session]) -> tuple[int, ...]:
         lead = Lead(company_id=company.id, contact_id=contact.id, status="NEW")
         session.add(lead)
         session.flush()
-        task = Task(lead_id=lead.id, title="Outreach", status="TODO")
+        task = Task(
+            lead_id=lead.id,
+            title="Explore a responsible sourcing fit",
+            description="Discuss whether the collection supports future interior sourcing needs.",
+            status="TODO",
+        )
         session.add(task)
         session.commit()
         return project.id, company.id, contact.id, lead.id, task.id
@@ -101,11 +116,29 @@ def test_help_registration_and_missing_confirmation_precede_executor(
     assert calls == 0
 
 
-def test_public_offline_generate_show_approve_flow(
-    monkeypatch: pytest.MonkeyPatch, factory: sessionmaker[Session]
+@pytest.mark.parametrize(
+    ("action", "expected_status", "timestamp_field", "other_timestamp"),
+    [
+        ("approve", "APPROVED", "approved_at", "rejected_at"),
+        ("reject", "REJECTED", "rejected_at", "approved_at"),
+    ],
+)
+def test_public_offline_generate_show_review_flow_has_canonical_timestamps_and_no_smtp(
+    monkeypatch: pytest.MonkeyPatch,
+    factory: sessionmaker[Session],
+    action: str,
+    expected_status: str,
+    timestamp_field: str,
+    other_timestamp: str,
 ) -> None:
     ids = seed(factory)
     fake = FakeEmailDraftGenerator()
+
+    def forbidden_smtp(*args: object, **kwargs: object) -> object:
+        raise AssertionError("Email draft operations must not construct SMTP clients.")
+
+    monkeypatch.setattr(smtplib, "SMTP", forbidden_smtp)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", forbidden_smtp)
     original_generate = cli.execute_generate
     original_show = cli.execute_show
     original_review = cli.execute_review
@@ -138,11 +171,14 @@ def test_public_offline_generate_show_approve_flow(
             "--task-id",
             str(ids[4]),
             "--sender-name",
-            "Alex",
+            "Maya",
             "--sender-company",
-            "Bali Leads",
+            "Bohemia Bali",
             "--purpose",
-            "Discuss workflow",
+            "initial B2B outreach",
+            "--value-proposition",
+            "Handcrafted natural-stone and solid-wood furniture made in Bali for "
+            "international interior projects.",
             "--output",
             "json",
         ],
@@ -150,18 +186,49 @@ def test_public_offline_generate_show_approve_flow(
     assert generate.exit_code == 0, generate.output
     payload = json.loads(generate.stdout)
     assert payload["status"] == "DRAFT"
+    assert payload["generated_at"].endswith("Z")
+    assert "Jordan Lee" in payload["text_body"]
+    assert "Purchasing Director" in payload["text_body"]
+    assert "Pacific Design Atelier" in payload["text_body"]
+    assert "Interior Design" in payload["text_body"]
+    assert "Los Angeles, United States" in payload["text_body"]
+    assert "Explore a responsible sourcing fit" in payload["text_body"]
+    assert "supports future interior sourcing needs" in payload["text_body"]
+    assert "Handcrafted natural-stone and solid-wood furniture" in payload["text_body"]
     draft_id = payload["id"]
     show = runner.invoke(
-        app,
-        ["agent", "email-draft", "show", *base(ids), "--draft-id", str(draft_id)],
-    )
-    assert show.exit_code == 0 and 'status="DRAFT"' in show.stdout
-    approve = runner.invoke(
         app,
         [
             "agent",
             "email-draft",
-            "approve",
+            "show",
+            *base(ids),
+            "--draft-id",
+            str(draft_id),
+            "--output",
+            "json",
+        ],
+    )
+    assert show.exit_code == 0, show.output
+    shown_payload = json.loads(show.stdout)
+    for field in (
+        "id",
+        "recipient_email",
+        "subject",
+        "text_body",
+        "prompt_version",
+        "context_fingerprint",
+        "content_hash",
+        "status",
+        "generated_at",
+    ):
+        assert shown_payload[field] == payload[field]
+    review_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "email-draft",
+            action,
             *base(ids),
             "--draft-id",
             str(draft_id),
@@ -170,8 +237,30 @@ def test_public_offline_generate_show_approve_flow(
             "json",
         ],
     )
-    assert approve.exit_code == 0, approve.output
-    assert json.loads(approve.stdout)["status"] == "APPROVED"
+    assert review_result.exit_code == 0, review_result.output
+    reviewed_payload = json.loads(review_result.stdout)
+    assert reviewed_payload["status"] == expected_status
+    assert reviewed_payload[timestamp_field].endswith("Z")
+    assert reviewed_payload["reviewed_at"].endswith("Z")
+    assert reviewed_payload[other_timestamp] is None
+    reviewed_show = runner.invoke(
+        app,
+        [
+            "agent",
+            "email-draft",
+            "show",
+            *base(ids),
+            "--draft-id",
+            str(draft_id),
+            "--output",
+            "json",
+        ],
+    )
+    assert reviewed_show.exit_code == 0, reviewed_show.output
+    reviewed_show_payload = json.loads(reviewed_show.stdout)
+    assert reviewed_show_payload["generated_at"] == reviewed_payload["generated_at"]
+    assert reviewed_show_payload["reviewed_at"] == reviewed_payload["reviewed_at"]
+    assert reviewed_show_payload[timestamp_field] == reviewed_payload[timestamp_field]
     assert len(fake.calls) == 1
 
 
