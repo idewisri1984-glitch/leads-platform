@@ -7,6 +7,7 @@ from pathlib import Path
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _TABLE = "contact_discovery_candidates"
 _REVISION = "8c5d6e7f8091"
+_HEAD = "9d6e7f8091a2"
 
 
 def alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -116,6 +117,6 @@ def test_contact_candidate_promotion_link_round_trip(tmp_path: Path) -> None:
         ).fetchone() == ("Grace",)
 
     alembic(database, "upgrade", "head")
-    assert revision(database) == _REVISION
+    assert revision(database) == _HEAD
     assert candidate_columns(database)["promoted_contact_id"][3] == 0
     alembic(database, "check")

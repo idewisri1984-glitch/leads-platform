@@ -14,6 +14,7 @@ from typer._click.exceptions import UsageError
 from typer.core import TyperCommand
 
 from app.cli._lazy_dependencies import SessionLocal
+from app.cli.email_draft import app as email_draft_app
 from app.modules.agent.company_apply import (
     AgentCompanyApplyConfirmationRequiredError,
     AgentCompanyApplyConflictError,
@@ -129,6 +130,7 @@ company_select_app = typer.Typer(help="Company-selection planning commands.")
 app.add_typer(company_select_app, name="company-select")
 contact_select_app = typer.Typer(help="Contact-selection planning commands.")
 app.add_typer(contact_select_app, name="contact-select")
+app.add_typer(email_draft_app, name="email-draft")
 
 _CONTACT_INVALID = "Agent contact plan data is invalid."
 _CONTACT_INTERNAL = "Agent contact plan failed."
