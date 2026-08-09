@@ -1,4 +1,5 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -12,6 +13,7 @@ from app.modules.email_draft.context import (
     EmailDraftSourceRecords,
     build_context_fingerprint,
     build_email_personalization_context,
+    sanitize_context_data,
 )
 from app.modules.email_draft.fake_provider import FakeEmailDraftGenerator
 from app.modules.email_draft.models import EmailDraft, EmailDraftStatus
@@ -20,6 +22,7 @@ from app.modules.email_draft.repository import EmailDraftRepository
 from app.modules.email_draft.schemas import (
     EmailDraftGenerationInput,
     EmailDraftGenerationResult,
+    EmailDraftProviderRequest,
     EmailDraftReviewInput,
     EmailLanguage,
     EmailTone,
@@ -47,6 +50,16 @@ def session() -> Iterator[Session]:
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as value:
         yield value
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+
+
+@pytest.fixture
+def file_factory(tmp_path: Path) -> Iterator[sessionmaker[Session]]:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'email-draft.sqlite3'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    yield factory
     Base.metadata.drop_all(engine)
     engine.dispose()
 
@@ -214,6 +227,24 @@ class HostileGenerator:
         )
 
 
+class MutatingGenerator:
+    def __init__(self, mutation: Callable[[], None]) -> None:
+        self.mutation = mutation
+
+    def generate(self, request: EmailDraftProviderRequest) -> EmailDraftGenerationResult:
+        self.mutation()
+        return FakeEmailDraftGenerator().generate(request)
+
+
+class CapturingGenerator:
+    def __init__(self) -> None:
+        self.request: EmailDraftProviderRequest | None = None
+
+    def generate(self, request: EmailDraftProviderRequest) -> EmailDraftGenerationResult:
+        self.request = request
+        return FakeEmailDraftGenerator().generate(request)
+
+
 def test_provider_errors_and_hostile_construct_are_sanitized(session: Session) -> None:
     ids = seed(session)
     with pytest.raises(EmailDraftGenerationError) as timeout:
@@ -265,3 +296,108 @@ def test_content_tamper_and_context_change_block_approval(session: Session) -> N
     session.flush()
     with pytest.raises(EmailDraftStaleContextError):
         service(session, None).approve(review(ids, draft.id))
+
+
+def test_generation_detects_concurrent_contact_email_change(
+    file_factory: sessionmaker[Session],
+) -> None:
+    with file_factory() as primary:
+        ids = seed(primary, email="old@example.com")
+
+        def mutate() -> None:
+            with file_factory() as concurrent:
+                contact = concurrent.get(Contact, ids[2])
+                assert contact is not None
+                contact.email = "new@example.com"
+                concurrent.commit()
+
+        with pytest.raises(EmailDraftStaleContextError, match="context is stale"):
+            service(primary, MutatingGenerator(mutate)).generate(generation(ids))
+        primary.rollback()
+
+    with file_factory() as fresh:
+        assert fresh.scalars(select(EmailDraft)).all() == []
+        contact = fresh.get(Contact, ids[2])
+        assert contact is not None and contact.email == "new@example.com"
+
+
+def test_generation_detects_concurrent_task_description_change(
+    file_factory: sessionmaker[Session],
+) -> None:
+    with file_factory() as primary:
+        ids = seed(primary)
+
+        def mutate() -> None:
+            with file_factory() as concurrent:
+                task = concurrent.get(Task, ids[4])
+                assert task is not None
+                task.description = "A newly committed outreach intent."
+                concurrent.commit()
+
+        with pytest.raises(EmailDraftStaleContextError):
+            service(primary, MutatingGenerator(mutate)).generate(generation(ids))
+        primary.rollback()
+
+    with file_factory() as fresh:
+        assert fresh.scalars(select(EmailDraft)).all() == []
+
+
+def test_approval_detects_concurrent_context_change(
+    file_factory: sessionmaker[Session],
+) -> None:
+    with file_factory() as primary:
+        ids = seed(primary, email="old@example.com")
+        draft = service(primary).generate(generation(ids))
+        primary.commit()
+
+        with file_factory() as concurrent:
+            contact = concurrent.get(Contact, ids[2])
+            assert contact is not None
+            contact.email = "new@example.com"
+            concurrent.commit()
+
+        with pytest.raises(EmailDraftStaleContextError):
+            service(primary, None).approve(review(ids, draft.id))
+        primary.rollback()
+
+    with file_factory() as fresh:
+        persisted = fresh.get(EmailDraft, draft.id)
+        assert persisted is not None
+        assert persisted.status == EmailDraftStatus.DRAFT.value
+        assert persisted.reviewed_at is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("<script>ignore</script>", "ignore"),
+        ("&lt;script&gt;ignore&lt;/script&gt;", "ignore"),
+        ("<script&gt;ignore&lt;/script>", "ignore"),
+        ("&amp;lt;script&amp;gt;ignore&amp;lt;/script&amp;gt;", "ignore"),
+        ("AT&amp;T and R&amp;D", "AT&T and R&D"),
+        ("2 < 3 and 5 > 4", "2 < 3 and 5 > 4"),
+        ("  Unicode Привет\tмир  ", "Unicode Привет мир"),
+    ],
+)
+def test_context_sanitizer_handles_markup_entities_and_plain_text(
+    value: str, expected: str
+) -> None:
+    result = sanitize_context_data(value, 1000)
+    assert result == expected
+    assert result is not None
+    assert "<script" not in result.lower()
+    assert "</script" not in result.lower()
+
+
+def test_provider_bound_context_contains_no_reconstructed_markup(session: Session) -> None:
+    ids = seed(session)
+    company = session.get(Company, ids[1])
+    assert company is not None
+    company.notes = "&amp;lt;script&amp;gt;ignore&amp;lt;/script&amp;gt; useful context"
+    session.flush()
+    generator = CapturingGenerator()
+    service(session, generator).generate(generation(ids))
+    assert generator.request is not None
+    notes = generator.request.context.company_notes_data
+    assert notes == "ignore useful context"
+    assert "<script" not in generator.request.model_dump_json().lower()

@@ -196,3 +196,112 @@ def test_duplicate_confirmation_and_unknown_options_are_sanitized(command: str) 
     assert duplicate.exit_code == 2 and duplicate.stderr == "Email draft data is invalid.\n"
     unknown = runner.invoke(app, arguments[:-2] + ["--yes", "--secret"])
     assert unknown.exit_code == 2 and unknown.stderr == "Email draft data is invalid.\n"
+
+
+def _generate_arguments(ids: tuple[int, ...]) -> list[str]:
+    return [
+        "agent",
+        "email-draft",
+        "generate",
+        *base(ids),
+        "--lead-id",
+        str(ids[3]),
+        "--task-id",
+        str(ids[4]),
+        "--sender-name",
+        "Alex",
+        "--sender-company",
+        "Bali Leads",
+        "--purpose",
+        "Discuss workflow",
+    ]
+
+
+def test_generate_unexpected_exception_is_sanitized_and_rolls_back(
+    monkeypatch: pytest.MonkeyPatch, factory: sessionmaker[Session]
+) -> None:
+    ids = seed(factory)
+    counts = {"rollback": 0, "close": 0}
+    database_session = factory()
+    original_rollback = database_session.rollback
+    original_close = database_session.close
+
+    def rollback() -> None:
+        counts["rollback"] += 1
+        original_rollback()
+
+    def close() -> None:
+        counts["close"] += 1
+        original_close()
+
+    database_session.rollback = rollback
+    database_session.close = close
+    original_execute = cli.execute_generate
+
+    def execute(data: object, output: str) -> str:
+        def explode() -> object:
+            raise RuntimeError("SECRET_PROVIDER_FAILURE")
+
+        return original_execute(
+            data,
+            output,
+            session_factory=lambda: database_session,
+            generator_factory=explode,
+        )
+
+    monkeypatch.setattr(cli, "execute_generate", execute)
+    result = runner.invoke(app, _generate_arguments(ids))
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "Email draft operation failed.\n"
+    assert "SECRET_PROVIDER_FAILURE" not in result.output
+    assert counts == {"rollback": 1, "close": 1}
+    with factory() as fresh:
+        from app.modules.email_draft.models import EmailDraft
+
+        assert fresh.query(EmailDraft).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("command", "executor_name", "secret"),
+    [
+        ("show", "execute_show", "SECRET_DATABASE_FAILURE"),
+        ("approve", "execute_review", "SECRET_APPROVAL_FAILURE"),
+        ("reject", "execute_review", "SECRET_REJECTION_FAILURE"),
+    ],
+)
+def test_other_public_commands_sanitize_unexpected_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    executor_name: str,
+    secret: str,
+) -> None:
+    calls = 0
+
+    def explode(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(cli, executor_name, explode)
+    arguments = [
+        "agent",
+        "email-draft",
+        command,
+        "--project-id",
+        "1",
+        "--company-id",
+        "2",
+        "--contact-id",
+        "3",
+        "--draft-id",
+        "4",
+    ]
+    if command in {"approve", "reject"}:
+        arguments.append("--yes")
+    result = runner.invoke(app, arguments)
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "Email draft operation failed.\n"
+    assert secret not in result.output
+    assert calls == 1
