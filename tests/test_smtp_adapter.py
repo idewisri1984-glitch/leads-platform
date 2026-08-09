@@ -133,9 +133,32 @@ def test_starttls_order_auth_and_verified_context() -> None:
 
 
 def test_implicit_tls_never_calls_starttls() -> None:
-    connection = RecordingSMTP()
-    client(connection, mode=SMTPSecurityMode.TLS_IMPLICIT).send(envelope())
-    assert connection.events == ["ehlo", "login", "send", "quit"]
+    plain_connection = RecordingSMTP()
+    secure_connection = RecordingSMTP()
+    factory_events: list[str] = []
+
+    def smtp_factory(host: str, port: int, timeout: float) -> RecordingSMTP:
+        factory_events.append("SMTP_FACTORY")
+        return plain_connection
+
+    def smtp_ssl_factory(
+        host: str, port: int, timeout: float, context: ssl.SSLContext
+    ) -> RecordingSMTP:
+        assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
+        factory_events.append("SMTP_SSL_FACTORY")
+        return secure_connection
+
+    transport = SMTPClient(
+        config(SMTPSecurityMode.TLS_IMPLICIT),
+        smtp_factory=smtp_factory,
+        smtp_ssl_factory=smtp_ssl_factory,
+    )
+    transport.send(envelope())
+    assert factory_events == ["SMTP_SSL_FACTORY"]
+    assert plain_connection.events == []
+    assert secure_connection.events == ["ehlo", "login", "send", "quit"]
+    assert secure_connection.events.count("starttls") == 0
+    assert secure_connection.events.count("send") == 1
 
 
 def test_starttls_is_required_and_unverified_context_is_rejected() -> None:
