@@ -305,7 +305,7 @@ def generate(
             prompt_version=EMAIL_DRAFT_PROMPT_VERSION,
         )
         rendered = execute_generate(data, _output(output))
-    except (ValidationError, ValueError) as error:
+    except Exception as error:
         _handle_error(error)
     typer.echo(rendered)
 
@@ -332,7 +332,7 @@ def show(
             EmailDraftScopeInput(**_scope(project_id, company_id, contact_id, draft_id)),
             _output(output),
         )
-    except (ValidationError, ValueError) as error:
+    except Exception as error:
         _handle_error(error)
     typer.echo(rendered)
 
@@ -353,7 +353,7 @@ def _review_command(
             **_scope(project_id, company_id, contact_id, draft_id), confirmed=True
         )
         rendered = execute_review(data, action, _output(output))
-    except (ValidationError, ValueError) as error:
+    except Exception as error:
         _handle_error(error)
     typer.echo(rendered)
 
