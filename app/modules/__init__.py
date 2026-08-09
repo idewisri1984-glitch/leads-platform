@@ -8,6 +8,7 @@ from app.modules.company_discovery import models as _company_discovery_models  #
 from app.modules.company_enrichment import models as _company_enrichment_models  # noqa: F401
 from app.modules.contact import models as _contact_models  # noqa: F401
 from app.modules.contact_discovery import models as _contact_discovery_models  # noqa: F401
+from app.modules.email_draft import models as _email_draft_models  # noqa: F401
 from app.modules.lead import models as _lead_models  # noqa: F401
 from app.modules.project import models as _project_models  # noqa: F401
 from app.modules.search_profile import models as _search_profile_models  # noqa: F401
