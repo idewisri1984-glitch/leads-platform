@@ -139,6 +139,14 @@ class EmailDeliveryAttempt(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+    row_version: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        server_default="1",
+        nullable=False,
+    )
+
+    __mapper_args__ = {"version_id_col": row_version}
 
 
 _IMMUTABLE_IDENTITY_FIELDS = (

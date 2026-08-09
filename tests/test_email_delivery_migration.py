@@ -8,6 +8,8 @@ from sqlalchemy import create_engine, inspect
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PREVIOUS_REVISION = "9d6e7f8091a2"
+_REVISION = "93dfda21cf4f"
+_HEAD = "a41bc92d7e60"
 
 
 def _alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -34,9 +36,16 @@ def _revision(database: Path) -> str:
 def test_email_delivery_attempt_migration_round_trip(tmp_path: Path) -> None:
     database = tmp_path / "email-delivery-migration.sqlite3"
     _alembic(database, "upgrade", _PREVIOUS_REVISION)
-    _alembic(database, "upgrade", "head")
-    head = _revision(database)
-    assert head != _PREVIOUS_REVISION
+    _alembic(database, "upgrade", _REVISION)
+    assert _revision(database) == _REVISION
+    with sqlite3.connect(database) as connection:
+        original_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info('email_delivery_attempts')")
+        }
+    assert "row_version" not in original_columns
+
+    _alembic(database, "upgrade", _HEAD)
+    assert _revision(database) == _HEAD
 
     engine = create_engine(f"sqlite+pysqlite:///{database}")
     inspector = inspect(engine)
@@ -63,7 +72,15 @@ def test_email_delivery_attempt_migration_round_trip(tmp_path: Path) -> None:
         "accepted_at",
         "unknown_at",
         "updated_at",
+        "row_version",
     }
+    row_version = next(
+        column
+        for column in inspector.get_columns("email_delivery_attempts")
+        if column["name"] == "row_version"
+    )
+    assert row_version["nullable"] is False
+    assert str(row_version["default"]).strip("'()") == "1"
     unique_names = {
         item["name"] for item in inspector.get_unique_constraints("email_delivery_attempts")
     }
@@ -93,15 +110,14 @@ def test_email_delivery_attempt_migration_round_trip(tmp_path: Path) -> None:
     assert foreign_key[0]["options"] == {"ondelete": "RESTRICT"}
     engine.dispose()
 
-    _alembic(database, "downgrade", _PREVIOUS_REVISION)
+    _alembic(database, "downgrade", _REVISION)
     with sqlite3.connect(database) as connection:
-        tables = {
-            row[0]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        downgraded_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info('email_delivery_attempts')")
         }
-    assert "email_delivery_attempts" not in tables
-    assert "email_drafts" in tables
+    assert "row_version" not in downgraded_columns
+    assert "outcome" in downgraded_columns
 
-    _alembic(database, "upgrade", "head")
-    assert _revision(database) == head
+    _alembic(database, "upgrade", _HEAD)
+    assert _revision(database) == _HEAD
     _alembic(database, "check")

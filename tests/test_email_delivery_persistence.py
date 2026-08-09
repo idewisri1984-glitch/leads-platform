@@ -1,6 +1,8 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from queue import Queue
+from threading import Barrier, Event, Thread
 
 import pytest
 from pydantic import ValidationError
@@ -8,6 +10,7 @@ from sqlalchemy import create_engine, event, func, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.database.base import Base
 from app.modules.company.models import Company
@@ -152,6 +155,22 @@ def _outcome_marker(outcome: EmailDeliveryOutcome) -> str:
         EmailDeliveryOutcome.PERMANENT_FAILURE: "c",
         EmailDeliveryOutcome.UNKNOWN: "d",
     }[outcome]
+
+
+def _apply_direct_outcome(
+    attempt: EmailDeliveryAttempt,
+    update_data: EmailDeliveryAttemptOutcomeUpdate,
+) -> None:
+    attempt.outcome = update_data.outcome.value
+    attempt.smtp_classification = (
+        None if update_data.smtp_classification is None else update_data.smtp_classification.value
+    )
+    attempt.smtp_code = update_data.smtp_code
+    attempt.error_category = update_data.error_category
+    attempt.completed_at = update_data.completed_at
+    attempt.accepted_at = update_data.accepted_at
+    attempt.unknown_at = update_data.unknown_at
+    attempt.updated_at = update_data.completed_at
 
 
 def test_reserved_attempt_persists_and_hydrates_from_fresh_session(
@@ -444,3 +463,188 @@ def test_datetime_is_normalized_before_sqlite_and_serialized_as_utc_z(
         values = EmailDeliveryAttemptRead.model_validate(persisted).model_dump(mode="json")
         assert values["created_at"] == "2026-08-09T12:00:00Z"
         assert values["updated_at"] == "2026-08-09T12:00:00Z"
+
+
+@pytest.mark.parametrize(
+    ("winner", "stale_replacement"),
+    [
+        (EmailDeliveryOutcome.ACCEPTED, EmailDeliveryOutcome.UNKNOWN),
+        (
+            EmailDeliveryOutcome.TRANSIENT_FAILURE,
+            EmailDeliveryOutcome.PERMANENT_FAILURE,
+        ),
+        (EmailDeliveryOutcome.PERMANENT_FAILURE, EmailDeliveryOutcome.ACCEPTED),
+        (EmailDeliveryOutcome.UNKNOWN, EmailDeliveryOutcome.TRANSIENT_FAILURE),
+    ],
+)
+def test_stale_direct_orm_write_cannot_overwrite_terminal_outcome(
+    factory: sessionmaker[Session],
+    winner: EmailDeliveryOutcome,
+    stale_replacement: EmailDeliveryOutcome,
+) -> None:
+    with factory() as seed:
+        draft = _draft(seed, f"stale-{winner.value}")
+        attempt = EmailDeliveryAttemptRepository(seed).reserve(
+            _create(draft.id, _outcome_marker(winner))
+        )
+        seed.commit()
+        attempt_id = attempt.id
+
+    first = factory()
+    stale = factory()
+    try:
+        first_attempt = first.get(EmailDeliveryAttempt, attempt_id)
+        stale_attempt = stale.get(EmailDeliveryAttempt, attempt_id)
+        assert first_attempt is not None
+        assert stale_attempt is not None
+        assert first_attempt.outcome == EmailDeliveryOutcome.RESERVED.value
+        assert stale_attempt.outcome == EmailDeliveryOutcome.RESERVED.value
+
+        _apply_direct_outcome(first_attempt, _terminal(winner))
+        first.commit()
+        _apply_direct_outcome(stale_attempt, _terminal(stale_replacement))
+        with pytest.raises(StaleDataError):
+            stale.commit()
+        stale.rollback()
+    finally:
+        first.close()
+        stale.close()
+
+    with factory() as check:
+        persisted = check.get(EmailDeliveryAttempt, attempt_id)
+        assert persisted is not None
+        assert persisted.outcome == winner.value
+
+
+def test_stale_same_outcome_direct_orm_write_is_rejected(
+    factory: sessionmaker[Session],
+) -> None:
+    with factory() as seed:
+        draft = _draft(seed, "stale-same-outcome")
+        attempt = EmailDeliveryAttemptRepository(seed).reserve(_create(draft.id, "a"))
+        seed.commit()
+        attempt_id = attempt.id
+
+    first = factory()
+    stale = factory()
+    try:
+        first_attempt = first.get(EmailDeliveryAttempt, attempt_id)
+        stale_attempt = stale.get(EmailDeliveryAttempt, attempt_id)
+        assert first_attempt is not None
+        assert stale_attempt is not None
+        _apply_direct_outcome(first_attempt, _terminal(EmailDeliveryOutcome.ACCEPTED))
+        first.commit()
+        stale_update = _terminal(EmailDeliveryOutcome.ACCEPTED).model_copy(
+            update={"smtp_code": 251}
+        )
+        _apply_direct_outcome(stale_attempt, stale_update)
+        with pytest.raises(StaleDataError):
+            stale.commit()
+        stale.rollback()
+    finally:
+        first.close()
+        stale.close()
+
+    with factory() as check:
+        persisted = check.get(EmailDeliveryAttempt, attempt_id)
+        assert persisted is not None
+        assert persisted.outcome == EmailDeliveryOutcome.ACCEPTED.value
+        assert persisted.smtp_code == 250
+
+
+def test_repository_rejects_stale_terminal_transition(
+    factory: sessionmaker[Session],
+) -> None:
+    with factory() as seed:
+        draft = _draft(seed, "stale-repository")
+        attempt = EmailDeliveryAttemptRepository(seed).reserve(_create(draft.id, "a"))
+        seed.commit()
+        attempt_id = attempt.id
+
+    first = factory()
+    stale = factory()
+    try:
+        assert first.get(EmailDeliveryAttempt, attempt_id).outcome == "RESERVED"
+        assert stale.get(EmailDeliveryAttempt, attempt_id).outcome == "RESERVED"
+        EmailDeliveryAttemptRepository(first).transition(
+            attempt_id,
+            _terminal(EmailDeliveryOutcome.ACCEPTED),
+        )
+        first.commit()
+        with pytest.raises(ValueError, match="transition is invalid"):
+            EmailDeliveryAttemptRepository(stale).transition(
+                attempt_id,
+                _terminal(EmailDeliveryOutcome.UNKNOWN),
+            )
+        stale.rollback()
+    finally:
+        first.close()
+        stale.close()
+
+    with factory() as check:
+        persisted = check.get(EmailDeliveryAttempt, attempt_id)
+        assert persisted is not None
+        assert persisted.outcome == EmailDeliveryOutcome.ACCEPTED.value
+
+
+def test_competing_repository_transitions_have_exactly_one_winner(
+    factory: sessionmaker[Session],
+) -> None:
+    with factory() as seed:
+        draft = _draft(seed, "competing-repository")
+        attempt = EmailDeliveryAttemptRepository(seed).reserve(_create(draft.id, "a"))
+        seed.commit()
+        attempt_id = attempt.id
+
+    loaded = Barrier(2)
+    winner_committed = Event()
+    results: Queue[tuple[str, str]] = Queue()
+
+    def transition(outcome: EmailDeliveryOutcome, *, winner: bool) -> None:
+        with factory() as session:
+            attempt = session.get(EmailDeliveryAttempt, attempt_id)
+            assert attempt is not None
+            assert attempt.outcome == EmailDeliveryOutcome.RESERVED.value
+            loaded.wait()
+            if not winner:
+                winner_committed.wait()
+            try:
+                EmailDeliveryAttemptRepository(session).transition(
+                    attempt_id,
+                    _terminal(outcome),
+                )
+                session.commit()
+            except ValueError:
+                session.rollback()
+                results.put((outcome.value, "stale"))
+            else:
+                results.put((outcome.value, "committed"))
+            finally:
+                if winner:
+                    winner_committed.set()
+
+    first = Thread(
+        target=transition,
+        args=(EmailDeliveryOutcome.TRANSIENT_FAILURE,),
+        kwargs={"winner": True},
+    )
+    second = Thread(
+        target=transition,
+        args=(EmailDeliveryOutcome.PERMANENT_FAILURE,),
+        kwargs={"winner": False},
+    )
+    first.start()
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert {results.get_nowait(), results.get_nowait()} == {
+        (EmailDeliveryOutcome.TRANSIENT_FAILURE.value, "committed"),
+        (EmailDeliveryOutcome.PERMANENT_FAILURE.value, "stale"),
+    }
+
+    with factory() as check:
+        persisted = check.get(EmailDeliveryAttempt, attempt_id)
+        assert persisted is not None
+        assert persisted.outcome == EmailDeliveryOutcome.TRANSIENT_FAILURE.value

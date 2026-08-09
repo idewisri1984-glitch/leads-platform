@@ -1,5 +1,5 @@
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .models import EmailDeliveryAttempt, EmailDeliveryOutcome
@@ -69,24 +69,36 @@ class EmailDeliveryAttemptRepository:
             validated = EmailDeliveryAttemptOutcomeUpdate(**data.model_dump())
         except (ValidationError, TypeError, ValueError):
             raise ValueError("Email delivery outcome transition is invalid.") from None
+        result = self.session.connection().execute(
+            update(EmailDeliveryAttempt)
+            .where(
+                EmailDeliveryAttempt.id == attempt_id,
+                EmailDeliveryAttempt.outcome == EmailDeliveryOutcome.RESERVED.value,
+            )
+            .values(
+                outcome=validated.outcome.value,
+                smtp_classification=(
+                    None
+                    if validated.smtp_classification is None
+                    else validated.smtp_classification.value
+                ),
+                smtp_code=validated.smtp_code,
+                error_category=validated.error_category,
+                completed_at=validated.completed_at,
+                accepted_at=validated.accepted_at,
+                unknown_at=validated.unknown_at,
+                updated_at=validated.completed_at,
+                row_version=EmailDeliveryAttempt.row_version + 1,
+            )
+            .execution_options(synchronize_session=False)
+        )
         attempt = self.session.scalar(
             select(EmailDeliveryAttempt)
             .where(EmailDeliveryAttempt.id == attempt_id)
-            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if attempt is None:
             raise ValueError("Email delivery attempt was not found.")
-        if attempt.outcome != EmailDeliveryOutcome.RESERVED.value:
+        if result.rowcount != 1:
             raise ValueError("Email delivery attempt transition is invalid.")
-        attempt.outcome = validated.outcome.value
-        attempt.smtp_classification = (
-            None if validated.smtp_classification is None else validated.smtp_classification.value
-        )
-        attempt.smtp_code = validated.smtp_code
-        attempt.error_category = validated.error_category
-        attempt.completed_at = validated.completed_at
-        attempt.accepted_at = validated.accepted_at
-        attempt.unknown_at = validated.unknown_at
-        attempt.updated_at = validated.completed_at
-        self.session.flush()
         return attempt
