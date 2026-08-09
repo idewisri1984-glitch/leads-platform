@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
 _STRICT = ConfigDict(frozen=True, extra="forbid", strict=True)
 
@@ -294,3 +294,16 @@ class EmailDraftRead(BaseModel):
     reviewed_at: datetime | None
     approved_at: datetime | None
     rejected_at: datetime | None
+
+    @field_serializer(
+        "generated_at",
+        "reviewed_at",
+        "approved_at",
+        "rejected_at",
+        when_used="json",
+    )
+    def serialize_datetime(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return utc_value.isoformat().replace("+00:00", "Z")
