@@ -68,6 +68,28 @@ def test_send_requires_explicit_confirmation_before_executor(
     assert "requires --confirm" in result.stderr
 
 
+def test_send_rejects_duplicate_email_draft_id_before_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("executor must not run")
+
+    monkeypatch.setattr(cli, "execute_send", forbidden)
+    arguments = _args("--confirm")
+    arguments[arguments.index("--email-draft-id") + 2 : arguments.index("--email-draft-id") + 2] = [
+        "--email-draft-id",
+        "5",
+    ]
+    result = runner.invoke(app, arguments)
+    assert result.exit_code == 2
+    assert calls == 0
+    assert "invalid" in result.stderr.casefold()
+
+
 def test_send_help_is_available_without_confirmation() -> None:
     result = runner.invoke(app, ["agent", "email-draft", "send", "--help"])
     assert result.exit_code == 0

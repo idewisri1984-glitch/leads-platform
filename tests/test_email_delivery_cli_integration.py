@@ -28,7 +28,7 @@ from app.providers.smtp.contracts import SMTPSecurityMode, SMTPTransportConfig
 from app.providers.smtp.fake import FakeSMTPScenario, FakeSMTPTransport
 
 from .test_email_delivery_integration import _SMTPServer
-from .test_email_delivery_service import NOW, _records, _sender
+from .test_email_delivery_service import NOW, RecordingTransport, _records, _sender
 
 runner = CliRunner()
 
@@ -294,6 +294,38 @@ def test_cli_tx2_failure_requires_recovery_and_blocks_resend(
         attempt = verification_session.scalar(select(EmailDeliveryAttempt))
         assert attempt is not None
         assert attempt.outcome == EmailDeliveryOutcome.RESERVED.value
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("receipt_recipient", "wrong@example.test"),
+        ("receipt_message_id", "<wrong@mail.example.test>"),
+    ],
+)
+def test_cli_receipt_mismatch_is_unknown_and_never_reports_success(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    value: str,
+) -> None:
+    ids = _records()
+    transport = RecordingTransport()
+    setattr(transport, attribute, value)
+    monkeypatch.setattr(cli, "_SMTPCompositionFactory", lambda: lambda: (transport, _sender()))
+    result = runner.invoke(app, _cli_args(ids))
+    assert result.exit_code == 19
+    assert "unknown" in result.stderr.casefold()
+    assert "retry is not supported" in result.stderr
+    for claim in ("ACCEPTED", "delivered", "received", "in inbox"):
+        assert claim.casefold() not in result.output.casefold()
+    assert len(transport.calls) == 1
+    with SessionLocal() as session:
+        attempt = session.scalar(select(EmailDeliveryAttempt))
+        draft = session.get(EmailDraft, ids[3])
+        assert attempt is not None
+        assert attempt.outcome == EmailDeliveryOutcome.UNKNOWN.value
+        assert draft is not None
+        assert draft.status == EmailDraftStatus.APPROVED.value
 
 
 def test_public_cli_uses_production_adapter_once_against_loopback(

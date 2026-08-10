@@ -82,6 +82,7 @@ _OPTIONS = (
     "--lead-id",
     "--task-id",
     "--draft-id",
+    "--email-draft-id",
     "--sender-name",
     "--sender-company",
     "--language",
@@ -171,11 +172,12 @@ class _SessionFactory(Protocol):
 
 class _SMTPCompositionFactory:
     def __call__(self) -> tuple[SMTPTransport, TrustedEmailSenderConfig]:
-        from app.core.config.settings import settings
         from app.providers.smtp.client import SMTPClient
         from app.providers.smtp.contracts import SMTPSecurityMode, SMTPTransportConfig
 
         try:
+            from app.core.config.settings import settings
+
             security_mode = SMTPSecurityMode(settings.smtp_security_mode)
             if (
                 settings.smtp_host is None
