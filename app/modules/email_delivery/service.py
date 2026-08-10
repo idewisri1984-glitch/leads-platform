@@ -119,6 +119,12 @@ def _database_utc(value: datetime | None) -> datetime:
     return value.astimezone(UTC)
 
 
+def _safe_smtp_code(value: object) -> int | None:
+    if type(value) is int and 200 <= value <= 599:
+        return value
+    return None
+
+
 class TrustedEmailSenderConfig(BaseModel):
     model_config = _STRICT
 
@@ -554,7 +560,7 @@ class ConfirmedEmailSendService:
             EmailDeliveryAttemptOutcomeUpdate(
                 outcome=outcome,
                 smtp_classification=classification,
-                smtp_code=error.smtp_code,
+                smtp_code=_safe_smtp_code(error.smtp_code),
                 error_category=category,
                 completed_at=completed_at,
                 accepted_at=None,
