@@ -12,9 +12,11 @@ from app.modules.email_delivery.repository import EmailDeliveryAttemptRepository
 from app.modules.email_delivery.service import (
     ConfirmedEmailSendService,
     EmailDeliveryAlreadyAttemptedError,
+    EmailDeliveryPermanentFailureError,
     EmailDeliveryPersistenceRecoveryRequiredError,
     EmailDeliveryStaleContextError,
     EmailDeliveryTransactionBoundaryError,
+    EmailDeliveryTransientFailureError,
     EmailDeliveryUnknownOutcomeError,
 )
 from app.modules.email_draft.models import EmailDraft
@@ -24,9 +26,118 @@ from app.providers.smtp.contracts import (
     SMTPMessageEnvelope,
     SMTPSecurityMode,
 )
+from app.providers.smtp.errors import (
+    SMTPAuthenticationFailedError,
+    SMTPConnectionFailedError,
+    SMTPDeliveryOutcomeUnknownError,
+    SMTPTransportError,
+)
 from app.providers.smtp.fake import FakeSMTPScenario, FakeSMTPTransport
 
 from .test_email_delivery_service import NOW, _command, _records, _sender, _service
+
+_FAILURE_CASES = [
+    (
+        SMTPConnectionFailedError,
+        EmailDeliveryTransientFailureError,
+        EmailDeliveryOutcome.TRANSIENT_FAILURE,
+        "TRANSIENT",
+        "connection",
+    ),
+    (
+        SMTPAuthenticationFailedError,
+        EmailDeliveryPermanentFailureError,
+        EmailDeliveryOutcome.PERMANENT_FAILURE,
+        "PERMANENT",
+        "authentication",
+    ),
+    (
+        SMTPDeliveryOutcomeUnknownError,
+        EmailDeliveryUnknownOutcomeError,
+        EmailDeliveryOutcome.UNKNOWN,
+        "UNKNOWN",
+        "unknown",
+    ),
+]
+
+
+class CodeFailureTransport:
+    def __init__(self, error: SMTPTransportError) -> None:
+        self.error = error
+        self.calls: list[SMTPMessageEnvelope] = []
+
+    def send(self, message: SMTPMessageEnvelope) -> SMTPDeliveryReceipt:
+        self.calls.append(message)
+        raise self.error
+
+
+class SMTPCodeInt(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    "smtp_code",
+    [-1, 0, 99, 100, 199, 600, 999, True, False, "250", None, SMTPCodeInt(250)],
+)
+@pytest.mark.parametrize(
+    ("error_type", "domain_error", "outcome", "classification", "category"),
+    _FAILURE_CASES,
+    ids=["transient", "permanent", "unknown"],
+)
+def test_invalid_smtp_codes_are_sanitized_without_reclassification(
+    smtp_code: object,
+    error_type: type[SMTPTransportError],
+    domain_error: type[Exception],
+    outcome: EmailDeliveryOutcome,
+    classification: str,
+    category: str,
+) -> None:
+    ids = _records()
+    transport = CodeFailureTransport(error_type(smtp_code=smtp_code))
+    with SessionLocal() as session, pytest.raises(domain_error) as captured:
+        _service(session, transport).send(_command(ids))
+    assert "ValidationError" not in type(captured.value).__name__
+    assert "SMTP code" not in str(captured.value)
+    with SessionLocal() as fresh:
+        attempt = fresh.scalar(select(EmailDeliveryAttempt))
+        assert attempt is not None
+        assert attempt.smtp_code is None
+        assert attempt.outcome == outcome.value
+        assert attempt.smtp_classification == classification
+        assert attempt.error_category == category
+        assert attempt.completed_at is not None
+        assert attempt.row_version == 2
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize("smtp_code", [200, 250, 421, 450, 500, 550, 599])
+@pytest.mark.parametrize(
+    ("error_type", "domain_error", "outcome", "classification", "category"),
+    _FAILURE_CASES,
+    ids=["transient", "permanent", "unknown"],
+)
+def test_valid_smtp_codes_are_preserved_without_reclassification(
+    smtp_code: int,
+    error_type: type[SMTPTransportError],
+    domain_error: type[Exception],
+    outcome: EmailDeliveryOutcome,
+    classification: str,
+    category: str,
+) -> None:
+    ids = _records()
+    transport = CodeFailureTransport(error_type(smtp_code=smtp_code))
+    with SessionLocal() as session, pytest.raises(domain_error):
+        _service(session, transport).send(_command(ids))
+    with SessionLocal() as fresh:
+        attempt = fresh.scalar(select(EmailDeliveryAttempt))
+        assert attempt is not None
+        assert attempt.smtp_code == smtp_code
+        assert attempt.outcome == outcome.value
+        assert attempt.smtp_classification == classification
+        assert attempt.error_category == category
+        assert attempt.completed_at is not None
+        assert attempt.row_version == 2
+    assert len(transport.calls) == 1
 
 
 class AdversarialReceiptTransport:
