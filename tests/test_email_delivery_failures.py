@@ -101,6 +101,48 @@ def test_service_rejects_a_genuinely_caller_owned_active_transaction() -> None:
     assert transport.calls == []
 
 
+def test_service_rejects_mismatched_repository_session_before_side_effects() -> None:
+    ids = _records()
+    transport = FakeSMTPTransport()
+    with SessionLocal() as service_session, SessionLocal() as repository_session:
+        with pytest.raises(EmailDeliveryTransactionBoundaryError):
+            ConfirmedEmailSendService(
+                session=service_session,
+                repository=EmailDeliveryAttemptRepository(repository_session),
+                transport=transport,
+                sender=_sender(),
+                clock=lambda: NOW,
+            )
+        assert not service_session.in_transaction()
+        assert not repository_session.in_transaction()
+        service_session.rollback()
+        repository_session.rollback()
+    with SessionLocal() as verification_session:
+        assert verification_session.get(EmailDeliveryAttempt, ids[3]) is None
+        assert (
+            verification_session.scalar(select(func.count()).select_from(EmailDeliveryAttempt)) == 0
+        )
+    assert transport.calls == []
+
+
+def test_same_bind_different_repository_session_is_rejected() -> None:
+    transport = FakeSMTPTransport()
+    with SessionLocal() as service_session, SessionLocal() as repository_session:
+        assert service_session is not repository_session
+        assert service_session.get_bind() is repository_session.get_bind()
+        with pytest.raises(EmailDeliveryTransactionBoundaryError):
+            ConfirmedEmailSendService(
+                session=service_session,
+                repository=EmailDeliveryAttemptRepository(repository_session),
+                transport=transport,
+                sender=_sender(),
+                clock=lambda: NOW,
+            )
+        assert not service_session.in_transaction()
+        assert not repository_session.in_transaction()
+    assert transport.calls == []
+
+
 def test_accepted_tx2_commit_failure_keeps_reservation_and_blocks_resend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

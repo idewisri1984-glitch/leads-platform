@@ -325,6 +325,8 @@ class ConfirmedEmailSendService:
         sender: TrustedEmailSenderConfig,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if getattr(repository, "session", None) is not session:
+            raise EmailDeliveryTransactionBoundaryError(_TRANSACTION)
         if type(sender) is not TrustedEmailSenderConfig:
             raise EmailDeliveryConfigurationError(_CONFIGURATION)
         try:
@@ -445,7 +447,9 @@ class ConfirmedEmailSendService:
 
     def _load_authoritative_draft(self, data: ConfirmedEmailSendCommand) -> EmailDraft:
         self.session.expire_all()
-        draft = self.session.get(EmailDraft, data.email_draft_id, populate_existing=True)
+        draft: EmailDraft | None = self.session.get(
+            EmailDraft, data.email_draft_id, populate_existing=True
+        )
         if (
             draft is None
             or draft.project_id != data.project_id
