@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -16,6 +17,7 @@ from app.modules.email_delivery.service import (
 
 runner = CliRunner()
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _result() -> ConfirmedEmailSendResult:
@@ -93,7 +95,7 @@ def test_send_rejects_duplicate_email_draft_id_before_executor(
 def test_send_help_is_available_without_confirmation() -> None:
     result = runner.invoke(app, ["agent", "email-draft", "send", "--help"])
     assert result.exit_code == 0
-    assert "--confirm" in result.stdout
+    assert "--confirm" in ANSI_ESCAPE.sub("", result.stdout)
 
 
 def test_send_constructs_exact_confirmed_command_and_safe_output(
