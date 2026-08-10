@@ -31,6 +31,7 @@ runner = CliRunner()
 commands = [
     ['--help'],
     ['agent', 'email-draft', '--help'],
+    ['agent', 'email-draft', 'send', '--help'],
     ['agent', 'email-draft', 'approve', '--help'],
     ['agent', 'email-draft', 'approve', '--project-id', '1', '--company-id', '2',
      '--contact-id', '3', '--draft-id', '4'],
@@ -52,22 +53,24 @@ print(counts)
     )
     assert result.returncode == 0
     assert result.stdout.splitlines() == [
-        "0,0,0,3",
+        "0,0,0,0,3",
         "{'smtp': 0, 'socket': 0, 'dns': 0}",
     ]
 
 
-def test_no_business_workflow_imports_smtp_transport_or_exposes_send_cli() -> None:
-    business_paths = [
+def test_only_email_delivery_cli_contains_lazy_smtp_composition() -> None:
+    non_delivery_paths = [
         _ROOT / "app" / "cli" / "agent.py",
-        _ROOT / "app" / "cli" / "email_draft.py",
         _ROOT / "app" / "modules" / "email_draft" / "service.py",
         _ROOT / "app" / "modules" / "agent" / "contact_apply.py",
     ]
-    combined = "\n".join(path.read_text(encoding="utf-8") for path in business_paths)
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in non_delivery_paths)
     assert "app.providers.smtp" not in combined
     assert "smtplib" not in combined
-    assert "email-draft send" not in combined
+    email_draft_cli = (_ROOT / "app" / "cli" / "email_draft.py").read_text(encoding="utf-8")
+    assert "from app.providers.smtp.client import SMTPClient" in email_draft_cli
+    assert '@app.command("send", cls=_SendCommand)' in email_draft_cli
+    assert "import smtplib" not in email_draft_cli
 
 
 def test_email_draft_lifecycle_has_no_delivery_statuses() -> None:
