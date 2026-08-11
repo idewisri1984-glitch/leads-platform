@@ -1,13 +1,37 @@
 from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from app.core.database.base import Base
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    impl = DateTime
+    cache_ok = True
+
+    def __init__(self) -> None:
+        super().__init__(timezone=True)
+
+    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("UTC datetime must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class ManualEmailSendRecord(Base):
@@ -33,7 +57,5 @@ class ManualEmailSendRecord(Base):
         ForeignKey("email_drafts.id", ondelete="RESTRICT"), nullable=False
     )
     recipient_email: Mapped[str] = mapped_column(String(255), nullable=False)
-    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
+    sent_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
