@@ -6,7 +6,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 _REVISION = "9d6e7f8091a2"
-_HEAD = "a41bc92d7e60"
+_HEAD = "b52cd03e8f71"
 
 
 def alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
