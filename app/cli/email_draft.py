@@ -13,6 +13,25 @@ from typer._click.exceptions import UsageError
 from typer.core import TyperCommand
 
 from app.cli._lazy_dependencies import SessionLocal
+from app.modules.email_delivery.manual_repository import ManualEmailSendRecordRepository
+from app.modules.email_delivery.manual_schemas import (
+    ConfirmedManualEmailSendCommand,
+    ManualEmailCopyPackage,
+    ManualEmailDraftScope,
+)
+from app.modules.email_delivery.manual_service import (
+    ManualOutreachAlreadySentError,
+    ManualOutreachAutomaticAttemptError,
+    ManualOutreachConfirmationRequiredError,
+    ManualOutreachError,
+    ManualOutreachInvalidCommandError,
+    ManualOutreachNotApprovedError,
+    ManualOutreachNotFoundError,
+    ManualOutreachPersistenceError,
+    ManualOutreachService,
+    ManualOutreachStaleContextError,
+    ManualOutreachTransactionBoundaryError,
+)
 from app.modules.email_delivery.models import EmailDeliveryOutcome
 from app.modules.email_delivery.repository import EmailDeliveryAttemptRepository
 from app.modules.email_delivery.service import (
@@ -73,6 +92,7 @@ app = typer.Typer(help="Persisted AI email-draft and human-review commands.")
 _INVALID = "Email draft data is invalid."
 _CONFIRMATION = "Email draft review requires --yes."
 _SEND_CONFIRMATION = "Email delivery requires --confirm."
+_MANUAL_SEND_CONFIRMATION = "Manual sent recording requires --confirm."
 _INTERNAL = "Email draft operation failed."
 _DELIVERY_INTERNAL = "Email delivery failed."
 _OPTIONS = (
@@ -124,6 +144,17 @@ _ERROR_CODES: tuple[tuple[type[EmailDraftError], int], ...] = (
     (EmailDraftStaleContextError, 14),
     (EmailDraftInternalError, 1),
 )
+_MANUAL_ERROR_CODES: tuple[tuple[type[ManualOutreachError], int], ...] = (
+    (ManualOutreachInvalidCommandError, 2),
+    (ManualOutreachConfirmationRequiredError, 3),
+    (ManualOutreachNotFoundError, 4),
+    (ManualOutreachNotApprovedError, 7),
+    (ManualOutreachStaleContextError, 14),
+    (ManualOutreachAlreadySentError, 15),
+    (ManualOutreachAutomaticAttemptError, 15),
+    (ManualOutreachPersistenceError, 20),
+    (ManualOutreachTransactionBoundaryError, 21),
+)
 
 
 class _EmailDraftCommand(TyperCommand):
@@ -162,6 +193,16 @@ class _SendCommand(_EmailDraftCommand):
             "--confirm" not in args or any(argument.startswith("--confirm=") for argument in args)
         ):
             click.echo(_SEND_CONFIRMATION, err=True)
+            raise click.exceptions.Exit(3)
+        return super().parse_args(ctx, args)
+
+
+class _ManualSendCommand(_EmailDraftCommand):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not any(argument in {"--help", "-h"} for argument in args) and (
+            "--confirm" not in args or any(argument.startswith("--confirm=") for argument in args)
+        ):
+            click.echo(_MANUAL_SEND_CONFIRMATION, err=True)
             raise click.exceptions.Exit(3)
         return super().parse_args(ctx, args)
 
@@ -253,6 +294,39 @@ def render_email_delivery(result: ConfirmedEmailSendResult, output: str) -> str:
     return "\n".join(
         f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
         for field in ConfirmedEmailSendResult.model_fields
+    )
+
+
+def render_manual_email_copy_package(result: ManualEmailCopyPackage, output: str) -> str:
+    if type(result) is not ManualEmailCopyPackage or output not in {"text", "json"}:
+        raise ManualOutreachInvalidCommandError(_INVALID)
+    try:
+        validated = ManualEmailCopyPackage(**result.model_dump())
+        values = validated.model_dump(mode="json")
+    except (ValidationError, TypeError, ValueError):
+        raise ManualOutreachInvalidCommandError(_INVALID) from None
+    if output == "json":
+        return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    metadata = (
+        f"PROJECT_ID: {validated.project_id}\n"
+        f"COMPANY_ID: {validated.company_id}\n"
+        f"CONTACT_ID: {validated.contact_id}\n"
+        f"LEAD_ID: {validated.lead_id}\n"
+        f"TASK_ID: {validated.task_id}\n"
+        f"EMAIL_DRAFT_ID: {validated.email_draft_id}\n"
+        f"DRAFT_STATUS: {validated.draft_status}\n"
+        f"CONTENT_HASH: {validated.content_hash}\n"
+        f"MANUAL_SEND_RECORD_ID: {validated.manual_send_record_id}\n"
+        f"SENT_AT: {values['sent_at']}"
+    )
+    return (
+        f"OUTREACH_STATUS: {validated.outreach_status.value}\n"
+        f"TO: {validated.recipient_email}\n"
+        f"RECIPIENT_NAME: {validated.recipient_name}\n"
+        f"COMPANY: {validated.company_name}\n"
+        f"SUBJECT: {validated.subject}\n"
+        f"BODY:\n{validated.text_body}\n"
+        f"---\n{metadata}"
     )
 
 
@@ -395,6 +469,59 @@ def execute_send(
         _cleanup(session.close) if failed else session.close()
 
 
+def execute_manual_export(
+    data: ManualEmailDraftScope,
+    output: str,
+    *,
+    session_factory: _SessionFactory = SessionLocal,
+) -> str:
+    session = session_factory()
+    failed = False
+    try:
+        service = ManualOutreachService(
+            session,
+            ManualEmailSendRecordRepository(session),
+        )
+        return render_manual_email_copy_package(service.export(data), output)
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        _cleanup(session.close) if failed else session.close()
+
+
+def execute_manual_mark_sent(
+    data: ConfirmedManualEmailSendCommand,
+    output: str,
+    *,
+    session_factory: _SessionFactory = SessionLocal,
+) -> str:
+    session = session_factory()
+    committed = False
+    failed = False
+    try:
+        service = ManualOutreachService(
+            session,
+            ManualEmailSendRecordRepository(session),
+        )
+        rendered = render_manual_email_copy_package(service.mark_sent(data), output)
+        try:
+            session.commit()
+            committed = True
+        except Exception:
+            raise ManualOutreachPersistenceError(
+                "Manual sent record could not be persisted."
+            ) from None
+        return rendered
+    except BaseException:
+        failed = True
+        if not committed:
+            _cleanup(session.rollback)
+        raise
+    finally:
+        _cleanup(session.close) if failed else session.close()
+
+
 def _handle_error(error: BaseException) -> Never:
     if isinstance(error, ValidationError):
         typer.echo(_INVALID, err=True)
@@ -429,6 +556,21 @@ def _handle_delivery_error(error: BaseException) -> Never:
         else:
             message = str(error)
         typer.echo(message, err=True)
+        raise typer.Exit(code) from None
+    typer.echo(_DELIVERY_INTERNAL, err=True)
+    raise typer.Exit(1) from None
+
+
+def _handle_manual_error(error: BaseException) -> Never:
+    if isinstance(error, ValidationError):
+        typer.echo(_INVALID, err=True)
+        raise typer.Exit(2) from None
+    if isinstance(error, ManualOutreachError):
+        code = next(
+            (value for error_type, value in _MANUAL_ERROR_CODES if isinstance(error, error_type)),
+            1,
+        )
+        typer.echo(str(error), err=True)
         raise typer.Exit(code) from None
     typer.echo(_DELIVERY_INTERNAL, err=True)
     raise typer.Exit(1) from None
@@ -573,12 +715,65 @@ def send(
     typer.echo(rendered)
 
 
+@app.command("export", cls=_EmailDraftCommand)
+def export_draft(
+    project_id: Annotated[str, typer.Option("--project-id")],
+    company_id: Annotated[str, typer.Option("--company-id")],
+    contact_id: Annotated[str, typer.Option("--contact-id")],
+    email_draft_id: Annotated[str, typer.Option("--email-draft-id")],
+    output: Annotated[str, typer.Option("--output")] = "text",
+) -> None:
+    try:
+        rendered = execute_manual_export(
+            ManualEmailDraftScope(
+                project_id=_positive(project_id),
+                company_id=_positive(company_id),
+                contact_id=_positive(contact_id),
+                email_draft_id=_positive(email_draft_id),
+            ),
+            _output(output),
+        )
+    except Exception as error:
+        _handle_manual_error(error)
+    typer.echo(rendered)
+
+
+@app.command("mark-sent", cls=_ManualSendCommand)
+def mark_sent(
+    project_id: Annotated[str, typer.Option("--project-id")],
+    company_id: Annotated[str, typer.Option("--company-id")],
+    contact_id: Annotated[str, typer.Option("--contact-id")],
+    email_draft_id: Annotated[str, typer.Option("--email-draft-id")],
+    confirm: Annotated[bool, typer.Option("--confirm")] = False,
+    output: Annotated[str, typer.Option("--output")] = "text",
+) -> None:
+    if not confirm:
+        _handle_manual_error(ManualOutreachConfirmationRequiredError(_MANUAL_SEND_CONFIRMATION))
+    try:
+        rendered = execute_manual_mark_sent(
+            ConfirmedManualEmailSendCommand(
+                project_id=_positive(project_id),
+                company_id=_positive(company_id),
+                contact_id=_positive(contact_id),
+                email_draft_id=_positive(email_draft_id),
+                confirmed=True,
+            ),
+            _output(output),
+        )
+    except Exception as error:
+        _handle_manual_error(error)
+    typer.echo(rendered)
+
+
 __all__ = [
     "app",
     "execute_generate",
+    "execute_manual_export",
+    "execute_manual_mark_sent",
     "execute_review",
     "execute_send",
     "execute_show",
     "render_email_delivery",
     "render_email_draft",
+    "render_manual_email_copy_package",
 ]
