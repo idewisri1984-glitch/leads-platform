@@ -11,7 +11,7 @@ from app.modules.contact_discovery.normalization import (
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.contact_discovery.website_contact_parser import (
     MAX_HTML_LENGTH,
-    parse_contact_discovery_candidates_from_html,
+    parse_contact_discovery_outcome_from_html,
 )
 from app.providers.public_web_fetcher import (
     BoundedPublicWebFetcher,
@@ -255,19 +255,20 @@ class WebsiteContactDiscoveryProvider:
                 candidates=[],
             )
 
-        successful_pages = 1
+        successful_pages = 0
         errors: list[str] = []
         candidates: list[ContactDiscoveryCandidateCreate] = []
         homepage_type = _classify_page(homepage.final_url, "") or (
             ContactDiscoverySourceType.OTHER_PUBLIC_PAGE
         )
-        self._parse_page(
+        if self._parse_page(
             company_id=company_id,
             page=homepage,
             source_type=homepage_type,
             candidates=candidates,
             errors=errors,
-        )
+        ):
+            successful_pages += 1
 
         links, limited = _discover_page_links(homepage.text, homepage.final_url)
         selected = links[: min(MAX_SECONDARY_PAGES, self._max_pages - 1)]
@@ -283,15 +284,15 @@ class WebsiteContactDiscoveryProvider:
             if final_host != homepage_host or final_port != homepage_port:
                 _append_error(errors, _ERROR_SECONDARY_FETCH)
                 continue
-            successful_pages += 1
             source_type = _classify_page(page.final_url, "") or link.source_type
-            self._parse_page(
+            if self._parse_page(
                 company_id=company_id,
                 page=page,
                 source_type=source_type,
                 candidates=candidates,
                 errors=errors,
-            )
+            ):
+                successful_pages += 1
 
         deduplicated = _deduplicate_candidates(candidates)
         if not deduplicated:
@@ -389,15 +390,15 @@ class WebsiteContactDiscoveryProvider:
                 if final_host is None or not _same_site(final_host, homepage_host):
                     _append_error(diagnostics, "search_url_rejected")
                     continue
-                successful_pages += 1
-                self._parse_page(
+                if self._parse_page(
                     company_id=company_id,
                     page=page,
                     source_type=_classify_page(page.final_url, "")
                     or ContactDiscoverySourceType.OTHER_PUBLIC_PAGE,
                     candidates=candidates,
                     errors=errors,
-                )
+                ):
+                    successful_pages += 1
                 if candidates:
                     break
             if candidates:
@@ -423,14 +424,13 @@ class WebsiteContactDiscoveryProvider:
         source_type: ContactDiscoverySourceType,
         candidates: list[ContactDiscoveryCandidateCreate],
         errors: list[str],
-    ) -> None:
+    ) -> bool:
         assert page.text is not None
         if len(page.text) > CONTACT_DISCOVERY_MAX_RESPONSE_BYTES:
             _append_error(errors, _ERROR_PAGE_PARSE)
-            return
-        parsed: list[ContactDiscoveryCandidateCreate]
+            return False
         try:
-            parsed = parse_contact_discovery_candidates_from_html(
+            outcome = parse_contact_discovery_outcome_from_html(
                 company_id=company_id,
                 html=page.text,
                 source_url=page.final_url,
@@ -438,8 +438,12 @@ class WebsiteContactDiscoveryProvider:
             )
         except Exception:
             _append_error(errors, _ERROR_PAGE_PARSE)
-            return
-        candidates.extend(parsed)
+            return False
+        if not outcome.completed:
+            _append_error(errors, outcome.failure_code or _ERROR_PAGE_PARSE)
+            return False
+        candidates.extend(outcome.candidates)
+        return True
 
 
 def _discover_page_links(html: str, homepage_url: str) -> tuple[list[_PageLink], bool]:

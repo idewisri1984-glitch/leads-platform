@@ -28,6 +28,7 @@ _ALLOWED_PROVIDER_ERRORS = frozenset(
         "homepage_fetch_failed",
         "secondary_page_fetch_failed",
         "page_parse_failed",
+        "parser_work_budget_exhausted",
         "search_provider_failed",
         _PROVIDER_FAILED,
         _PROVIDER_INVALID_RESULT,
@@ -291,7 +292,8 @@ class ContactDiscoveryService:
 
     @staticmethod
     def _status_for(result: _ValidatedProviderResult) -> ContactDiscoveryStatus:
-        if "search_provider_failed" in result.errors and not result.candidates:
+        terminal_failures = {"parser_work_budget_exhausted", "search_provider_failed"}
+        if terminal_failures.intersection(result.errors) and not result.candidates:
             return ContactDiscoveryStatus.FAILED
         if result.successful_pages == 0 and result.errors:
             return ContactDiscoveryStatus.FAILED

@@ -18,6 +18,7 @@ MAX_DOM_NODES = 50_000
 MAX_TOTAL_WORK_UNITS = 250_000
 MAX_CARD_SUBTREE_NODES = 300
 MAX_ANCESTOR_DEPTH = 256
+PARSER_WORK_BUDGET_EXHAUSTED = "parser_work_budget_exhausted"
 _ParserBase: Any = getattr(_html_parser, "HTML" + "Parser")
 
 _EMAIL = re.compile(r"(?<![\w.+-])([\w.+-]+@[\w-]+(?:\.[\w-]+)+)", re.ASCII)
@@ -293,6 +294,13 @@ class _ExtractedPerson:
     schema_person: bool = False
 
 
+@dataclass(frozen=True)
+class ContactDiscoveryParseResult:
+    candidates: tuple[ContactDiscoveryCandidateCreate, ...]
+    completed: bool
+    failure_code: str | None = None
+
+
 def parse_contact_discovery_candidates_from_html(
     *,
     company_id: int,
@@ -300,18 +308,36 @@ def parse_contact_discovery_candidates_from_html(
     source_url: str,
     source_type: ContactDiscoverySourceType,
 ) -> list[ContactDiscoveryCandidateCreate]:
-    """Extract conservative person candidates from an already-provided HTML string."""
+    """Compatibility wrapper returning candidates from a completed parse."""
+    return list(
+        parse_contact_discovery_outcome_from_html(
+            company_id=company_id,
+            html=html,
+            source_url=source_url,
+            source_type=source_type,
+        ).candidates
+    )
+
+
+def parse_contact_discovery_outcome_from_html(
+    *,
+    company_id: int,
+    html: str,
+    source_url: str,
+    source_type: ContactDiscoverySourceType,
+) -> ContactDiscoveryParseResult:
+    """Extract candidates and report whether bounded parsing completed."""
     if company_id <= 0:
         raise ValueError("Company ID must be greater than zero.")
     normalize_source_for_deduplication(source_url)
     if len(html) > MAX_HTML_LENGTH:
-        return []
+        return ContactDiscoveryParseResult((), False, "page_parse_failed")
     collector = _StaticContactHTMLCollector()
     try:
         collector.feed(html)
         collector.close()
         if collector.exhausted:
-            return []
+            return ContactDiscoveryParseResult((), False, "page_parse_failed")
         budget = _WorkBudget()
         structured_people = [
             *_extract_html_people(collector.root, budget),
@@ -319,7 +345,7 @@ def parse_contact_discovery_candidates_from_html(
         ]
         narrative_people = _extract_narrative_founders(collector.root, source_type, budget)
         if budget.exhausted:
-            return []
+            return ContactDiscoveryParseResult((), False, PARSER_WORK_BUDGET_EXHAUSTED)
         candidates: list[ContactDiscoveryCandidateCreate] = []
         canonical_indexes: dict[str, int] = {}
         founder_alias_indexes: dict[tuple[str, str, str], int | None] = {}
@@ -355,10 +381,10 @@ def parse_contact_discovery_candidates_from_html(
                 if alias is not None and alias not in founder_alias_indexes:
                     founder_alias_indexes[alias] = index
         if budget.exhausted:
-            return []
-        return candidates
+            return ContactDiscoveryParseResult((), False, PARSER_WORK_BUDGET_EXHAUSTED)
+        return ContactDiscoveryParseResult(tuple(candidates), True)
     except (RecursionError, ValueError, TypeError):
-        return []
+        return ContactDiscoveryParseResult((), False, "page_parse_failed")
 
 
 def _walk(node: _Node, budget: _WorkBudget, *, limit: int = MAX_DOM_NODES) -> list[_Node]:
