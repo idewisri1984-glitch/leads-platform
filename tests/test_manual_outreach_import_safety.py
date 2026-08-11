@@ -33,7 +33,10 @@ socket.create_connection = blocked("socket")
 socket.getaddrinfo = blocked("dns")
 
 from app.cli.main import app
-result = CliRunner().invoke(app, ["agent", "email-draft", "export", "--help"])
+export_result = CliRunner().invoke(app, ["agent", "email-draft", "export", "--help"])
+mark_sent_result = CliRunner().invoke(
+    app, ["agent", "email-draft", "mark-sent", "--help"]
+)
 forbidden = [
     "app.core.config.settings",
     "app.core.database.engine",
@@ -42,7 +45,8 @@ forbidden = [
     "app.providers.openai_email.client",
     "openai",
 ]
-print(result.exit_code)
+print(export_result.exit_code)
+print(mark_sent_result.exit_code)
 print(counts)
 print(",".join(name for name in forbidden if name in sys.modules))
 """
@@ -58,6 +62,7 @@ print(",".join(name for name in forbidden if name in sys.modules))
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
+        "0",
         "0",
         "{'settings': 0, 'engine': 0, 'sessionmaker': 0, 'session': 0, "
         "'smtp': 0, 'socket': 0, 'dns': 0}",
