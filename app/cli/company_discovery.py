@@ -590,6 +590,7 @@ def execute_stage_profile(
 
     if persist:
         session: Session | None = None
+        active_phase = "preparation"
         try:
             with make_session() as session:
                 profile_service = make_search_profile_service(SearchProfileRepository(session))
@@ -620,9 +621,11 @@ def execute_stage_profile(
                 )
                 SearchProfileQueryGenerator().generate_preview(profile, normalized_options)
 
+                active_phase = "provider_initialization"
                 staging_provider = make_provider()
                 staging_repository = make_repository(session)
                 staging_service = make_service(staging_repository)
+                active_phase = "staging_execution"
                 report = staging_service.run(
                     profile=profile,
                     provider=staging_provider,
@@ -630,6 +633,7 @@ def execute_stage_profile(
                     dry_run=False,
                     repository=staging_repository,
                 )
+                active_phase = "persistence"
                 _invoke_session_method(session, "commit")
         except SearchProfileDiscoveryExecutionError:
             if session is not None:
@@ -656,9 +660,15 @@ def execute_stage_profile(
         except Exception:
             if session is not None:
                 _safe_rollback(session)
+            error_message = {
+                "preparation": "Staging preparation failed.",
+                "provider_initialization": "Provider initialization failed.",
+                "staging_execution": "Staging execution failed.",
+                "persistence": "Staging persistence failed.",
+            }[active_phase]
             return StageProfileCommandOutcome(
                 exit_code=1,
-                error_message="Staging persistence failed.",
+                error_message=error_message,
             )
 
         return StageProfileCommandOutcome(
