@@ -192,7 +192,10 @@ class BoundedPublicWebFetcher:
                     redirect_url = None
                 if redirect_url is None or (
                     allowed_hostname is not None
-                    and urlsplit(redirect_url).hostname != allowed_hostname
+                    and not _equivalent_allowed_hostname(
+                        urlsplit(redirect_url).hostname,
+                        allowed_hostname,
+                    )
                 ):
                     return self._error(current_url, PublicWebFetchErrorCode.REDIRECT_UNSAFE)
                 current_url = redirect_url
@@ -254,6 +257,12 @@ def resolve_hostname(hostname: str) -> Sequence[str]:
         for item in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     }
     return tuple(str(address) for address in sorted(addresses, key=_address_sort_key))
+
+
+def _equivalent_allowed_hostname(candidate: str | None, allowed: str) -> bool:
+    if candidate is None:
+        return False
+    return candidate.casefold().removeprefix("www.") == allowed.casefold().removeprefix("www.")
 
 
 def _address_sort_key(
