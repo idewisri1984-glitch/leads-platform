@@ -23,7 +23,7 @@ from app.providers.public_web_fetcher import (
 
 MAX_PAGES = 3
 MAX_SECONDARY_PAGES = 2
-CONTACT_DISCOVERY_MAX_RESPONSE_BYTES = 750_000
+CONTACT_DISCOVERY_MAX_RESPONSE_BYTES = MAX_HTML_LENGTH
 MAX_SEARCH_QUERIES = 2
 MAX_SEARCH_RESULTS_PER_QUERY = 3
 MAX_SEARCH_PAGES = 3
@@ -367,6 +367,7 @@ class WebsiteContactDiscoveryProvider:
                 )
             except Exception:
                 _append_error(diagnostics, "search_provider_failed")
+                _append_error(errors, "search_provider_failed")
                 break
             bounded_results = tuple(results[:MAX_SEARCH_RESULTS_PER_QUERY])
             search_results += len(bounded_results)
@@ -380,7 +381,7 @@ class WebsiteContactDiscoveryProvider:
                 seen_urls.add(search_url)
                 fetched_search_pages += 1
                 attempted_pages += 1
-                page = self._fetcher.fetch(search_url)
+                page = self._fetcher.fetch(search_url, allowed_hostname=homepage_host)
                 if page.error_code is not None or page.text is None:
                     _append_fetch_diagnostic(diagnostics, "search_page", page)
                     continue
@@ -424,6 +425,9 @@ class WebsiteContactDiscoveryProvider:
         errors: list[str],
     ) -> None:
         assert page.text is not None
+        if len(page.text) > CONTACT_DISCOVERY_MAX_RESPONSE_BYTES:
+            _append_error(errors, _ERROR_PAGE_PARSE)
+            return
         parsed: list[ContactDiscoveryCandidateCreate]
         try:
             parsed = parse_contact_discovery_candidates_from_html(

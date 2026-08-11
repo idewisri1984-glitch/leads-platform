@@ -13,7 +13,7 @@ from app.modules.contact_discovery.normalization import (
 )
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 
-MAX_HTML_LENGTH = 250_000
+MAX_HTML_LENGTH = 750_000
 MAX_DOM_NODES = 50_000
 MAX_TOTAL_WORK_UNITS = 250_000
 MAX_CARD_SUBTREE_NODES = 300
