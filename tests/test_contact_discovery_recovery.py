@@ -3,6 +3,8 @@ from typing import Any
 
 import pytest
 
+from app.modules.contact_discovery.models import ContactDiscoveryStatus
+from app.modules.contact_discovery.service import ContactDiscoveryService
 from app.modules.contact_discovery.website_provider import (
     CONTACT_DISCOVERY_MAX_RESPONSE_BYTES,
     MAX_SEARCH_PAGES,
@@ -106,7 +108,7 @@ def test_fetch_failure_category_is_preserved(code: PublicWebFetchErrorCode, expe
 
 
 def test_contact_specific_large_response_limit_is_bounded_and_larger_than_baseline() -> None:
-    body = ("<html>" + person_html() + " " * 300_000 + "</html>").encode()
+    body = ("<html><!--" + "x" * 300_000 + "-->" + person_html() + "</html>").encode()
 
     class BoundedTransport:
         def fetch(self, **kwargs: Any) -> FetchResponse:
@@ -119,7 +121,7 @@ def test_contact_specific_large_response_limit_is_bounded_and_larger_than_baseli
         resolver=lambda _hostname: [PUBLIC_IP],
         max_response_bytes=250_000,
     )
-    recovery = BoundedPublicWebFetcher(
+    recovery_fetcher = BoundedPublicWebFetcher(
         transport=BoundedTransport(),
         resolver=lambda _hostname: [PUBLIC_IP],
         max_response_bytes=CONTACT_DISCOVERY_MAX_RESPONSE_BYTES,
@@ -127,7 +129,11 @@ def test_contact_specific_large_response_limit_is_bounded_and_larger_than_baseli
     assert baseline.fetch("https://example.com/").error_code == (
         PublicWebFetchErrorCode.RESPONSE_TOO_LARGE
     )
-    assert recovery.fetch("https://example.com/").error_code is None
+    result = WebsiteContactDiscoveryProvider(fetcher=recovery_fetcher).discover(
+        company_id=1,
+        website_url="https://example.com/",
+    )
+    assert result.candidates[0].email == "ada@example.com"
     assert CONTACT_DISCOVERY_MAX_RESPONSE_BYTES == 750_000
 
 
@@ -142,9 +148,109 @@ def test_response_beyond_contact_hard_limit_still_fails_without_partial_body() -
         resolver=lambda _hostname: [PUBLIC_IP],
         max_response_bytes=CONTACT_DISCOVERY_MAX_RESPONSE_BYTES,
     )
-    result = fetcher.fetch("https://example.com/")
-    assert result.error_code == PublicWebFetchErrorCode.RESPONSE_TOO_LARGE
-    assert result.text is None
+    result = WebsiteContactDiscoveryProvider(fetcher=fetcher).discover(
+        company_id=1,
+        website_url="https://example.com/",
+    )
+    assert result.candidates == ()
+    assert result.errors == ("homepage_fetch_failed",)
+    assert result.diagnostics == (
+        "configured_url_response_too_large",
+        "search_fallback_unavailable",
+    )
+
+
+def test_search_redirect_to_foreign_host_is_rejected_before_foreign_request() -> None:
+    calls: list[str] = []
+
+    class RedirectTransport:
+        def fetch(self, **kwargs: Any) -> FetchResponse:
+            calls.append(kwargs["hostname"])
+            if kwargs["url"] == "https://example.com/":
+                return FetchResponse(200, {"content-type": "text/html"}, b"<html></html>")
+            if kwargs["hostname"] == "example.com":
+                return FetchResponse(
+                    302,
+                    {"location": "https://foreign.example/person"},
+                    b"",
+                )
+            raise AssertionError("Foreign redirect target must not be fetched.")
+
+    fetcher = BoundedPublicWebFetcher(
+        transport=RedirectTransport(),
+        resolver=lambda _hostname: [PUBLIC_IP],
+        max_response_bytes=CONTACT_DISCOVERY_MAX_RESPONSE_BYTES,
+    )
+    result = WebsiteContactDiscoveryProvider(
+        fetcher=fetcher,
+        search_provider=FakeSearchProvider([ContactSearchResult(url="https://example.com/team")]),
+    ).discover(company_id=1, website_url="https://example.com/")
+    assert calls == ["example.com", "example.com"]
+    assert result.candidates == ()
+    assert "search_page_redirect_unsafe" in result.diagnostics
+
+
+def test_search_redirect_between_www_equivalent_hosts_is_allowed() -> None:
+    calls: list[str] = []
+
+    class RedirectTransport:
+        def fetch(self, **kwargs: Any) -> FetchResponse:
+            calls.append(kwargs["hostname"])
+            if kwargs["url"] == "https://example.com/":
+                return FetchResponse(200, {"content-type": "text/html"}, b"<html></html>")
+            if kwargs["hostname"] == "example.com":
+                return FetchResponse(
+                    302,
+                    {"location": "https://www.example.com/team"},
+                    b"",
+                )
+            return FetchResponse(
+                200,
+                {"content-type": "text/html"},
+                person_html().encode(),
+            )
+
+    fetcher = BoundedPublicWebFetcher(
+        transport=RedirectTransport(),
+        resolver=lambda _hostname: [PUBLIC_IP],
+        max_response_bytes=CONTACT_DISCOVERY_MAX_RESPONSE_BYTES,
+    )
+    result = WebsiteContactDiscoveryProvider(
+        fetcher=fetcher,
+        search_provider=FakeSearchProvider([ContactSearchResult(url="https://example.com/team")]),
+    ).discover(company_id=1, website_url="https://example.com/")
+    assert calls == ["example.com", "example.com", "www.example.com"]
+    assert result.candidates[0].email == "ada@example.com"
+
+
+def test_search_provider_failure_is_truthful_and_persisted() -> None:
+    class FailingSearchProvider:
+        def search(self, *, query: str, limit: int) -> Sequence[ContactSearchResult]:
+            raise RuntimeError("unsafe provider detail")
+
+    class RecordingRepository:
+        def __init__(self) -> None:
+            self.state: dict[str, Any] | None = None
+
+        def update_state(self, company_id: int, **kwargs: Any) -> None:
+            self.state = {"company_id": company_id, **kwargs}
+
+    repository = RecordingRepository()
+    provider = WebsiteContactDiscoveryProvider(
+        fetcher=FakeFetcher(lambda url: fetched(url, "<html></html>")),
+        search_provider=FailingSearchProvider(),
+    )
+    result = ContactDiscoveryService(repository=repository, provider=provider).run(
+        company_id=1,
+        website_url="https://example.com/",
+        dry_run=False,
+    )
+    assert result.status is ContactDiscoveryStatus.FAILED
+    assert result.errors == ("search_provider_failed",)
+    assert result.diagnostics == ("search_provider_failed",)
+    assert repository.state is not None
+    assert repository.state["discovery_status"] is ContactDiscoveryStatus.FAILED
+    assert repository.state["last_error"] == "search_provider_failed"
 
 
 def test_failed_website_uses_bounded_search_and_returns_sourced_email() -> None:
@@ -206,9 +312,21 @@ def test_unsafe_and_foreign_search_urls_are_rejected_before_fetch() -> None:
 
 def test_search_queries_results_and_page_fetches_have_strict_ceilings() -> None:
     root = "https://example.com/"
-    results = [ContactSearchResult(url=f"https://example.com/team/{index}") for index in range(20)]
+
+    class DistinctSearchProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def search(self, *, query: str, limit: int) -> Sequence[ContactSearchResult]:
+            self.calls.append((query, limit))
+            query_number = len(self.calls)
+            return [
+                ContactSearchResult(url=f"https://example.com/team/{query_number}/{index}")
+                for index in range(limit)
+            ]
+
     fetcher = FakeFetcher(lambda url: failure(url, PublicWebFetchErrorCode.REQUEST_FAILED))
-    search = FakeSearchProvider(results)
+    search = DistinctSearchProvider()
     result = WebsiteContactDiscoveryProvider(fetcher=fetcher, search_provider=search).discover(
         company_id=4, website_url=root
     )
