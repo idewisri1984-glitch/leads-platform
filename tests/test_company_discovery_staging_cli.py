@@ -13,6 +13,7 @@ from app.modules.company_discovery.staging_service_schemas import (
     CompanyDiscoveryStagingCandidatePreview,
     CompanyDiscoveryStagingRunResult,
 )
+from app.modules.project import Project
 from app.modules.search_profile import SearchProfileRunOptions
 from app.modules.search_profile.schemas import SearchProfileRead
 from tests.cli_output import plain_cli_output
@@ -385,6 +386,109 @@ def test_stage_profile_rejects_invalid_profile_state_before_provider(
     assert message in result.output
     assert FakeSerpApiClient.calls == 0
     assert FakeSessionLocal.calls >= 1
+
+
+def test_stage_profile_real_project_service_reaches_provider_boundary_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_boundary_calls = 0
+
+    class ProjectLookupSession(FakeSession):
+        def scalar(self, statement: object) -> Project:
+            return Project(id=9, name="Sales project")
+
+    class ProjectLookupSessionLocal:
+        def __enter__(self) -> ProjectLookupSession:
+            self.session = ProjectLookupSession()
+            return self.session
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def stop_at_provider_boundary() -> None:
+        nonlocal provider_boundary_calls
+        provider_boundary_calls += 1
+        raise RuntimeError("provider-boundary-sentinel")
+
+    monkeypatch.setattr(cli, "SessionLocal", ProjectLookupSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "_build_staging_discovery_provider", stop_at_provider_boundary)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    assert result.exit_code == 1
+    assert "Provider initialization failed." in result.output
+    assert "provider-boundary-sentinel" not in result.output
+    assert "Staging persistence failed." not in result.output
+    assert provider_boundary_calls == 1
+
+
+def test_stage_profile_preparation_failure_is_safe_and_not_mislabeled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_fakes()
+
+    class FailingProjectService:
+        def __init__(self, repository: object) -> None:
+            pass
+
+        def get(self, project_id: int) -> object:
+            raise RuntimeError("preparation-secret-sentinel")
+
+    monkeypatch.setattr(cli, "SessionLocal", FakeSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "ProjectService", FailingProjectService)
+    monkeypatch.setattr(cli, "SerpApiClient", FailingSerpApiClient)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    assert result.exit_code == 1
+    assert "Staging preparation failed." in result.output
+    assert "Staging persistence failed." not in result.output
+    assert "preparation-secret-sentinel" not in result.output
+    assert FakeSessionLocal.sessions[0].rollback_calls == 1
+
+
+def test_stage_profile_unexpected_staging_failure_remains_truthfully_classified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_fakes()
+
+    class UnexpectedStagingFailure(FakeStagingService):
+        def run(
+            self,
+            *,
+            profile: SearchProfileRead,
+            provider: object,
+            options: SearchProfileRunOptions,
+            dry_run: bool,
+            repository: object | None,
+        ) -> CompanyDiscoveryStagingRunResult:
+            raise RuntimeError("staging-secret-sentinel")
+
+    monkeypatch.setattr(cli, "SessionLocal", FakeSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "ProjectService", fake_project_service_factory(True))
+    monkeypatch.setattr(cli, "SerpApiClient", FakeSerpApiClient)
+    monkeypatch.setattr(cli, "CompanyDiscoveryStagingService", UnexpectedStagingFailure)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    assert result.exit_code == 1
+    assert "Staging execution failed." in result.output
+    assert "Staging preparation failed." not in result.output
+    assert "staging-secret-sentinel" not in result.output
+    assert FakeSessionLocal.sessions[0].commit_calls == 0
+    assert FakeSessionLocal.sessions[0].rollback_calls == 1
 
 
 def test_stage_profile_deduplicates_and_normalizes_country_overrides(
