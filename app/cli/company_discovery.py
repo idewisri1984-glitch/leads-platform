@@ -591,6 +591,7 @@ def execute_stage_profile(
     if persist:
         session: Session | None = None
         active_phase = "preparation"
+        commit_succeeded = False
         try:
             with make_session() as session:
                 profile_service = make_search_profile_service(SearchProfileRepository(session))
@@ -623,9 +624,9 @@ def execute_stage_profile(
 
                 active_phase = "provider_initialization"
                 staging_provider = make_provider()
+                active_phase = "staging_execution"
                 staging_repository = make_repository(session)
                 staging_service = make_service(staging_repository)
-                active_phase = "staging_execution"
                 report = staging_service.run(
                     profile=profile,
                     provider=staging_provider,
@@ -635,6 +636,8 @@ def execute_stage_profile(
                 )
                 active_phase = "persistence"
                 _invoke_session_method(session, "commit")
+                commit_succeeded = True
+                active_phase = "finalization"
         except SearchProfileDiscoveryExecutionError:
             if session is not None:
                 _safe_rollback(session)
@@ -658,13 +661,14 @@ def execute_stage_profile(
                 error_message="Invalid staging run options.",
             )
         except Exception:
-            if session is not None:
+            if session is not None and not commit_succeeded:
                 _safe_rollback(session)
             error_message = {
                 "preparation": "Staging preparation failed.",
                 "provider_initialization": "Provider initialization failed.",
                 "staging_execution": "Staging execution failed.",
                 "persistence": "Staging persistence failed.",
+                "finalization": "Staging finalization failed.",
             }[active_phase]
             return StageProfileCommandOutcome(
                 exit_code=1,
