@@ -491,6 +491,161 @@ def test_stage_profile_unexpected_staging_failure_remains_truthfully_classified(
     assert FakeSessionLocal.sessions[0].rollback_calls == 1
 
 
+def test_stage_profile_repository_factory_failure_is_staging_execution_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_fakes()
+
+    def failing_repository_factory(session: object) -> None:
+        raise RuntimeError("repository-secret-sentinel")
+
+    monkeypatch.setattr(cli, "SessionLocal", FakeSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "ProjectService", fake_project_service_factory(True))
+    monkeypatch.setattr(cli, "SerpApiClient", FakeSerpApiClient)
+    monkeypatch.setattr(cli, "CompanyDiscoveryStagingRepository", failing_repository_factory)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    assert result.exit_code == 1
+    assert "Staging execution failed." in result.output
+    assert "Provider initialization failed." not in result.output
+    assert "Staging persistence failed." not in result.output
+    assert "repository-secret-sentinel" not in result.output
+    assert FakeSessionLocal.sessions[0].commit_calls == 0
+    assert FakeSessionLocal.sessions[0].rollback_calls == 1
+
+
+def test_stage_profile_service_factory_failure_is_staging_execution_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_fakes()
+
+    class FailingServiceFactory:
+        def __init__(self, repository: object | None) -> None:
+            raise RuntimeError("service-factory-secret-sentinel")
+
+    monkeypatch.setattr(cli, "SessionLocal", FakeSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "ProjectService", fake_project_service_factory(True))
+    monkeypatch.setattr(cli, "SerpApiClient", FakeSerpApiClient)
+    monkeypatch.setattr(cli, "CompanyDiscoveryStagingService", FailingServiceFactory)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    assert result.exit_code == 1
+    assert "Staging execution failed." in result.output
+    assert "Provider initialization failed." not in result.output
+    assert "Staging persistence failed." not in result.output
+    assert "service-factory-secret-sentinel" not in result.output
+    assert FakeSessionLocal.sessions[0].commit_calls == 0
+    assert FakeSessionLocal.sessions[0].rollback_calls == 1
+
+
+def test_stage_profile_commit_failure_is_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_fakes()
+
+    class CommitFailingSession(FakeSession):
+        def commit(self) -> None:
+            self.commit_calls += 1
+            raise RuntimeError("commit-secret-sentinel")
+
+    class CommitFailingSessionLocal:
+        sessions: list[CommitFailingSession] = []
+
+        def __init__(self) -> None:
+            self.session = CommitFailingSession()
+            type(self).sessions.append(self.session)
+
+        def __enter__(self) -> CommitFailingSession:
+            return self.session
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    patch_staging_service(
+        monkeypatch,
+        make_result(
+            dry_run=False,
+            status=CompanyDiscoveryRunStatus.SUCCEEDED,
+            run_persisted=True,
+            run_id=335,
+        ),
+    )
+    monkeypatch.setattr(cli, "SessionLocal", CommitFailingSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "ProjectService", fake_project_service_factory(True))
+    monkeypatch.setattr(cli, "SerpApiClient", FakeSerpApiClient)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    session = CommitFailingSessionLocal.sessions[0]
+    assert result.exit_code == 1
+    assert "Staging persistence failed." in result.output
+    assert "Staging execution failed." not in result.output
+    assert "commit-secret-sentinel" not in result.output
+    assert session.commit_calls == 1
+    assert session.rollback_calls == 1
+
+
+def test_stage_profile_post_commit_failure_is_finalization_failure_without_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_fakes()
+
+    class ExitFailingSessionLocal:
+        sessions: list[FakeSession] = []
+
+        def __init__(self) -> None:
+            self.session = FakeSession()
+            type(self).sessions.append(self.session)
+
+        def __enter__(self) -> FakeSession:
+            return self.session
+
+        def __exit__(self, *args: object) -> None:
+            if args[0] is None:
+                raise RuntimeError("post-commit-secret-sentinel")
+
+    patch_staging_service(
+        monkeypatch,
+        make_result(
+            dry_run=False,
+            status=CompanyDiscoveryRunStatus.SUCCEEDED,
+            run_persisted=True,
+            run_id=336,
+        ),
+    )
+    monkeypatch.setattr(cli, "SessionLocal", ExitFailingSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "ProjectService", fake_project_service_factory(True))
+    monkeypatch.setattr(cli, "SerpApiClient", FakeSerpApiClient)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    session = ExitFailingSessionLocal.sessions[0]
+    assert result.exit_code == 1
+    assert "Staging finalization failed." in result.output
+    assert "Staging persistence failed." not in result.output
+    assert "post-commit-secret-sentinel" not in result.output
+    assert session.commit_calls == 1
+    assert session.rollback_calls == 0
+
+
 def test_stage_profile_deduplicates_and_normalizes_country_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
