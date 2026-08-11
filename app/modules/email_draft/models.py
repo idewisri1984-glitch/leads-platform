@@ -33,6 +33,10 @@ class EmailDraft(Base):
             "status IN ('DRAFT', 'APPROVED', 'REJECTED')",
             name="ck_email_drafts_status",
         ),
+        CheckConstraint(
+            "delivery_mode IS NULL OR delivery_mode IN ('MANUAL', 'AUTOMATIC')",
+            name="ck_email_drafts_delivery_mode",
+        ),
         UniqueConstraint("request_fingerprint", name="uq_email_drafts_request_fingerprint"),
     )
 
@@ -72,6 +76,7 @@ class EmailDraft(Base):
     status: Mapped[str] = mapped_column(
         String(20), default=EmailDraftStatus.DRAFT.value, nullable=False, index=True
     )
+    delivery_mode: Mapped[str | None] = mapped_column(String(20), index=True)
     generated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

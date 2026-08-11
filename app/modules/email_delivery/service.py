@@ -42,7 +42,9 @@ from app.providers.smtp.errors import (
 )
 from app.providers.smtp.interfaces import SMTPTransport
 
+from .manual_repository import ManualEmailSendRecordRepository
 from .models import EmailDeliveryAttempt, EmailDeliveryOutcome
+from .outreach_mode import EmailDeliveryMode, claim_email_delivery_mode
 from .repository import EmailDeliveryAttemptRepository
 from .schemas import (
     EmailDeliveryAttemptCreate,
@@ -354,6 +356,19 @@ class ConfirmedEmailSendService:
             existing = self.repository.get_by_email_draft_id(draft.id)
             if existing is not None:
                 raise EmailDeliveryAlreadyAttemptedError(existing.id, existing.outcome)
+            manual_record = ManualEmailSendRecordRepository(self.session).get_by_email_draft_id(
+                draft.id
+            )
+            if manual_record is not None:
+                raise EmailDeliveryAlreadyAttemptedError(
+                    manual_record.id, EmailDeliveryMode.MANUAL.value
+                )
+            if not claim_email_delivery_mode(
+                self.session,
+                email_draft_id=draft.id,
+                mode=EmailDeliveryMode.AUTOMATIC,
+            ):
+                raise EmailDeliveryAlreadyAttemptedError()
             created_at = _utc(self.clock())
             attempt_key = build_delivery_attempt_key(
                 project_id=draft.project_id,
