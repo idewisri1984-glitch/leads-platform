@@ -75,6 +75,9 @@ class ContactDiscoveryRunResult:
     selected_urls: int = 0
     limited_link_scan: bool = False
     persisted_candidates: tuple[ContactDiscoveryPersistedCandidate, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+    search_queries: int = 0
+    search_results: int = 0
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,9 @@ class _ValidatedProviderResult:
     errors: tuple[str, ...]
     selected_urls: int
     limited_link_scan: bool
+    diagnostics: tuple[str, ...]
+    search_queries: int
+    search_results: int
 
 
 class ContactDiscoveryService:
@@ -161,7 +167,13 @@ class ContactDiscoveryService:
         if not isinstance(result, WebsiteContactDiscoveryProviderResult):
             return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)
 
-        counters = (result.attempted_pages, result.successful_pages, result.selected_urls)
+        counters = (
+            result.attempted_pages,
+            result.successful_pages,
+            result.selected_urls,
+            result.search_queries,
+            result.search_results,
+        )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counters
         ):
@@ -173,6 +185,8 @@ class ContactDiscoveryService:
         if not ContactDiscoveryService._is_sequence(result.candidates) or not (
             ContactDiscoveryService._is_sequence(result.errors)
         ):
+            return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)
+        if not ContactDiscoveryService._is_sequence(result.diagnostics):
             return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)
 
         candidates: list[ContactDiscoveryCandidateCreate] = []
@@ -208,6 +222,12 @@ class ContactDiscoveryService:
             if sanitized not in errors:
                 errors.append(sanitized)
 
+        diagnostics: list[str] = []
+        for diagnostic in result.diagnostics:
+            sanitized = ContactDiscoveryService._safe_diagnostic(diagnostic)
+            if sanitized not in diagnostics:
+                diagnostics.append(sanitized)
+
         if result.successful_pages == 0 and not errors:
             return ContactDiscoveryService._failed_result(_PROVIDER_INVALID_RESULT)
         if candidates and result.successful_pages == 0:
@@ -220,6 +240,9 @@ class ContactDiscoveryService:
             errors=tuple(errors),
             selected_urls=result.selected_urls,
             limited_link_scan=result.limited_link_scan,
+            diagnostics=tuple(diagnostics),
+            search_queries=result.search_queries,
+            search_results=result.search_results,
         )
 
     @staticmethod
@@ -235,7 +258,35 @@ class ContactDiscoveryService:
             errors=(error,),
             selected_urls=0,
             limited_link_scan=False,
+            diagnostics=(),
+            search_queries=0,
+            search_results=0,
         )
+
+    @staticmethod
+    def _safe_diagnostic(value: object) -> str:
+        if not isinstance(value, str):
+            return _PROVIDER_FAILED
+        fixed = {
+            "search_fallback_unavailable",
+            "search_provider_failed",
+            "search_url_rejected",
+        }
+        fetch_codes = {
+            "host_not_public",
+            "redirect_unsafe",
+            "redirect_limit",
+            "request_failed",
+            "response_too_large",
+            "response_not_html",
+            "response_decode_failed",
+        }
+        prefixes = {"configured_url", "canonical_root", "secondary_page", "search_page"}
+        if value in fixed or any(
+            value == f"{prefix}_{code}" for prefix in prefixes for code in fetch_codes
+        ):
+            return value
+        return _PROVIDER_FAILED
 
     @staticmethod
     def _status_for(result: _ValidatedProviderResult) -> ContactDiscoveryStatus:
@@ -324,4 +375,7 @@ class ContactDiscoveryService:
             selected_urls=result.selected_urls,
             limited_link_scan=result.limited_link_scan,
             persisted_candidates=persisted_candidates,
+            diagnostics=result.diagnostics,
+            search_queries=result.search_queries,
+            search_results=result.search_results,
         )

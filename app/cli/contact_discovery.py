@@ -40,11 +40,9 @@ ServiceFactory = Callable[
 
 
 def WebsiteContactDiscoveryProvider() -> ContactDiscoveryProvider:
-    from app.modules.contact_discovery.website_provider import (
-        WebsiteContactDiscoveryProvider as Provider,
-    )
+    from app.cli.contact_discovery_runtime import build_website_contact_discovery_provider
 
-    return Provider()
+    return build_website_contact_discovery_provider()
 
 
 def ContactDiscoveryService(
@@ -226,11 +224,14 @@ def _print_result(result: ContactDiscoveryRunResult) -> None:
     typer.echo(f"Candidate upserts: {result.candidate_upserts}")
     typer.echo(f"State persisted: {_yes_no(result.state_persisted)}")
     typer.echo(f"Limited link scan: {_yes_no(result.limited_link_scan)}")
+    typer.echo(f"Search queries: {result.search_queries}")
+    typer.echo(f"Search results: {result.search_results}")
     displayed_errors = tuple(_display_value(error) for error in result.errors[:_MAX_DISPLAY_ERRORS])
     typer.echo(f"Errors: {', '.join(displayed_errors) or 'none'}")
     omitted_errors = len(result.errors) - len(displayed_errors)
     if omitted_errors:
         typer.echo(f"Omitted errors: {omitted_errors}")
+    typer.echo(f"Diagnostics: {', '.join(result.diagnostics) or 'none'}")
 
     displayed = result.candidates[:_MAX_DISPLAY_CANDIDATES]
     for index, candidate in enumerate(displayed, start=1):

@@ -15,6 +15,7 @@ from app.modules.contact_discovery.website_contact_parser import (
 )
 from app.providers.public_web_fetcher import (
     BoundedPublicWebFetcher,
+    PublicWebFetchErrorCode,
     PublicWebFetchResult,
     normalize_public_web_request_url,
     normalize_public_web_url,
@@ -22,6 +23,10 @@ from app.providers.public_web_fetcher import (
 
 MAX_PAGES = 3
 MAX_SECONDARY_PAGES = 2
+CONTACT_DISCOVERY_MAX_RESPONSE_BYTES = 750_000
+MAX_SEARCH_QUERIES = 2
+MAX_SEARCH_RESULTS_PER_QUERY = 3
+MAX_SEARCH_PAGES = 3
 MAX_ANCHORS_INSPECTED = 2_000
 MAX_HREF_LENGTH = 2_048
 MAX_CANDIDATE_LINKS = 100
@@ -113,6 +118,15 @@ class PublicWebFetcher(Protocol):
 
 
 @dataclass(frozen=True)
+class ContactSearchResult:
+    url: str
+
+
+class ContactSearchProvider(Protocol):
+    def search(self, *, query: str, limit: int) -> Sequence[ContactSearchResult]: ...
+
+
+@dataclass(frozen=True)
 class WebsiteContactDiscoveryProviderResult:
     candidates: tuple[ContactDiscoveryCandidateCreate, ...] = ()
     attempted_pages: int = 0
@@ -120,6 +134,9 @@ class WebsiteContactDiscoveryProviderResult:
     errors: tuple[str, ...] = ()
     selected_urls: int = 0
     limited_link_scan: bool = False
+    diagnostics: tuple[str, ...] = ()
+    search_queries: int = 0
+    search_results: int = 0
 
 
 @dataclass(frozen=True)
@@ -189,11 +206,15 @@ class WebsiteContactDiscoveryProvider:
         self,
         *,
         fetcher: PublicWebFetcher | None = None,
+        search_provider: ContactSearchProvider | None = None,
         max_pages: int = MAX_PAGES,
     ) -> None:
         if max_pages < 1 or max_pages > MAX_PAGES:
             raise ValueError("Contact discovery page limit must be between one and three.")
-        self._fetcher = fetcher or BoundedPublicWebFetcher()
+        self._fetcher = fetcher or BoundedPublicWebFetcher(
+            max_response_bytes=CONTACT_DISCOVERY_MAX_RESPONSE_BYTES
+        )
+        self._search_provider = search_provider
         self._max_pages = max_pages
 
     def discover(
@@ -211,14 +232,29 @@ class WebsiteContactDiscoveryProvider:
         if normalized_homepage is None:
             return WebsiteContactDiscoveryProviderResult(errors=(_ERROR_INVALID_WEBSITE,))
 
+        diagnostics: list[str] = []
         homepage = self._fetcher.fetch(normalized_homepage)
+        attempted_pages = 1
         if homepage.error_code is not None or homepage.text is None:
-            return WebsiteContactDiscoveryProviderResult(
-                attempted_pages=1,
-                errors=(_ERROR_HOMEPAGE_FETCH,),
+            _append_fetch_diagnostic(diagnostics, "configured_url", homepage)
+            canonical_root = _canonical_root_retry_url(normalized_homepage)
+            if canonical_root is not None:
+                homepage = self._fetcher.fetch(canonical_root)
+                attempted_pages += 1
+                if homepage.error_code is not None or homepage.text is None:
+                    _append_fetch_diagnostic(diagnostics, "canonical_root", homepage)
+
+        if homepage.error_code is not None or homepage.text is None:
+            return self._search_fallback_result(
+                company_id=company_id,
+                normalized_homepage=normalized_homepage,
+                attempted_pages=attempted_pages,
+                successful_pages=0,
+                errors=[_ERROR_HOMEPAGE_FETCH],
+                diagnostics=diagnostics,
+                candidates=[],
             )
 
-        attempted_pages = 1
         successful_pages = 1
         errors: list[str] = []
         candidates: list[ContactDiscoveryCandidateCreate] = []
@@ -241,6 +277,7 @@ class WebsiteContactDiscoveryProvider:
             page = self._fetcher.fetch(link.url, allowed_hostname=homepage_host)
             if page.error_code is not None or page.text is None:
                 _append_error(errors, _ERROR_SECONDARY_FETCH)
+                _append_fetch_diagnostic(diagnostics, "secondary_page", page)
                 continue
             final_host, final_port = _site_identity(page.final_url)
             if final_host != homepage_host or final_port != homepage_port:
@@ -256,13 +293,125 @@ class WebsiteContactDiscoveryProvider:
                 errors=errors,
             )
 
+        deduplicated = _deduplicate_candidates(candidates)
+        if not deduplicated:
+            return self._search_fallback_result(
+                company_id=company_id,
+                normalized_homepage=homepage.final_url,
+                attempted_pages=attempted_pages,
+                successful_pages=successful_pages,
+                errors=errors,
+                diagnostics=diagnostics,
+                candidates=deduplicated,
+                selected_urls=len(selected),
+                limited_link_scan=limited,
+            )
+
         return WebsiteContactDiscoveryProviderResult(
-            candidates=tuple(_deduplicate_candidates(candidates)),
+            candidates=tuple(deduplicated),
             attempted_pages=attempted_pages,
             successful_pages=successful_pages,
             errors=tuple(errors),
             selected_urls=len(selected),
             limited_link_scan=limited,
+            diagnostics=tuple(diagnostics),
+        )
+
+    def _search_fallback_result(
+        self,
+        *,
+        company_id: int,
+        normalized_homepage: str,
+        attempted_pages: int,
+        successful_pages: int,
+        errors: list[str],
+        diagnostics: list[str],
+        candidates: list[ContactDiscoveryCandidateCreate],
+        selected_urls: int = 0,
+        limited_link_scan: bool = False,
+    ) -> WebsiteContactDiscoveryProviderResult:
+        if self._search_provider is None:
+            _append_error(diagnostics, "search_fallback_unavailable")
+            return WebsiteContactDiscoveryProviderResult(
+                candidates=tuple(_deduplicate_candidates(candidates)),
+                attempted_pages=attempted_pages,
+                successful_pages=successful_pages,
+                errors=tuple(errors),
+                selected_urls=selected_urls,
+                limited_link_scan=limited_link_scan,
+                diagnostics=tuple(diagnostics),
+            )
+
+        homepage_host = urlsplit(normalized_homepage).hostname
+        if homepage_host is None:
+            _append_error(diagnostics, "search_fallback_unavailable")
+            return WebsiteContactDiscoveryProviderResult(
+                attempted_pages=attempted_pages,
+                successful_pages=successful_pages,
+                errors=tuple(errors),
+                diagnostics=tuple(diagnostics),
+            )
+
+        search_queries = 0
+        search_results = 0
+        fetched_search_pages = 0
+        seen_urls: set[str] = set()
+        for query in _contact_search_queries(homepage_host):
+            if search_queries >= MAX_SEARCH_QUERIES or fetched_search_pages >= MAX_SEARCH_PAGES:
+                break
+            search_queries += 1
+            try:
+                results = self._search_provider.search(
+                    query=query,
+                    limit=MAX_SEARCH_RESULTS_PER_QUERY,
+                )
+            except Exception:
+                _append_error(diagnostics, "search_provider_failed")
+                break
+            bounded_results = tuple(results[:MAX_SEARCH_RESULTS_PER_QUERY])
+            search_results += len(bounded_results)
+            for result in bounded_results:
+                if fetched_search_pages >= MAX_SEARCH_PAGES:
+                    break
+                search_url = _safe_same_site_search_url(result, homepage_host)
+                if search_url is None or search_url in seen_urls:
+                    _append_error(diagnostics, "search_url_rejected")
+                    continue
+                seen_urls.add(search_url)
+                fetched_search_pages += 1
+                attempted_pages += 1
+                page = self._fetcher.fetch(search_url)
+                if page.error_code is not None or page.text is None:
+                    _append_fetch_diagnostic(diagnostics, "search_page", page)
+                    continue
+                final_host = urlsplit(page.final_url).hostname
+                if final_host is None or not _same_site(final_host, homepage_host):
+                    _append_error(diagnostics, "search_url_rejected")
+                    continue
+                successful_pages += 1
+                self._parse_page(
+                    company_id=company_id,
+                    page=page,
+                    source_type=_classify_page(page.final_url, "")
+                    or ContactDiscoverySourceType.OTHER_PUBLIC_PAGE,
+                    candidates=candidates,
+                    errors=errors,
+                )
+                if candidates:
+                    break
+            if candidates:
+                break
+
+        return WebsiteContactDiscoveryProviderResult(
+            candidates=tuple(_deduplicate_candidates(candidates)),
+            attempted_pages=attempted_pages,
+            successful_pages=successful_pages,
+            errors=tuple(errors),
+            selected_urls=selected_urls,
+            limited_link_scan=limited_link_scan,
+            diagnostics=tuple(diagnostics),
+            search_queries=search_queries,
+            search_results=search_results,
         )
 
     @staticmethod
@@ -427,3 +576,44 @@ def _deduplicate_candidates(
 def _append_error(errors: list[str], error: str) -> None:
     if error not in errors:
         errors.append(error)
+
+
+def _canonical_root_retry_url(url: str) -> str | None:
+    parsed = urlsplit(url)
+    if parsed.path in {"", "/"} and not parsed.query:
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+
+
+def _append_fetch_diagnostic(
+    diagnostics: list[str], stage: str, result: PublicWebFetchResult
+) -> None:
+    code = result.error_code or PublicWebFetchErrorCode.REQUEST_FAILED
+    _append_error(diagnostics, f"{stage}_{code.value}")
+
+
+def _contact_search_queries(hostname: str) -> tuple[str, str]:
+    site = hostname.removeprefix("www.")
+    return (
+        f"site:{site} team about contact email",
+        f"site:{site} founder principal email",
+    )
+
+
+def _safe_same_site_search_url(result: ContactSearchResult, homepage_hostname: str) -> str | None:
+    if not isinstance(result, ContactSearchResult):
+        return None
+    try:
+        normalized = normalize_public_web_request_url(result.url)
+    except ValueError:
+        return None
+    if normalized is None:
+        return None
+    hostname = urlsplit(normalized).hostname
+    if hostname is None or not _same_site(hostname, homepage_hostname):
+        return None
+    return normalized
+
+
+def _same_site(first: str, second: str) -> bool:
+    return first.casefold().removeprefix("www.") == second.casefold().removeprefix("www.")
