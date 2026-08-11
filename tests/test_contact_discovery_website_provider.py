@@ -7,7 +7,8 @@ from app.modules.contact_discovery import website_provider
 from app.modules.contact_discovery.models import ContactDiscoverySourceType
 from app.modules.contact_discovery.schemas import ContactDiscoveryCandidateCreate
 from app.modules.contact_discovery.website_contact_parser import (
-    parse_contact_discovery_candidates_from_html,
+    ContactDiscoveryParseResult,
+    parse_contact_discovery_outcome_from_html,
 )
 from app.modules.contact_discovery.website_provider import (
     WebsiteContactDiscoveryProvider,
@@ -402,14 +403,14 @@ def test_secondary_redirect_to_another_host_is_rejected_before_parsing() -> None
 def test_parser_exception_is_sanitized_and_other_pages_remain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = parse_contact_discovery_candidates_from_html
+    original = parse_contact_discovery_outcome_from_html
 
-    def parser(**kwargs: Any) -> list[ContactDiscoveryCandidateCreate]:
+    def parser(**kwargs: Any) -> ContactDiscoveryParseResult:
         if kwargs["source_url"].endswith("/team"):
             raise RuntimeError("raw HTML secret traceback")
         return original(**kwargs)
 
-    monkeypatch.setattr(website_provider, "parse_contact_discovery_candidates_from_html", parser)
+    monkeypatch.setattr(website_provider, "parse_contact_discovery_outcome_from_html", parser)
     team = f"{HOME}/team"
     pages = {
         HOME: fetched(HOME, person_card() + '<a href="/team">Team</a>'),
@@ -424,10 +425,10 @@ def test_parser_exception_is_sanitized_and_other_pages_remain(
 
 
 def test_parser_base_exception_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
-    def interrupt(**_kwargs: Any) -> list[ContactDiscoveryCandidateCreate]:
+    def interrupt(**_kwargs: Any) -> ContactDiscoveryParseResult:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(website_provider, "parse_contact_discovery_candidates_from_html", interrupt)
+    monkeypatch.setattr(website_provider, "parse_contact_discovery_outcome_from_html", interrupt)
     provider, _ = provider_for({HOME: fetched(HOME, person_card())})
     with pytest.raises(KeyboardInterrupt):
         provider.discover(company_id=1, website_url=HOME)
@@ -436,14 +437,14 @@ def test_parser_base_exception_is_not_swallowed(monkeypatch: pytest.MonkeyPatch)
 def test_successful_pages_counts_same_site_fetch_even_when_parser_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def parser(**_kwargs: Any) -> list[ContactDiscoveryCandidateCreate]:
+    def parser(**_kwargs: Any) -> ContactDiscoveryParseResult:
         raise RuntimeError("secret parser detail")
 
-    monkeypatch.setattr(website_provider, "parse_contact_discovery_candidates_from_html", parser)
+    monkeypatch.setattr(website_provider, "parse_contact_discovery_outcome_from_html", parser)
     provider, _ = provider_for({HOME: fetched(HOME, person_card())})
     result = provider.discover(company_id=1, website_url=HOME)
     assert result.attempted_pages == 1
-    assert result.successful_pages == 1
+    assert result.successful_pages == 0
     assert result.errors == ("page_parse_failed",)
     assert "secret" not in repr(result)
 
@@ -474,22 +475,25 @@ def test_duplicate_merge_fills_empty_fields_and_keeps_maximum_confidence(
 ) -> None:
     team = f"{HOME}/team"
 
-    def parser(**kwargs: Any) -> list[ContactDiscoveryCandidateCreate]:
+    def parser(**kwargs: Any) -> ContactDiscoveryParseResult:
         homepage = kwargs["source_url"] == HOME
-        return [
-            ContactDiscoveryCandidateCreate(
-                company_id=kwargs["company_id"],
-                name="Ada Lovelace" if homepage else "Changed Name",
-                title=None if homepage else "CTO",
-                email="ada@example.com",
-                phone=None if homepage else "+1 212 555 0199",
-                source_url=kwargs["source_url"],
-                source_type=kwargs["source_type"],
-                confidence=60 if homepage else 90,
-            )
-        ]
+        return ContactDiscoveryParseResult(
+            candidates=(
+                ContactDiscoveryCandidateCreate(
+                    company_id=kwargs["company_id"],
+                    name="Ada Lovelace" if homepage else "Changed Name",
+                    title=None if homepage else "CTO",
+                    email="ada@example.com",
+                    phone=None if homepage else "+1 212 555 0199",
+                    source_url=kwargs["source_url"],
+                    source_type=kwargs["source_type"],
+                    confidence=60 if homepage else 90,
+                ),
+            ),
+            completed=True,
+        )
 
-    monkeypatch.setattr(website_provider, "parse_contact_discovery_candidates_from_html", parser)
+    monkeypatch.setattr(website_provider, "parse_contact_discovery_outcome_from_html", parser)
     pages = {
         HOME: fetched(HOME, '<a href="/team">Team</a>'),
         team: fetched(team),

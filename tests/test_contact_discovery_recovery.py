@@ -3,8 +3,13 @@ from typing import Any
 
 import pytest
 
-from app.modules.contact_discovery.models import ContactDiscoveryStatus
+from app.modules.contact_discovery.models import ContactDiscoverySourceType, ContactDiscoveryStatus
 from app.modules.contact_discovery.service import ContactDiscoveryService
+from app.modules.contact_discovery.website_contact_parser import (
+    MAX_TOTAL_WORK_UNITS,
+    PARSER_WORK_BUDGET_EXHAUSTED,
+    parse_contact_discovery_outcome_from_html,
+)
 from app.modules.contact_discovery.website_provider import (
     CONTACT_DISCOVERY_MAX_RESPONSE_BYTES,
     MAX_SEARCH_PAGES,
@@ -27,6 +32,16 @@ PUBLIC_IP = "93.184.216.34"
 def person_html(*, email: str | None = "ada@example.com") -> str:
     mailbox = f'<a href="mailto:{email}">{email}</a>' if email else ""
     return f'<div class="person"><h3>Ada Lovelace</h3><p class="role">Founder</p>{mailbox}</div>'
+
+
+def budget_exhausting_html() -> str:
+    return (
+        "<html><body><p>"
+        + "A" * (MAX_TOTAL_WORK_UNITS + 1)
+        + "</p>"
+        + person_html()
+        + "</body></html>"
+    )
 
 
 def fetched(url: str, html: str) -> PublicWebFetchResult:
@@ -251,6 +266,77 @@ def test_search_provider_failure_is_truthful_and_persisted() -> None:
     assert repository.state is not None
     assert repository.state["discovery_status"] is ContactDiscoveryStatus.FAILED
     assert repository.state["last_error"] == "search_provider_failed"
+
+
+def test_parser_budget_exhaustion_is_truthful_and_persisted() -> None:
+    body = budget_exhausting_html().encode()
+
+    class BoundedTransport:
+        def fetch(self, **kwargs: Any) -> FetchResponse:
+            return FetchResponse(200, {"content-type": "text/html"}, body)
+
+    class RecordingRepository:
+        def __init__(self) -> None:
+            self.state: dict[str, Any] | None = None
+            self.candidate_upserts = 0
+
+        def upsert_candidate(self, company_id: int, candidate: object) -> None:
+            self.candidate_upserts += 1
+            raise AssertionError("Incomplete parser output must not be persisted.")
+
+        def update_state(self, company_id: int, **kwargs: Any) -> None:
+            self.state = {"company_id": company_id, **kwargs}
+
+    repository = RecordingRepository()
+    provider = WebsiteContactDiscoveryProvider(
+        fetcher=BoundedPublicWebFetcher(
+            transport=BoundedTransport(),
+            resolver=lambda _hostname: [PUBLIC_IP],
+            max_response_bytes=CONTACT_DISCOVERY_MAX_RESPONSE_BYTES,
+        )
+    )
+    result = ContactDiscoveryService(repository=repository, provider=provider).run(
+        company_id=1,
+        website_url="https://example.com/about",
+        dry_run=False,
+    )
+    assert len(body) > MAX_TOTAL_WORK_UNITS
+    assert len(body) < CONTACT_DISCOVERY_MAX_RESPONSE_BYTES
+    assert result.candidates == ()
+    assert result.successful_pages == 0
+    assert result.status is ContactDiscoveryStatus.FAILED
+    assert result.errors == (PARSER_WORK_BUDGET_EXHAUSTED,)
+    assert repository.candidate_upserts == 0
+    assert repository.state is not None
+    assert repository.state["discovery_status"] is ContactDiscoveryStatus.FAILED
+    assert repository.state["last_error"] == PARSER_WORK_BUDGET_EXHAUSTED
+
+
+def test_candidate_found_before_budget_exhaustion_is_discarded_as_incomplete() -> None:
+    outcome = parse_contact_discovery_outcome_from_html(
+        company_id=1,
+        html=budget_exhausting_html(),
+        source_url="https://example.com/about",
+        source_type=ContactDiscoverySourceType.ABOUT_PAGE,
+    )
+    assert outcome.completed is False
+    assert outcome.failure_code == PARSER_WORK_BUDGET_EXHAUSTED
+    assert outcome.candidates == ()
+
+
+def test_completed_empty_page_remains_truthful_not_found() -> None:
+    provider = WebsiteContactDiscoveryProvider(
+        fetcher=FakeFetcher(lambda url: fetched(url, "<html><body>Welcome</body></html>"))
+    )
+    result = ContactDiscoveryService(repository=object(), provider=provider).run(
+        company_id=1,
+        website_url="https://example.com/",
+        dry_run=True,
+    )
+    assert result.status is ContactDiscoveryStatus.NOT_FOUND
+    assert result.candidates == ()
+    assert result.errors == ()
+    assert result.successful_pages == 1
 
 
 def test_failed_website_uses_bounded_search_and_returns_sourced_email() -> None:
