@@ -15,6 +15,14 @@ class ProjectService:
 
         return ProjectRead.model_validate(project)
 
+    def get(self, project_id: int) -> ProjectRead | None:
+        project = self.repository.get(project_id)
+
+        if project is None:
+            return None
+
+        return ProjectRead.model_validate(project)
+
     def get_all(self) -> list[ProjectRead]:
         projects = self.repository.get_all()
 
