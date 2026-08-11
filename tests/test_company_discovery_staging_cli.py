@@ -1,6 +1,7 @@
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
@@ -642,6 +643,79 @@ def test_stage_profile_post_commit_failure_is_finalization_failure_without_rollb
     assert "Staging finalization failed." in result.output
     assert "Staging persistence failed." not in result.output
     assert "post-commit-secret-sentinel" not in result.output
+    assert session.commit_calls == 1
+    assert session.rollback_calls == 0
+
+
+def make_validation_error() -> ValidationError:
+    with pytest.raises(ValidationError) as captured:
+        SearchProfileRunOptions(max_queries=0)
+    return captured.value
+
+
+@pytest.mark.parametrize(
+    "post_commit_error",
+    [
+        pytest.param(make_validation_error(), id="validation-error"),
+        pytest.param(
+            cli.SearchProfileQueryGenerationError("query-secret-sentinel"),
+            id="query-generation-error",
+        ),
+        pytest.param(
+            cli.SearchProfileDiscoveryExecutionError("execution-secret-sentinel"),
+            id="discovery-execution-error",
+        ),
+        pytest.param(
+            CompanyDiscoveryStagingServiceError("staging-secret-sentinel"),
+            id="staging-service-error",
+        ),
+    ],
+)
+def test_stage_profile_typed_post_commit_failures_use_finalization_without_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    post_commit_error: Exception,
+) -> None:
+    reset_fakes()
+
+    class TypedExitFailingSessionLocal:
+        sessions: list[FakeSession] = []
+
+        def __init__(self) -> None:
+            self.session = FakeSession()
+            type(self).sessions.append(self.session)
+
+        def __enter__(self) -> FakeSession:
+            return self.session
+
+        def __exit__(self, *args: object) -> None:
+            if args[0] is None:
+                raise post_commit_error
+
+    patch_staging_service(
+        monkeypatch,
+        make_result(
+            dry_run=False,
+            status=CompanyDiscoveryRunStatus.SUCCEEDED,
+            run_persisted=True,
+            run_id=337,
+        ),
+    )
+    monkeypatch.setattr(cli, "SessionLocal", TypedExitFailingSessionLocal)
+    monkeypatch.setattr(cli, "SearchProfileService", fake_profile_service_factory(make_profile()))
+    monkeypatch.setattr(cli, "ProjectService", fake_project_service_factory(True))
+    monkeypatch.setattr(cli, "SerpApiClient", FakeSerpApiClient)
+
+    result = runner.invoke(
+        cli.app,
+        ["stage-profile", "--profile-id", "12", "--persist", "--yes"],
+    )
+
+    session = TypedExitFailingSessionLocal.sessions[0]
+    assert result.exit_code == 1
+    assert "Staging finalization failed." in result.output
+    assert "Execution failed." not in result.output
+    assert "Invalid staging run options." not in result.output
+    assert str(post_commit_error) not in result.output
     assert session.commit_calls == 1
     assert session.rollback_calls == 0
 
