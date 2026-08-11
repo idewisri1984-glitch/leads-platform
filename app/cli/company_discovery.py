@@ -592,6 +592,17 @@ def execute_stage_profile(
         session: Session | None = None
         active_phase = "preparation"
         commit_succeeded = False
+
+        def failure_outcome(pre_commit_message: str) -> StageProfileCommandOutcome:
+            if session is not None and not commit_succeeded:
+                _safe_rollback(session)
+            return StageProfileCommandOutcome(
+                exit_code=1,
+                error_message=(
+                    "Staging finalization failed." if commit_succeeded else pre_commit_message
+                ),
+            )
+
         try:
             with make_session() as session:
                 profile_service = make_search_profile_service(SearchProfileRepository(session))
@@ -639,30 +650,14 @@ def execute_stage_profile(
                 commit_succeeded = True
                 active_phase = "finalization"
         except SearchProfileDiscoveryExecutionError:
-            if session is not None:
-                _safe_rollback(session)
-            return StageProfileCommandOutcome(exit_code=1, error_message="Execution failed.")
+            return failure_outcome("Execution failed.")
         except CompanyDiscoveryStagingServiceError:
-            if session is not None:
-                _safe_rollback(session)
-            return StageProfileCommandOutcome(exit_code=1, error_message="Execution failed.")
+            return failure_outcome("Execution failed.")
         except SearchProfileQueryGenerationError:
-            if session is not None:
-                _safe_rollback(session)
-            return StageProfileCommandOutcome(
-                exit_code=1,
-                error_message="Invalid staging run options.",
-            )
+            return failure_outcome("Invalid staging run options.")
         except ValidationError:
-            if session is not None:
-                _safe_rollback(session)
-            return StageProfileCommandOutcome(
-                exit_code=1,
-                error_message="Invalid staging run options.",
-            )
+            return failure_outcome("Invalid staging run options.")
         except Exception:
-            if session is not None and not commit_succeeded:
-                _safe_rollback(session)
             error_message = {
                 "preparation": "Staging preparation failed.",
                 "provider_initialization": "Provider initialization failed.",
@@ -670,10 +665,7 @@ def execute_stage_profile(
                 "persistence": "Staging persistence failed.",
                 "finalization": "Staging finalization failed.",
             }[active_phase]
-            return StageProfileCommandOutcome(
-                exit_code=1,
-                error_message=error_message,
-            )
+            return failure_outcome(error_message)
 
         return StageProfileCommandOutcome(
             exit_code=_exit_code_for_staging_status(report.status),
