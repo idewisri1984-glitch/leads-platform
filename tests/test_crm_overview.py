@@ -1,4 +1,6 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from app.modules.crm import (
     CRMCompanyRecord,
@@ -59,20 +61,74 @@ def test_keeps_company_contact_and_lead_rows_when_downstream_entities_are_absent
     assert lead_without_task.outreach_status == "NO_DRAFT"
 
 
-def test_selects_active_task_then_latest_done_fallback() -> None:
-    tasks = (
-        CRMTaskRecord(4, 3, "done old", "DONE", None),
-        CRMTaskRecord(6, 3, "active", "TODO", None),
-        CRMTaskRecord(7, 3, "done new", "DONE", None),
-    )
+@pytest.mark.parametrize(
+    ("tasks", "expected_id"),
+    [
+        (
+            (
+                CRMTaskRecord(4, 3, "todo", "TODO", None),
+                CRMTaskRecord(5, 3, "progress", "IN_PROGRESS", None),
+            ),
+            5,
+        ),
+        (
+            (
+                CRMTaskRecord(4, 3, "later", "IN_PROGRESS", NOW + timedelta(days=2)),
+                CRMTaskRecord(5, 3, "earlier", "IN_PROGRESS", NOW + timedelta(days=1)),
+            ),
+            5,
+        ),
+        (
+            (
+                CRMTaskRecord(4, 3, "unscheduled", "TODO", None),
+                CRMTaskRecord(5, 3, "scheduled", "TODO", NOW),
+            ),
+            5,
+        ),
+        (
+            (
+                CRMTaskRecord(5, 3, "higher", "TODO", NOW),
+                CRMTaskRecord(4, 3, "lower", "TODO", NOW),
+            ),
+            4,
+        ),
+        (
+            (
+                CRMTaskRecord(4, 3, "cancelled", "CANCELLED", None),
+                CRMTaskRecord(5, 3, "done", "DONE", None),
+            ),
+            5,
+        ),
+        (
+            (
+                CRMTaskRecord(4, 3, "done old", "DONE", None),
+                CRMTaskRecord(7, 3, "done new", "DONE", None),
+            ),
+            7,
+        ),
+        (
+            (
+                CRMTaskRecord(4, 3, "cancelled old", "CANCELLED", None),
+                CRMTaskRecord(7, 3, "cancelled new", "CANCELLED", None),
+            ),
+            7,
+        ),
+    ],
+    ids=[
+        "in-progress-before-todo",
+        "earliest-naive-due-at",
+        "scheduled-before-null",
+        "id-tie-break",
+        "done-before-cancelled",
+        "latest-done-fallback",
+        "latest-cancelled-fallback",
+    ],
+)
+def test_current_task_selection_matrix(tasks: tuple[CRMTaskRecord, ...], expected_id: int) -> None:
     row = CRMOverviewService().build(snapshot(contacts=(contact(),), leads=(lead(),), tasks=tasks))[
         0
     ]
-    assert (row.task_id, row.task_status) == (6, "TODO")
-    fallback = CRMOverviewService().build(
-        snapshot(contacts=(contact(),), leads=(lead(),), tasks=(tasks[0], tasks[2]))
-    )[0]
-    assert fallback.task_id == 7
+    assert row.task_id == expected_id
 
 
 def test_prefers_selected_task_draft_and_exposes_fallback_draft_task() -> None:

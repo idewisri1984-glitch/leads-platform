@@ -62,6 +62,22 @@ def test_text_and_json_render_stable_fields(monkeypatch) -> None:  # type: ignor
     assert payload[0]["outreach_status"] == "MANUALLY_SENT"
 
 
+def test_text_renderer_keeps_pipe_characters_inside_one_company_cell(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    selected = row()
+    pipe_name = "IA Interior Architects | Designing People-Centric Experiences | IA"
+    selected = CRMOverviewRow(**{**selected.as_dict(), "company": pipe_name})
+    monkeypatch.setattr(crm_cli, "_load_rows", lambda _project, _company: (selected,))
+
+    result = runner.invoke(app, ["crm", "list"])
+
+    assert result.exit_code == 0
+    output = plain_cli_output(result.output)
+    assert pipe_name in output
+    assert "Field" in output and "Value" in output
+    assert "Hillary Wallace" in output
+    assert "Follow up" in output
+
+
 def test_filters_are_forwarded(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[tuple[int | None, int | None]] = []
     monkeypatch.setattr(

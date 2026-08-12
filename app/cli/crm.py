@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import typer
+from rich.console import Console
+from rich.table import Table
 
 if TYPE_CHECKING:
     from app.modules.crm import CRMOverviewRow
@@ -63,9 +65,19 @@ def _render_text(rows: tuple[CRMOverviewRow, ...]) -> None:
     if not rows:
         typer.echo("No CRM records found.")
         return
-    typer.echo(" | ".join(_HEADERS))
-    for row in rows:
-        typer.echo(" | ".join(_text_value(value) for value in row.as_dict().values()))
+    console = Console(width=120)
+    for position, row in enumerate(rows, start=1):
+        table = Table(
+            "Field",
+            "Value",
+            title=f"CRM Record {position}",
+            show_lines=True,
+            expand=True,
+        )
+        table.columns[0].no_wrap = True
+        for heading, value in zip(_HEADERS, row.as_dict().values(), strict=True):
+            table.add_row(heading, _text_value(value))
+        console.print(table)
 
 
 @app.command("list")
