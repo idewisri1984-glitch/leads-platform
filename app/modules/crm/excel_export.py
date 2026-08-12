@@ -884,11 +884,12 @@ class CRMExcelExportService:
         title = " ".join(job_title.casefold().replace("-", " ").split())
         if any(alias in title for alias in ("co founder", "cofounder")):
             return 1
+        if "managing principal" in title:
+            return 4
         priorities = (
             (0, ("founder",)),
             (2, ("owner",)),
-            (3, ("managing principal",)),
-            (4, ("principal",)),
+            (3, ("principal",)),
             (5, ("partner",)),
             (6, ("president",)),
             (7, ("chief executive officer", "ceo")),

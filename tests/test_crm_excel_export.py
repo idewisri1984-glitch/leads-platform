@@ -375,3 +375,72 @@ def test_person_without_email_falls_back_to_company_and_no_email_remains_visible
     no_email = service._build_sales_leads((no_email_company,), (), (), ())[0]
     assert no_email.recommended_recipient_type == "NO_EMAIL"
     assert no_email.recommended_recipient is None
+
+
+def test_principal_ranks_ahead_of_managing_principal() -> None:
+    contacts = [
+        ExcelContact(
+            1,
+            11,
+            "Acme",
+            "Morgan",
+            "Manager",
+            "Managing Principal",
+            "managing@example.com",
+            None,
+            None,
+            None,
+            None,
+            "MANUAL_VERIFIED",
+            "ACTIVE",
+            None,
+        ),
+        ExcelContact(
+            2,
+            11,
+            "Acme",
+            "Priya",
+            "Principal",
+            "Principal",
+            "principal@example.com",
+            None,
+            None,
+            None,
+            None,
+            "MANUAL_VERIFIED",
+            "ACTIVE",
+            None,
+        ),
+    ]
+
+    selected = CRMExcelExportService._select_primary_contact(contacts)
+
+    assert selected is contacts[1]
+    assert selected.job_title == "Principal"
+
+
+def test_founder_still_ranks_ahead_of_principal_roles() -> None:
+    contacts = [
+        ExcelContact(
+            contact_id,
+            11,
+            "Acme",
+            role,
+            None,
+            role,
+            f"{contact_id}@example.com",
+            None,
+            None,
+            None,
+            None,
+            "MANUAL_VERIFIED",
+            "ACTIVE",
+            None,
+        )
+        for contact_id, role in enumerate(("Managing Principal", "Principal", "Founder"), start=1)
+    ]
+
+    selected = CRMExcelExportService._select_primary_contact(contacts)
+
+    assert selected is contacts[2]
+    assert selected.job_title == "Founder"
