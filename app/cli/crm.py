@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
@@ -11,6 +12,7 @@ from rich.text import Text
 
 if TYPE_CHECKING:
     from app.modules.crm import CRMOverviewRow
+    from app.modules.crm.excel_export import CRMExcelExportResult
 
 app = typer.Typer(help="Show a read-only CRM overview.")
 
@@ -42,6 +44,26 @@ def _load_rows(project_id: int | None, company_id: int | None) -> tuple[CRMOverv
     with SessionLocal() as session:
         snapshot = CRMOverviewRepository(session).load(project_id, company_id)
         return CRMOverviewService().build(snapshot)
+
+
+def _export_excel(
+    project_id: int | None,
+    company_id: int | None,
+    output_file: Path,
+    *,
+    overwrite: bool,
+) -> CRMExcelExportResult:
+    from app.core.database.session import SessionLocal
+    from app.modules.crm.excel_export import CRMExcelExportService
+
+    with SessionLocal() as session:
+        return CRMExcelExportService().export(
+            session,
+            project_id=project_id,
+            company_id=company_id,
+            output_file=output_file,
+            overwrite=overwrite,
+        )
 
 
 def _json_value(value: datetime | int | str | None) -> datetime | int | str | None:
@@ -104,3 +126,37 @@ def list_crm(
         typer.echo(json.dumps([_row_dict(row) for row in rows], ensure_ascii=True))
         return
     _render_text(rows)
+
+
+@app.command("export-excel")
+def export_excel(
+    output_file: Annotated[Path, typer.Option(help="Destination .xlsx file.")],
+    project_id: Annotated[int | None, typer.Option(help="Limit results to a Project ID.")] = None,
+    company_id: Annotated[int | None, typer.Option(help="Limit results to a Company ID.")] = None,
+    overwrite: Annotated[
+        bool, typer.Option(help="Replace an existing destination safely.")
+    ] = False,
+) -> None:
+    """Export the read-only CRM overview and supporting records to Excel."""
+    if project_id is not None and project_id <= 0:
+        raise typer.BadParameter("Project ID must be positive.", param_hint="--project-id")
+    if company_id is not None and company_id <= 0:
+        raise typer.BadParameter("Company ID must be positive.", param_hint="--company-id")
+    try:
+        result = _export_excel(
+            project_id,
+            company_id,
+            output_file,
+            overwrite=overwrite,
+        )
+    except Exception as error:
+        from app.modules.crm.excel_export import CRMExcelExportError
+
+        message = (
+            str(error) if isinstance(error, CRMExcelExportError) else "CRM Excel export failed."
+        )
+        typer.echo(message, err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"CRM Excel export created: {result.output_file}")
+    for sheet_name, count in result.counts.items():
+        typer.echo(f"{sheet_name}: {count}")
