@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 if TYPE_CHECKING:
     from app.modules.crm import CRMOverviewRow
@@ -76,7 +77,7 @@ def _render_text(rows: tuple[CRMOverviewRow, ...]) -> None:
         )
         table.columns[0].no_wrap = True
         for heading, value in zip(_HEADERS, row.as_dict().values(), strict=True):
-            table.add_row(heading, _text_value(value))
+            table.add_row(heading, Text(_text_value(value)))
         console.print(table)
 
 

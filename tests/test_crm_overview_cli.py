@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from typer.testing import CliRunner
 
 import app.cli.crm as crm_cli
@@ -76,6 +77,26 @@ def test_text_renderer_keeps_pipe_characters_inside_one_company_cell(monkeypatch
     assert "Field" in output and "Value" in output
     assert "Hillary Wallace" in output
     assert "Follow up" in output
+
+
+@pytest.mark.parametrize(
+    "literal_value",
+    [
+        "[bold]Literal[/bold]",
+        "[link=https://example.com]Company[/link]",
+    ],
+)
+def test_text_renderer_preserves_rich_markup_like_business_values_literally(
+    monkeypatch, literal_value: str
+) -> None:  # type: ignore[no-untyped-def]
+    selected = row()
+    selected = CRMOverviewRow(**{**selected.as_dict(), "company": literal_value})
+    monkeypatch.setattr(crm_cli, "_load_rows", lambda _project, _company: (selected,))
+
+    result = runner.invoke(app, ["crm", "list"])
+
+    assert result.exit_code == 0
+    assert literal_value in plain_cli_output(result.output)
 
 
 def test_filters_are_forwarded(monkeypatch) -> None:  # type: ignore[no-untyped-def]
