@@ -20,6 +20,7 @@ from app.modules.crm.excel_export import (
     ExcelOutreach,
     ExcelTask,
 )
+from tests.cli_output import plain_cli_output
 
 runner = CliRunner()
 NOW = datetime(2026, 8, 12, 2, 32, tzinfo=UTC)
@@ -120,11 +121,12 @@ def dataset(*, company_name: str = "Acme | Design | NY") -> CRMExcelDataset:
 def test_command_registration_help_and_required_output_file() -> None:
     help_result = runner.invoke(app, ["crm", "export-excel", "--help"])
     missing_result = runner.invoke(app, ["crm", "export-excel"])
+    plain_help = plain_cli_output(help_result.output)
     assert help_result.exit_code == 0
-    assert "--output-file" in help_result.output
-    assert "--project-id" in help_result.output
-    assert "--company-id" in help_result.output
-    assert "--overwrite" in help_result.output
+    assert "--output-file" in plain_help
+    assert "--project-id" in plain_help
+    assert "--company-id" in plain_help
+    assert "--overwrite" in plain_help
     assert missing_result.exit_code != 0
 
 
