@@ -658,6 +658,158 @@ def test_company_scoped_draft_preserves_its_recipient_in_sales_leads(
     assert values["Email Text"] == "Hello Example Design team, ..."
 
 
+@pytest.mark.parametrize("invalid_recipient", ("invalid", "   "))
+def test_company_scoped_draft_with_invalid_recipient_preserves_identity(
+    tmp_path: Path,
+    invalid_recipient: str,
+) -> None:
+    base = dataset(company_name="Example Design")
+    decision_maker = replace(
+        base.contacts[0],
+        first_name="Hillary",
+        last_name="Example",
+    )
+    person_without_lead = _crm_row(lead_id=None)
+    company_draft = _crm_row(
+        contact_id=None,
+        lead_id=9,
+        draft_id=1,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+    outreach = replace(
+        base.outreach[0],
+        contact="Example Design team",
+        recipient_email=invalid_recipient,
+        subject="Company introduction",
+        email_body="Hello Example Design team, ...",
+    )
+    sales_leads = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        (decision_maker,),
+        (person_without_lead, company_draft),
+        (outreach,),
+    )
+    output = (
+        CRMExcelExportService()
+        ._export_dataset(
+            replace(
+                base,
+                sales_leads=sales_leads,
+                leads=(person_without_lead, company_draft),
+                contacts=(decision_maker,),
+                outreach=(outreach,),
+            ),
+            tmp_path / f"invalid-company-draft-{invalid_recipient.strip() or 'blank'}.xlsx",
+        )
+        .output_file
+    )
+
+    sheet = load_workbook(output)["Sales Leads"]
+    values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
+    assert values["Decision Maker Name"] == "Hillary Example"
+    assert values["Decision Maker Email"] == "hillary@example.com"
+    assert values["Recommended Recipient Type"] == "NO_EMAIL"
+    assert values["Recommended Recipient"] is None
+    assert values["Email Subject"] == "Company introduction"
+    assert values["Email Text"] == "Hello Example Design team, ..."
+    assert values["Recommended Recipient"] != "hillary@example.com"
+
+
+def test_company_fallback_does_not_borrow_stronger_other_person_outreach(
+    tmp_path: Path,
+) -> None:
+    base = dataset(company_name="Example Design")
+    founder = replace(
+        base.contacts[0],
+        first_name="Founder",
+        last_name="A",
+        job_title="Founder",
+        email="founder-a@example.com",
+    )
+    other_contact = replace(
+        founder,
+        id=3,
+        first_name="Contact",
+        last_name="B",
+        job_title="Principal",
+        email="contact-b@example.com",
+    )
+    founder_without_lead = _crm_row(contact_id=founder.id, lead_id=None)
+    other_person_sent = _crm_row(
+        contact_id=other_contact.id,
+        lead_id=20,
+        draft_id=2,
+        draft_status="APPROVED",
+        outreach_status="MANUALLY_SENT",
+    )
+    company_fallback = _crm_row(
+        contact_id=None,
+        lead_id=30,
+        draft_id=3,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+    other_outreach = replace(
+        base.outreach[0],
+        draft_id=2,
+        contact="Contact B",
+        recipient_email="contact-b@example.com",
+        subject="Other person subject",
+        email_body="Other person body",
+    )
+    company_outreach = replace(
+        base.outreach[0],
+        draft_id=3,
+        contact="Example Design team",
+        recipient_email="info@example.com",
+        subject="Company fallback subject",
+        email_body="Company fallback body",
+        outreach_status="APPROVED",
+        manual_sent_at=None,
+    )
+    rows = (founder_without_lead, other_person_sent, company_fallback)
+    outreach = (other_outreach, company_outreach)
+    sales_leads = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        (founder, other_contact),
+        rows,
+        outreach,
+    )
+    output = (
+        CRMExcelExportService()
+        ._export_dataset(
+            replace(
+                base,
+                sales_leads=sales_leads,
+                leads=rows,
+                contacts=(founder, other_contact),
+                outreach=outreach,
+            ),
+            tmp_path / "cross-person-company-fallback.xlsx",
+        )
+        .output_file
+    )
+
+    sheet = load_workbook(output)["Sales Leads"]
+    values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
+    assert values["Decision Maker Contact ID"] == founder.id
+    assert values["Decision Maker Name"] == "Founder A"
+    assert values["Decision Maker Email"] == "founder-a@example.com"
+    assert values["Lead ID"] == 30
+    assert values["Draft ID"] == 3
+    assert values["Outreach Status"] == "APPROVED"
+    assert values["Recommended Recipient Type"] == "COMPANY"
+    assert values["Recommended Recipient"] == "info@example.com"
+    assert values["Email Subject"] == "Company fallback subject"
+    assert values["Email Text"] == "Company fallback body"
+    assert values["Lead ID"] != 20
+    assert values["Draft ID"] != 2
+    assert values["Recommended Recipient"] != "contact-b@example.com"
+    assert values["Email Subject"] != "Other person subject"
+    assert values["Email Text"] != "Other person body"
+
+
 def test_person_scoped_draft_keeps_decision_maker_recipient() -> None:
     selected = dataset().sales_leads[0]
 
