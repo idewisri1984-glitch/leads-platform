@@ -1,0 +1,861 @@
+import tomllib
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+from openpyxl import load_workbook
+from typer.testing import CliRunner
+
+import app.cli.crm as crm_cli
+from app.cli.main import app
+from app.modules.crm import CRMOverviewRow
+from app.modules.crm.excel_export import (
+    CRMExcelDataset,
+    CRMExcelExportError,
+    CRMExcelExportResult,
+    CRMExcelExportService,
+    ExcelCompany,
+    ExcelContact,
+    ExcelOutreach,
+    ExcelTask,
+)
+from tests.cli_output import plain_cli_output
+
+runner = CliRunner()
+NOW = datetime(2026, 8, 12, 2, 32, tzinfo=UTC)
+
+
+def dataset(*, company_name: str = "Acme | Design | NY") -> CRMExcelDataset:
+    row = CRMOverviewRow(
+        company_id=11,
+        company=company_name,
+        contact_id=2,
+        contact="[bold]Literal[/bold]",
+        role="Principal Designer",
+        email="hillary@example.com",
+        lead_id=2,
+        lead_status="NEW",
+        task_id=3,
+        task='=HYPERLINK("https://evil.example","click")',
+        task_status="TODO",
+        draft_id=1,
+        draft_task_id=2,
+        draft_status="APPROVED",
+        outreach_status="MANUALLY_SENT",
+        last_sent_at=NOW,
+    )
+    company = ExcelCompany(
+        11,
+        1,
+        company_name,
+        "@SUM(A1:A2)",
+        None,
+        None,
+        None,
+        "NEW",
+        None,
+        "info@example.com",
+        "+123456789",
+        "https://instagram.com/acme",
+        "https://linkedin.com/company/acme",
+        "https://acme.test/contact",
+        "https://acme.test/about",
+        "SUCCEEDED",
+        "https://acme.test",
+        NOW,
+        None,
+    )
+    contact = ExcelContact(
+        2,
+        11,
+        company_name,
+        "+1+1",
+        None,
+        "Founder",
+        "hillary@example.com",
+        None,
+        None,
+        None,
+        None,
+        "MANUAL_VERIFIED",
+        "NEW",
+        None,
+    )
+    outreach = ExcelOutreach(
+        1,
+        1,
+        company_name,
+        "+1+1",
+        "hillary@example.com",
+        "=Subject",
+        "APPROVED",
+        2,
+        "MANUAL",
+        "MANUALLY_SENT",
+        NOW,
+        None,
+        None,
+        NOW,
+        NOW,
+        NOW,
+        "[link=https://example.com]Company[/link]",
+    )
+    service = CRMExcelExportService()
+    sales = service._build_sales_leads((company,), (contact,), (row,), (outreach,))
+    return CRMExcelDataset(
+        sales_leads=sales,
+        leads=(row,),
+        lead_project_ids={11: 1},
+        task_due_dates={3: NOW},
+        companies=(company,),
+        contacts=(contact,),
+        tasks=(
+            ExcelTask(2, 2, company_name, "+1+1", "Historical", None, "DONE", None),
+            ExcelTask(3, 2, company_name, "+1+1", row.task or "", "@SUM(A1:A2)", "TODO", NOW),
+        ),
+        outreach=(outreach,),
+    )
+
+
+def test_command_registration_help_and_required_output_file() -> None:
+    help_result = runner.invoke(app, ["crm", "export-excel", "--help"])
+    missing_result = runner.invoke(app, ["crm", "export-excel"])
+    plain_help = plain_cli_output(help_result.output)
+    assert help_result.exit_code == 0
+    assert "--output-file" in plain_help
+    assert "--project-id" in plain_help
+    assert "--company-id" in plain_help
+    assert "--overwrite" in plain_help
+    assert missing_result.exit_code != 0
+
+
+def test_cli_forwards_filters_overwrite_and_reports_counts(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    calls: list[tuple[int | None, int | None, Path, bool]] = []
+    output = tmp_path / "crm.xlsx"
+
+    def export(
+        project: int | None,
+        company: int | None,
+        path: Path,
+        *,
+        overwrite: bool,
+    ) -> CRMExcelExportResult:
+        calls.append((project, company, path, overwrite))
+        return CRMExcelExportResult(
+            path,
+            {name: 0 for name in ("Sales Leads", "Companies", "Contacts", "Tasks", "Outreach")},
+        )
+
+    monkeypatch.setattr(crm_cli, "_export_excel", export)
+    result = runner.invoke(
+        app,
+        [
+            "crm",
+            "export-excel",
+            "--project-id",
+            "1",
+            "--company-id",
+            "11",
+            "--output-file",
+            str(output),
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 0
+    assert calls == [(1, 11, output, True)]
+    assert "CRM Excel export created:" in result.output
+    assert "Leads: 0" in result.output
+
+
+def test_cli_reports_safe_known_and_unknown_errors(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    def fail_known(*_args: object, **_kwargs: object) -> CRMExcelExportResult:
+        raise CRMExcelExportError("Destination already exists: export.xlsx")
+
+    monkeypatch.setattr(crm_cli, "_export_excel", fail_known)
+    known = runner.invoke(app, ["crm", "export-excel", "--output-file", str(tmp_path / "x")])
+
+    def fail_unknown(*_args: object, **_kwargs: object) -> CRMExcelExportResult:
+        raise RuntimeError("secret")
+
+    monkeypatch.setattr(crm_cli, "_export_excel", fail_unknown)
+    unknown = runner.invoke(app, ["crm", "export-excel", "--output-file", str(tmp_path / "y")])
+    assert known.exit_code == 1 and "Destination already exists" in known.stderr
+    assert unknown.exit_code == 1 and unknown.stderr == "CRM Excel export failed.\n"
+    assert "secret" not in unknown.output
+
+
+def test_workbook_structure_semantics_and_literal_cells(tmp_path: Path) -> None:
+    destination = tmp_path / "nested" / "crm"
+    result = CRMExcelExportService()._export_dataset(dataset(), destination)
+    assert result.output_file == Path(f"{destination}.xlsx")
+    workbook = load_workbook(result.output_file, data_only=False)
+    assert workbook.sheetnames == ["Sales Leads", "Companies", "Contacts", "Tasks", "Outreach"]
+    leads = workbook["Sales Leads"]
+    assert leads.freeze_panes == "A2"
+    assert leads.auto_filter.ref == "A1:AK2"
+    assert "SalesLeadsTable" in leads.tables
+    values = {
+        leads.cell(1, column).value: leads.cell(2, column)
+        for column in range(1, leads.max_column + 1)
+    }
+    assert values["Current Task ID"].value == 3
+    assert values["Draft ID"].value == 1
+    assert values["Recommended Recipient Type"].value == "DECISION_MAKER"
+    assert values["Recommended Recipient"].value == "hillary@example.com"
+    assert values["Email Subject"].value == "=Subject"
+    assert values["Email Subject"].data_type == "s"
+    assert values["Last Sent At"].number_format == "yyyy-mm-dd hh:mm:ss"
+    assert values["Company Name"].value == "Acme | Design | NY"
+    assert values["Decision Maker Name"].value == "+1+1"
+    assert values["Current Task"].data_type == "s"
+    assert values["Current Task"].value.startswith("=HYPERLINK")
+    assert workbook["Companies"]["D2"].data_type == "s"
+    assert workbook["Companies"]["D2"].value == "@SUM(A1:A2)"
+    assert workbook["Contacts"]["D2"].data_type == "s"
+    assert workbook["Tasks"]["F3"].data_type == "s"
+    assert workbook["Outreach"]["F2"].data_type == "s"
+    assert workbook["Outreach"]["G2"].value == "[link=https://example.com]Company[/link]"
+    assert workbook["Outreach"].column_dimensions["G"].width <= 80
+
+
+def test_empty_workbook_has_headers_without_invalid_tables(tmp_path: Path) -> None:
+    empty = CRMExcelDataset((), (), {}, {}, (), (), (), ())
+    destination = tmp_path / "empty.xlsx"
+    result = CRMExcelExportService()._export_dataset(empty, destination)
+    workbook = load_workbook(result.output_file)
+    assert result.counts == {name: 0 for name in workbook.sheetnames}
+    assert all(sheet.max_row == 1 and not sheet.tables for sheet in workbook.worksheets)
+
+
+def test_existing_destination_requires_overwrite_and_preserves_good_file(tmp_path: Path) -> None:
+    destination = tmp_path / "crm.xlsx"
+    destination.write_bytes(b"existing-good-file")
+    service = CRMExcelExportService()
+    with pytest.raises(CRMExcelExportError, match="Destination already exists"):
+        service._export_dataset(dataset(), destination)
+    assert destination.read_bytes() == b"existing-good-file"
+    service._export_dataset(dataset(), destination, overwrite=True)
+    assert load_workbook(destination).sheetnames == list(_SHEET_NAMES_FOR_TEST)
+
+
+_SHEET_NAMES_FOR_TEST = ("Sales Leads", "Companies", "Contacts", "Tasks", "Outreach")
+
+
+def test_company_only_and_recipient_priority_rules() -> None:
+    service = CRMExcelExportService()
+    company = ExcelCompany(
+        1,
+        1,
+        "Company Only",
+        None,
+        None,
+        None,
+        None,
+        "NEW",
+        None,
+        "hello@example.com",
+        None,
+        "https://instagram.com/company",
+        None,
+        None,
+        None,
+        "PARTIAL",
+        None,
+        None,
+        None,
+    )
+    company_only = service._build_sales_leads((company,), (), (), ())[0]
+    assert company_only.recommended_recipient_type == "COMPANY"
+    assert company_only.recommended_recipient == "hello@example.com"
+    assert company_only.decision_maker_name is None
+    assert company_only.email_subject is None and company_only.email_text is None
+
+    project_manager = ExcelContact(
+        1,
+        1,
+        company.name,
+        "Pat",
+        "Manager",
+        "Project Manager",
+        "pm@example.com",
+        None,
+        None,
+        None,
+        None,
+        "MANUAL",
+        "NEW",
+        None,
+    )
+    founder = ExcelContact(
+        2,
+        1,
+        company.name,
+        "Fran",
+        "Founder",
+        "Founder",
+        "founder@example.com",
+        None,
+        None,
+        None,
+        None,
+        "VERIFIED",
+        "NEW",
+        None,
+    )
+    selected = service._build_sales_leads((company,), (project_manager, founder), (), ())[0]
+    assert selected.decision_maker_contact_id == founder.id
+    assert selected.recommended_recipient_type == "DECISION_MAKER"
+    assert selected.recommended_recipient == "founder@example.com"
+    assert selected.company_email == "hello@example.com"
+
+
+def test_person_without_email_falls_back_to_company_and_no_email_remains_visible() -> None:
+    service = CRMExcelExportService()
+    company = ExcelCompany(
+        1,
+        1,
+        "Fallback",
+        None,
+        None,
+        None,
+        None,
+        "NEW",
+        None,
+        "info@example.com",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    principal = ExcelContact(
+        1,
+        1,
+        company.name,
+        "Priya",
+        None,
+        "Principal",
+        None,
+        None,
+        None,
+        None,
+        None,
+        "MANUAL",
+        "NEW",
+        None,
+    )
+    selected = service._build_sales_leads((company,), (principal,), (), ())[0]
+    assert selected.decision_maker_name == "Priya"
+    assert selected.decision_maker_email is None
+    assert selected.recommended_recipient_type == "COMPANY"
+    assert selected.recommended_recipient == "info@example.com"
+
+    no_email_company = ExcelCompany(
+        2,
+        1,
+        "Social Only",
+        None,
+        None,
+        None,
+        None,
+        "NEW",
+        None,
+        None,
+        None,
+        "https://instagram.com/social",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    no_email = service._build_sales_leads((no_email_company,), (), (), ())[0]
+    assert no_email.recommended_recipient_type == "NO_EMAIL"
+    assert no_email.recommended_recipient is None
+
+
+def test_principal_ranks_ahead_of_managing_principal() -> None:
+    contacts = [
+        ExcelContact(
+            1,
+            11,
+            "Acme",
+            "Morgan",
+            "Manager",
+            "Managing Principal",
+            "managing@example.com",
+            None,
+            None,
+            None,
+            None,
+            "MANUAL_VERIFIED",
+            "ACTIVE",
+            None,
+        ),
+        ExcelContact(
+            2,
+            11,
+            "Acme",
+            "Priya",
+            "Principal",
+            "Principal",
+            "principal@example.com",
+            None,
+            None,
+            None,
+            None,
+            "MANUAL_VERIFIED",
+            "ACTIVE",
+            None,
+        ),
+    ]
+
+    selected = CRMExcelExportService._select_primary_contact(contacts)
+
+    assert selected is contacts[1]
+    assert selected.job_title == "Principal"
+
+
+def test_founder_still_ranks_ahead_of_principal_roles() -> None:
+    contacts = [
+        ExcelContact(
+            contact_id,
+            11,
+            "Acme",
+            role,
+            None,
+            role,
+            f"{contact_id}@example.com",
+            None,
+            None,
+            None,
+            None,
+            "MANUAL_VERIFIED",
+            "ACTIVE",
+            None,
+        )
+        for contact_id, role in enumerate(("Managing Principal", "Principal", "Founder"), start=1)
+    ]
+
+    selected = CRMExcelExportService._select_primary_contact(contacts)
+
+    assert selected is contacts[2]
+    assert selected.job_title == "Founder"
+
+
+def _crm_row(
+    *,
+    contact_id: int | None = 2,
+    lead_id: int | None,
+    task_id: int | None = None,
+    task_status: str | None = None,
+    draft_id: int | None = None,
+    draft_status: str | None = None,
+    outreach_status: str = "NO_DRAFT",
+) -> CRMOverviewRow:
+    return CRMOverviewRow(
+        company_id=11,
+        company="Acme",
+        contact_id=contact_id,
+        contact="Fran Founder" if contact_id is not None else None,
+        role="Founder" if contact_id is not None else None,
+        email="founder@example.com" if contact_id is not None else None,
+        lead_id=lead_id,
+        lead_status="NEW" if lead_id is not None else None,
+        task_id=task_id,
+        task="Current work" if task_id is not None else None,
+        task_status=task_status,
+        draft_id=draft_id,
+        draft_task_id=task_id if draft_id is not None else None,
+        draft_status=draft_status,
+        outreach_status=outreach_status,
+        last_sent_at=NOW if outreach_status == "MANUALLY_SENT" else None,
+    )
+
+
+def test_openpyxl_is_runtime_dependency_and_types_remain_dev_only() -> None:
+    metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    runtime = metadata["project"]["dependencies"]
+    development = metadata["dependency-groups"]["dev"]
+
+    assert any(requirement.startswith("openpyxl>=") for requirement in runtime)
+    assert not any(requirement.startswith("openpyxl>=") for requirement in development)
+    assert any(requirement.startswith("types-openpyxl>=") for requirement in development)
+    assert not any(requirement.startswith("types-openpyxl>=") for requirement in runtime)
+
+
+def test_master_row_prefers_sent_draft_over_older_lead() -> None:
+    base = dataset()
+    older = _crm_row(lead_id=1)
+    relevant = _crm_row(
+        lead_id=2,
+        task_id=2,
+        task_status="DONE",
+        draft_id=1,
+        draft_status="APPROVED",
+        outreach_status="MANUALLY_SENT",
+    )
+
+    selected = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        base.contacts,
+        (older, relevant),
+        base.outreach,
+    )[0]
+
+    assert selected.lead_id == 2
+    assert selected.draft_id == 1
+    assert selected.draft_status == "APPROVED"
+    assert selected.outreach_status == "MANUALLY_SENT"
+    assert selected.email_subject == "=Subject"
+    assert selected.email_text == "[link=https://example.com]Company[/link]"
+
+
+def test_master_row_prefers_active_task_but_not_over_draft() -> None:
+    without_state = _crm_row(lead_id=1)
+    active = _crm_row(lead_id=2, task_id=5, task_status="TODO")
+    drafted = _crm_row(lead_id=3, draft_id=7, draft_status="APPROVED")
+
+    assert (
+        CRMExcelExportService._select_master_row([without_state, active], dataset().contacts[0])
+        is active
+    )
+    assert (
+        CRMExcelExportService._select_master_row([active, drafted], dataset().contacts[0])
+        is drafted
+    )
+
+
+def test_master_row_uses_truthful_unassigned_company_fallback() -> None:
+    person_without_lead = _crm_row(lead_id=None)
+    company_draft = _crm_row(
+        contact_id=None,
+        lead_id=9,
+        draft_id=8,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+
+    selected = CRMExcelExportService._select_master_row(
+        [person_without_lead, company_draft], dataset().contacts[0]
+    )
+
+    assert selected is company_draft
+    assert selected.contact_id is None
+
+
+def _role_contact(contact_id: int, title: str) -> ExcelContact:
+    return ExcelContact(
+        contact_id,
+        11,
+        "Acme",
+        title,
+        None,
+        title,
+        f"contact-{contact_id}@example.com",
+        None,
+        None,
+        None,
+        None,
+        "MANUAL_VERIFIED",
+        "ACTIVE",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "Executive Assistant to Founder",
+        "Assistant to the Owner",
+        "Founder's Assistant",
+        "Procurement Intern",
+        "Procurement Coordinator",
+        "Purchasing Assistant",
+        "Partner Liaison",
+        "Project Manager Assistant",
+    ),
+)
+def test_subordinate_titles_are_not_decision_makers(title: str) -> None:
+    principal = _role_contact(100, "Principal")
+    subordinate = _role_contact(1, title)
+
+    assert CRMExcelExportService._select_primary_contact([subordinate, principal]) is principal
+    assert CRMExcelExportService._role_rank(title) is None
+
+
+@pytest.mark.parametrize(
+    ("title", "rank"),
+    (
+        ("Founder", 0),
+        ("Co-Founder", 1),
+        ("Founder & Principal", 0),
+        ("Co-Founder and Creative Director", 1),
+        ("HEAD OF PROCUREMENT", 12),
+        ("Director of Procurement", 12),
+        ("Procurement Director", 12),
+        ("Head of Purchasing", 12),
+        ("Purchasing Director", 12),
+    ),
+)
+def test_legitimate_normalized_decision_maker_titles(title: str, rank: int) -> None:
+    assert CRMExcelExportService._role_rank(title) == rank
+
+
+def test_senior_project_manager_still_ranks_ahead_of_project_manager() -> None:
+    senior = _role_contact(2, "Senior Project Manager")
+    project_manager = _role_contact(1, "Project Manager")
+
+    assert CRMExcelExportService._select_primary_contact([project_manager, senior]) is senior
+
+
+def test_company_scoped_draft_preserves_its_recipient_in_sales_leads(
+    tmp_path: Path,
+) -> None:
+    base = dataset()
+    person_without_lead = _crm_row(lead_id=None)
+    company_draft = _crm_row(
+        contact_id=None,
+        lead_id=9,
+        draft_id=1,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+    outreach = replace(
+        base.outreach[0],
+        contact="Example Design team",
+        recipient_email="info@example.com",
+        subject="Company introduction",
+        email_body="Hello Example Design team, ...",
+    )
+    sales_leads = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        base.contacts,
+        (person_without_lead, company_draft),
+        (outreach,),
+    )
+    output = (
+        CRMExcelExportService()
+        ._export_dataset(
+            replace(base, sales_leads=sales_leads, leads=(person_without_lead, company_draft)),
+            tmp_path / "company-draft.xlsx",
+        )
+        .output_file
+    )
+
+    sheet = load_workbook(output)["Sales Leads"]
+    values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
+    assert values["Decision Maker Name"] == "+1+1"
+    assert values["Decision Maker Email"] == "hillary@example.com"
+    assert values["Recommended Recipient Type"] == "COMPANY"
+    assert values["Recommended Recipient"] == "info@example.com"
+    assert values["Email Subject"] == "Company introduction"
+    assert values["Email Text"] == "Hello Example Design team, ..."
+
+
+@pytest.mark.parametrize("invalid_recipient", ("invalid", "   "))
+def test_company_scoped_draft_with_invalid_recipient_preserves_identity(
+    tmp_path: Path,
+    invalid_recipient: str,
+) -> None:
+    base = dataset(company_name="Example Design")
+    decision_maker = replace(
+        base.contacts[0],
+        first_name="Hillary",
+        last_name="Example",
+    )
+    person_without_lead = _crm_row(lead_id=None)
+    company_draft = _crm_row(
+        contact_id=None,
+        lead_id=9,
+        draft_id=1,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+    outreach = replace(
+        base.outreach[0],
+        contact="Example Design team",
+        recipient_email=invalid_recipient,
+        subject="Company introduction",
+        email_body="Hello Example Design team, ...",
+    )
+    sales_leads = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        (decision_maker,),
+        (person_without_lead, company_draft),
+        (outreach,),
+    )
+    output = (
+        CRMExcelExportService()
+        ._export_dataset(
+            replace(
+                base,
+                sales_leads=sales_leads,
+                leads=(person_without_lead, company_draft),
+                contacts=(decision_maker,),
+                outreach=(outreach,),
+            ),
+            tmp_path / f"invalid-company-draft-{invalid_recipient.strip() or 'blank'}.xlsx",
+        )
+        .output_file
+    )
+
+    sheet = load_workbook(output)["Sales Leads"]
+    values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
+    assert values["Decision Maker Name"] == "Hillary Example"
+    assert values["Decision Maker Email"] == "hillary@example.com"
+    assert values["Recommended Recipient Type"] == "NO_EMAIL"
+    assert values["Recommended Recipient"] is None
+    assert values["Email Subject"] == "Company introduction"
+    assert values["Email Text"] == "Hello Example Design team, ..."
+    assert values["Recommended Recipient"] != "hillary@example.com"
+
+
+def test_company_fallback_does_not_borrow_stronger_other_person_outreach(
+    tmp_path: Path,
+) -> None:
+    base = dataset(company_name="Example Design")
+    founder = replace(
+        base.contacts[0],
+        first_name="Founder",
+        last_name="A",
+        job_title="Founder",
+        email="founder-a@example.com",
+    )
+    other_contact = replace(
+        founder,
+        id=3,
+        first_name="Contact",
+        last_name="B",
+        job_title="Principal",
+        email="contact-b@example.com",
+    )
+    founder_without_lead = _crm_row(contact_id=founder.id, lead_id=None)
+    other_person_sent = _crm_row(
+        contact_id=other_contact.id,
+        lead_id=20,
+        draft_id=2,
+        draft_status="APPROVED",
+        outreach_status="MANUALLY_SENT",
+    )
+    company_fallback = _crm_row(
+        contact_id=None,
+        lead_id=30,
+        draft_id=3,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+    other_outreach = replace(
+        base.outreach[0],
+        draft_id=2,
+        contact="Contact B",
+        recipient_email="contact-b@example.com",
+        subject="Other person subject",
+        email_body="Other person body",
+    )
+    company_outreach = replace(
+        base.outreach[0],
+        draft_id=3,
+        contact="Example Design team",
+        recipient_email="info@example.com",
+        subject="Company fallback subject",
+        email_body="Company fallback body",
+        outreach_status="APPROVED",
+        manual_sent_at=None,
+    )
+    rows = (founder_without_lead, other_person_sent, company_fallback)
+    outreach = (other_outreach, company_outreach)
+    sales_leads = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        (founder, other_contact),
+        rows,
+        outreach,
+    )
+    output = (
+        CRMExcelExportService()
+        ._export_dataset(
+            replace(
+                base,
+                sales_leads=sales_leads,
+                leads=rows,
+                contacts=(founder, other_contact),
+                outreach=outreach,
+            ),
+            tmp_path / "cross-person-company-fallback.xlsx",
+        )
+        .output_file
+    )
+
+    sheet = load_workbook(output)["Sales Leads"]
+    values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
+    assert values["Decision Maker Contact ID"] == founder.id
+    assert values["Decision Maker Name"] == "Founder A"
+    assert values["Decision Maker Email"] == "founder-a@example.com"
+    assert values["Lead ID"] == 30
+    assert values["Draft ID"] == 3
+    assert values["Outreach Status"] == "APPROVED"
+    assert values["Recommended Recipient Type"] == "COMPANY"
+    assert values["Recommended Recipient"] == "info@example.com"
+    assert values["Email Subject"] == "Company fallback subject"
+    assert values["Email Text"] == "Company fallback body"
+    assert values["Lead ID"] != 20
+    assert values["Draft ID"] != 2
+    assert values["Recommended Recipient"] != "contact-b@example.com"
+    assert values["Email Subject"] != "Other person subject"
+    assert values["Email Text"] != "Other person body"
+
+
+def test_person_scoped_draft_keeps_decision_maker_recipient() -> None:
+    selected = dataset().sales_leads[0]
+
+    assert selected.recommended_recipient_type == "DECISION_MAKER"
+    assert selected.recommended_recipient == "hillary@example.com"
+    assert selected.email_subject == "=Subject"
+
+
+def test_company_scoped_lead_without_draft_keeps_person_recommendation() -> None:
+    base = dataset()
+    person_without_lead = _crm_row(lead_id=None)
+    company_lead = _crm_row(contact_id=None, lead_id=9)
+
+    selected = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        base.contacts,
+        (person_without_lead, company_lead),
+        (),
+    )[0]
+
+    assert selected.lead_id == 9
+    assert selected.draft_id is None
+    assert selected.recommended_recipient_type == "DECISION_MAKER"
+    assert selected.recommended_recipient == "hillary@example.com"
+    assert selected.email_subject is None
+    assert selected.email_text is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    ("Managing Principal & Founder", "Founder & Managing Principal"),
+)
+def test_composite_role_priority_is_order_independent(title: str) -> None:
+    assert CRMExcelExportService._role_rank(title) == 0
+
+
+@pytest.mark.parametrize(
+    ("title", "rank"),
+    (
+        ("Co-Founder & Creative Director", 1),
+        ("Owner / Principal", 2),
+        ("Principal & Design Director", 3),
+        ("Senior Project Manager / Project Manager", 13),
+    ),
+)
+def test_composite_roles_use_highest_semantic_priority(title: str, rank: int) -> None:
+    assert CRMExcelExportService._role_rank(title) == rank
