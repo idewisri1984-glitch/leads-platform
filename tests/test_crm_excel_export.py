@@ -1,3 +1,4 @@
+import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -444,3 +445,169 @@ def test_founder_still_ranks_ahead_of_principal_roles() -> None:
 
     assert selected is contacts[2]
     assert selected.job_title == "Founder"
+
+
+def _crm_row(
+    *,
+    contact_id: int | None = 2,
+    lead_id: int | None,
+    task_id: int | None = None,
+    task_status: str | None = None,
+    draft_id: int | None = None,
+    draft_status: str | None = None,
+    outreach_status: str = "NO_DRAFT",
+) -> CRMOverviewRow:
+    return CRMOverviewRow(
+        company_id=11,
+        company="Acme",
+        contact_id=contact_id,
+        contact="Fran Founder" if contact_id is not None else None,
+        role="Founder" if contact_id is not None else None,
+        email="founder@example.com" if contact_id is not None else None,
+        lead_id=lead_id,
+        lead_status="NEW" if lead_id is not None else None,
+        task_id=task_id,
+        task="Current work" if task_id is not None else None,
+        task_status=task_status,
+        draft_id=draft_id,
+        draft_task_id=task_id if draft_id is not None else None,
+        draft_status=draft_status,
+        outreach_status=outreach_status,
+        last_sent_at=NOW if outreach_status == "MANUALLY_SENT" else None,
+    )
+
+
+def test_openpyxl_is_runtime_dependency_and_types_remain_dev_only() -> None:
+    metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    runtime = metadata["project"]["dependencies"]
+    development = metadata["dependency-groups"]["dev"]
+
+    assert any(requirement.startswith("openpyxl>=") for requirement in runtime)
+    assert not any(requirement.startswith("openpyxl>=") for requirement in development)
+    assert any(requirement.startswith("types-openpyxl>=") for requirement in development)
+    assert not any(requirement.startswith("types-openpyxl>=") for requirement in runtime)
+
+
+def test_master_row_prefers_sent_draft_over_older_lead() -> None:
+    base = dataset()
+    older = _crm_row(lead_id=1)
+    relevant = _crm_row(
+        lead_id=2,
+        task_id=2,
+        task_status="DONE",
+        draft_id=1,
+        draft_status="APPROVED",
+        outreach_status="MANUALLY_SENT",
+    )
+
+    selected = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        base.contacts,
+        (older, relevant),
+        base.outreach,
+    )[0]
+
+    assert selected.lead_id == 2
+    assert selected.draft_id == 1
+    assert selected.draft_status == "APPROVED"
+    assert selected.outreach_status == "MANUALLY_SENT"
+    assert selected.email_subject == "=Subject"
+    assert selected.email_text == "[link=https://example.com]Company[/link]"
+
+
+def test_master_row_prefers_active_task_but_not_over_draft() -> None:
+    without_state = _crm_row(lead_id=1)
+    active = _crm_row(lead_id=2, task_id=5, task_status="TODO")
+    drafted = _crm_row(lead_id=3, draft_id=7, draft_status="APPROVED")
+
+    assert (
+        CRMExcelExportService._select_master_row([without_state, active], dataset().contacts[0])
+        is active
+    )
+    assert (
+        CRMExcelExportService._select_master_row([active, drafted], dataset().contacts[0])
+        is drafted
+    )
+
+
+def test_master_row_uses_truthful_unassigned_company_fallback() -> None:
+    person_without_lead = _crm_row(lead_id=None)
+    company_draft = _crm_row(
+        contact_id=None,
+        lead_id=9,
+        draft_id=8,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+
+    selected = CRMExcelExportService._select_master_row(
+        [person_without_lead, company_draft], dataset().contacts[0]
+    )
+
+    assert selected is company_draft
+    assert selected.contact_id is None
+
+
+def _role_contact(contact_id: int, title: str) -> ExcelContact:
+    return ExcelContact(
+        contact_id,
+        11,
+        "Acme",
+        title,
+        None,
+        title,
+        f"contact-{contact_id}@example.com",
+        None,
+        None,
+        None,
+        None,
+        "MANUAL_VERIFIED",
+        "ACTIVE",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "Executive Assistant to Founder",
+        "Assistant to the Owner",
+        "Founder's Assistant",
+        "Procurement Intern",
+        "Procurement Coordinator",
+        "Purchasing Assistant",
+        "Partner Liaison",
+        "Project Manager Assistant",
+    ),
+)
+def test_subordinate_titles_are_not_decision_makers(title: str) -> None:
+    principal = _role_contact(100, "Principal")
+    subordinate = _role_contact(1, title)
+
+    assert CRMExcelExportService._select_primary_contact([subordinate, principal]) is principal
+    assert CRMExcelExportService._role_rank(title) is None
+
+
+@pytest.mark.parametrize(
+    ("title", "rank"),
+    (
+        ("Founder", 0),
+        ("Co-Founder", 1),
+        ("Founder & Principal", 0),
+        ("Co-Founder and Creative Director", 1),
+        ("HEAD OF PROCUREMENT", 12),
+        ("Director of Procurement", 12),
+        ("Procurement Director", 12),
+        ("Head of Purchasing", 12),
+        ("Purchasing Director", 12),
+    ),
+)
+def test_legitimate_normalized_decision_maker_titles(title: str, rank: int) -> None:
+    assert CRMExcelExportService._role_rank(title) == rank
+
+
+def test_senior_project_manager_still_ranks_ahead_of_project_manager() -> None:
+    senior = _role_contact(2, "Senior Project Manager")
+    project_manager = _role_contact(1, "Project Manager")
+
+    assert CRMExcelExportService._select_primary_contact([project_manager, senior]) is senior

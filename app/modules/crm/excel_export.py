@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -873,19 +874,70 @@ class CRMExcelExportService:
     ) -> CRMOverviewRow | None:
         if primary is not None:
             matching = [row for row in rows if row.contact_id == primary.id]
-            return min(matching, key=lambda row: row.lead_id or 0, default=None)
+            selected = max(matching, key=CRMExcelExportService._master_row_key, default=None)
+            if selected is not None and CRMExcelExportService._master_row_strength(selected) > 0:
+                return selected
         unassigned = [row for row in rows if row.contact_id is None]
-        return min(unassigned, key=lambda row: row.lead_id or 0, default=None)
+        return max(unassigned, key=CRMExcelExportService._master_row_key, default=None)
+
+    @staticmethod
+    def _master_row_strength(row: CRMOverviewRow) -> int:
+        if row.outreach_status in {"MANUALLY_SENT", "AUTOMATIC_ACCEPTED"}:
+            return 4
+        if row.draft_id is not None:
+            return 3
+        if row.task_status in {"TODO", "IN_PROGRESS"}:
+            return 2
+        if row.lead_id is not None:
+            return 1
+        return 0
+
+    @classmethod
+    def _master_row_key(cls, row: CRMOverviewRow) -> tuple[int, str, int, int, int]:
+        return (
+            cls._master_row_strength(row),
+            row.last_sent_at.isoformat() if row.last_sent_at else "",
+            row.draft_id or 0,
+            row.task_id or 0,
+            row.lead_id or 0,
+        )
 
     @staticmethod
     def _role_rank(job_title: str | None) -> int | None:
         if not job_title:
             return None
-        title = " ".join(job_title.casefold().replace("-", " ").split())
-        if any(alias in title for alias in ("co founder", "cofounder")):
+        title = " ".join(re.sub(r"[^a-z0-9]+", " ", job_title.casefold()).split())
+        padded = f" {title} "
+        subordinate_tokens = {
+            "assistant",
+            "intern",
+            "internship",
+            "coordinator",
+            "liaison",
+        }
+        if subordinate_tokens.intersection(title.split()):
+            return None
+
+        def contains(phrase: str) -> bool:
+            return f" {phrase} " in padded
+
+        if contains("co founder") or contains("cofounder"):
             return 1
-        if "managing principal" in title:
+        if contains("managing principal"):
             return 4
+        procurement_leadership = (
+            "head of procurement",
+            "director of procurement",
+            "procurement director",
+            "head of purchasing",
+            "director of purchasing",
+            "purchasing director",
+            "chief procurement officer",
+            "procurement manager",
+            "purchasing manager",
+        )
+        if any(contains(phrase) for phrase in procurement_leadership):
+            return 12
         priorities = (
             (0, ("founder",)),
             (2, ("owner",)),
@@ -897,12 +949,11 @@ class CRMExcelExportService:
             (9, ("design director",)),
             (10, ("studio director",)),
             (11, ("managing director",)),
-            (12, ("procurement", "purchasing")),
             (13, ("senior project manager",)),
             (14, ("project manager",)),
         )
         return next(
-            (rank for rank, aliases in priorities if any(alias in title for alias in aliases)),
+            (rank for rank, aliases in priorities if any(contains(alias) for alias in aliases)),
             None,
         )
 
