@@ -808,7 +808,25 @@ class CRMExcelExportService:
             )
             company_email = company.company_email
             usable_company_email = company_email if self._usable_email(company_email) else None
-            if decision_email is not None:
+            company_scoped_draft = (
+                draft
+                if selected_row is not None
+                and selected_row.contact_id is None
+                and draft is not None
+                else None
+            )
+            if company_scoped_draft is not None:
+                draft_recipient = (
+                    company_scoped_draft.recipient_email
+                    if self._usable_email(company_scoped_draft.recipient_email)
+                    else None
+                )
+                recipient_type, recipient = (
+                    ("COMPANY", draft_recipient)
+                    if draft_recipient is not None
+                    else ("NO_EMAIL", None)
+                )
+            elif decision_email is not None:
                 recipient_type, recipient = "DECISION_MAKER", decision_email
             elif usable_company_email is not None:
                 recipient_type, recipient = "COMPANY", usable_company_email
@@ -921,10 +939,18 @@ class CRMExcelExportService:
         def contains(phrase: str) -> bool:
             return f" {phrase} " in padded
 
+        matched_ranks: list[int] = []
+        generic_title = padded
         if contains("co founder") or contains("cofounder"):
-            return 1
+            matched_ranks.append(1)
+            generic_title = generic_title.replace(" co founder ", " ").replace(" cofounder ", " ")
         if contains("managing principal"):
-            return 4
+            matched_ranks.append(4)
+            generic_title = generic_title.replace(" managing principal ", " ")
+
+        def contains_generic(phrase: str) -> bool:
+            return f" {phrase} " in generic_title
+
         procurement_leadership = (
             "head of procurement",
             "director of procurement",
@@ -937,7 +963,7 @@ class CRMExcelExportService:
             "purchasing manager",
         )
         if any(contains(phrase) for phrase in procurement_leadership):
-            return 12
+            matched_ranks.append(12)
         priorities = (
             (0, ("founder",)),
             (2, ("owner",)),
@@ -952,10 +978,12 @@ class CRMExcelExportService:
             (13, ("senior project manager",)),
             (14, ("project manager",)),
         )
-        return next(
-            (rank for rank, aliases in priorities if any(contains(alias) for alias in aliases)),
-            None,
+        matched_ranks.extend(
+            rank
+            for rank, aliases in priorities
+            if any(contains_generic(alias) for alias in aliases)
         )
+        return min(matched_ranks, default=None)
 
     @staticmethod
     def _usable_email(value: str | None) -> bool:

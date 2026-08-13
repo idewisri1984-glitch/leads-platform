@@ -1,4 +1,5 @@
 import tomllib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -611,3 +612,96 @@ def test_senior_project_manager_still_ranks_ahead_of_project_manager() -> None:
     project_manager = _role_contact(1, "Project Manager")
 
     assert CRMExcelExportService._select_primary_contact([project_manager, senior]) is senior
+
+
+def test_company_scoped_draft_preserves_its_recipient_in_sales_leads(
+    tmp_path: Path,
+) -> None:
+    base = dataset()
+    person_without_lead = _crm_row(lead_id=None)
+    company_draft = _crm_row(
+        contact_id=None,
+        lead_id=9,
+        draft_id=1,
+        draft_status="APPROVED",
+        outreach_status="APPROVED",
+    )
+    outreach = replace(
+        base.outreach[0],
+        contact="Example Design team",
+        recipient_email="info@example.com",
+        subject="Company introduction",
+        email_body="Hello Example Design team, ...",
+    )
+    sales_leads = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        base.contacts,
+        (person_without_lead, company_draft),
+        (outreach,),
+    )
+    output = (
+        CRMExcelExportService()
+        ._export_dataset(
+            replace(base, sales_leads=sales_leads, leads=(person_without_lead, company_draft)),
+            tmp_path / "company-draft.xlsx",
+        )
+        .output_file
+    )
+
+    sheet = load_workbook(output)["Sales Leads"]
+    values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
+    assert values["Decision Maker Name"] == "+1+1"
+    assert values["Decision Maker Email"] == "hillary@example.com"
+    assert values["Recommended Recipient Type"] == "COMPANY"
+    assert values["Recommended Recipient"] == "info@example.com"
+    assert values["Email Subject"] == "Company introduction"
+    assert values["Email Text"] == "Hello Example Design team, ..."
+
+
+def test_person_scoped_draft_keeps_decision_maker_recipient() -> None:
+    selected = dataset().sales_leads[0]
+
+    assert selected.recommended_recipient_type == "DECISION_MAKER"
+    assert selected.recommended_recipient == "hillary@example.com"
+    assert selected.email_subject == "=Subject"
+
+
+def test_company_scoped_lead_without_draft_keeps_person_recommendation() -> None:
+    base = dataset()
+    person_without_lead = _crm_row(lead_id=None)
+    company_lead = _crm_row(contact_id=None, lead_id=9)
+
+    selected = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        base.contacts,
+        (person_without_lead, company_lead),
+        (),
+    )[0]
+
+    assert selected.lead_id == 9
+    assert selected.draft_id is None
+    assert selected.recommended_recipient_type == "DECISION_MAKER"
+    assert selected.recommended_recipient == "hillary@example.com"
+    assert selected.email_subject is None
+    assert selected.email_text is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    ("Managing Principal & Founder", "Founder & Managing Principal"),
+)
+def test_composite_role_priority_is_order_independent(title: str) -> None:
+    assert CRMExcelExportService._role_rank(title) == 0
+
+
+@pytest.mark.parametrize(
+    ("title", "rank"),
+    (
+        ("Co-Founder & Creative Director", 1),
+        ("Owner / Principal", 2),
+        ("Principal & Design Director", 3),
+        ("Senior Project Manager / Project Manager", 13),
+    ),
+)
+def test_composite_roles_use_highest_semantic_priority(title: str, rank: int) -> None:
+    assert CRMExcelExportService._role_rank(title) == rank
