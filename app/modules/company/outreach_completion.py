@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from typing import Protocol, cast
 
 from sqlalchemy.exc import IntegrityError
@@ -248,8 +249,11 @@ class CompanyScopedOutreachCompletionService:
         if persisted_email != normalized_email:
             raise CompanyScopedOutreachCompletionConflictError(_EMAIL_CONFLICT)
 
-        lead, lead_created = self._find_or_create_lead(lead_repository, data.company_id)
-        task, task_created = self._find_or_create_task(task_repository, lead.id)
+        lead, task, lead_created, task_created = self._find_or_create_outreach(
+            lead_repository,
+            task_repository,
+            data.company_id,
+        )
         return CompanyScopedOutreachCompletionResult(
             project_id=data.project_id,
             company_id=data.company_id,
@@ -308,55 +312,60 @@ class CompanyScopedOutreachCompletionService:
         return session
 
     @staticmethod
-    def _find_or_create_lead(
-        repository: LeadRepository, company_id: int
-    ) -> tuple[_LeadRecord, bool]:
-        leads = _repository_call(lambda: repository.get_by_company(company_id))
+    def _find_or_create_outreach(
+        lead_repository: LeadRepository,
+        task_repository: TaskRepository,
+        company_id: int,
+    ) -> tuple[_LeadRecord, _TaskRecord, bool, bool]:
+        leads = _repository_call(lambda: lead_repository.get_by_company(company_id))
         company_scoped = sorted(
             (lead for lead in leads if getattr(lead, "contact_id", object()) is None),
             key=lambda lead: getattr(lead, "id", 0),
         )
-        if company_scoped:
-            lead = company_scoped[0]
+        for lead in company_scoped:
             CompanyScopedOutreachCompletionService._validate_lead(lead, company_id)
-            return lead, False
-        lead = _repository_call(
-            lambda: repository.create_pending(
-                company_id=company_id,
-                contact_id=None,
-                status="NEW",
-                source=_LEAD_SOURCE,
-                notes=None,
-            )
-        )
-        CompanyScopedOutreachCompletionService._validate_lead(lead, company_id)
-        return lead, True
 
-    @staticmethod
-    def _find_or_create_task(repository: TaskRepository, lead_id: int) -> tuple[_TaskRecord, bool]:
-        tasks = _repository_call(lambda: repository.get_by_lead(lead_id))
-        matching = sorted(
-            (
-                task
-                for task in tasks
-                if getattr(task, "title", None) == _TASK_TITLE
-                and getattr(task, "status", None) in _ACTIVE_TASK_STATUSES
-            ),
-            key=lambda task: getattr(task, "id", 0),
-        )
-        if matching:
-            task = matching[0]
-            CompanyScopedOutreachCompletionService._validate_task(task, lead_id)
-            return task, False
+        active: list[tuple[_LeadRecord, _TaskRecord]] = []
+        for lead in company_scoped:
+            tasks = _repository_call(partial(task_repository.get_by_lead, lead.id))
+            for task in tasks:
+                if (
+                    getattr(task, "title", None) == _TASK_TITLE
+                    and getattr(task, "status", None) in _ACTIVE_TASK_STATUSES
+                ):
+                    CompanyScopedOutreachCompletionService._validate_task(task, lead.id)
+                    active.append((lead, task))
+
+        if len(active) > 1:
+            raise CompanyScopedOutreachCompletionConflictError(_CONFLICT)
+        if active:
+            owning_lead, active_task = active[0]
+            return owning_lead, active_task, False, False
+
+        lead_created = not company_scoped
+        if lead_created:
+            lead = _repository_call(
+                lambda: lead_repository.create_pending(
+                    company_id=company_id,
+                    contact_id=None,
+                    status="NEW",
+                    source=_LEAD_SOURCE,
+                    notes=None,
+                )
+            )
+            CompanyScopedOutreachCompletionService._validate_lead(lead, company_id)
+        else:
+            lead = company_scoped[0]
+
         task = _repository_call(
-            lambda: repository.create_for_lead(
-                lead_id=lead_id,
+            lambda: task_repository.create_for_lead(
+                lead_id=lead.id,
                 title=_TASK_TITLE,
                 description=_TASK_DESCRIPTION,
             )
         )
-        CompanyScopedOutreachCompletionService._validate_task(task, lead_id)
-        return task, True
+        CompanyScopedOutreachCompletionService._validate_task(task, lead.id)
+        return lead, task, lead_created, True
 
     @staticmethod
     def _validate_lead(lead: _LeadRecord, company_id: int) -> None:

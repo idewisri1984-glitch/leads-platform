@@ -118,6 +118,35 @@ def counts() -> tuple[int, int, int]:
         )
 
 
+def seed_duplicate_leads(
+    company_id: int,
+    statuses: tuple[str | None, str | None],
+) -> tuple[tuple[int, int], tuple[int | None, int | None]]:
+    with SessionLocal() as session:
+        leads = [
+            Lead(company_id=company_id, contact_id=None, status="NEW"),
+            Lead(company_id=company_id, contact_id=None, status="NEW"),
+        ]
+        session.add_all(leads)
+        session.flush()
+        task_ids: list[int | None] = []
+        for lead, status in zip(leads, statuses, strict=True):
+            if status is None:
+                task_ids.append(None)
+                continue
+            task = Task(
+                lead_id=lead.id,
+                title=_TITLE,
+                description=_DESCRIPTION,
+                status=status,
+            )
+            session.add(task)
+            session.flush()
+            task_ids.append(task.id)
+        session.commit()
+        return (leads[0].id, leads[1].id), (task_ids[0], task_ids[1])
+
+
 def test_first_completion_creates_company_lead_and_outreach_task_atomically() -> None:
     project_id, company_id = seed_company()
     factory = TrackingFactory()
@@ -213,6 +242,92 @@ def test_existing_active_task_is_reused_with_company_lead() -> None:
     assert result.lead_reused is result.task_reused is True
     assert result.lead_created is result.task_created is False
     assert counts() == (1, 1, 0)
+
+
+@pytest.mark.parametrize("status", ["TODO", "IN_PROGRESS"])
+def test_duplicate_leads_reuse_active_task_on_higher_id_lead(status: str) -> None:
+    project_id, company_id = seed_company()
+    lead_ids, task_ids = seed_duplicate_leads(company_id, (None, status))
+
+    result = complete(TrackingFactory(), project_id, company_id)
+
+    assert result.lead_id == lead_ids[1]
+    assert result.task_id == task_ids[1]
+    assert result.lead_created is False
+    assert result.lead_reused is True
+    assert result.task_created is False
+    assert result.task_reused is True
+    assert result.lead_id != lead_ids[0]
+    assert counts() == (2, 1, 0)
+
+
+def test_duplicate_leads_without_active_task_use_minimum_id_then_reuse() -> None:
+    project_id, company_id = seed_company()
+    lead_ids, _ = seed_duplicate_leads(company_id, (None, None))
+    factory = TrackingFactory()
+
+    first = complete(factory, project_id, company_id)
+    second = complete(factory, project_id, company_id)
+
+    assert first.lead_id == min(lead_ids)
+    assert first.task_created is True
+    assert second.lead_id == first.lead_id
+    assert second.task_id == first.task_id
+    assert second.task_reused is True
+    assert counts() == (2, 1, 0)
+
+
+def test_multiple_active_tasks_across_duplicate_leads_are_conflict_without_mutation() -> None:
+    project_id, company_id = seed_company()
+    seed_duplicate_leads(company_id, ("TODO", "IN_PROGRESS"))
+    factory = TrackingFactory()
+
+    with pytest.raises(CompanyScopedOutreachCompletionConflictError) as captured:
+        complete(factory, project_id, company_id)
+
+    assert str(captured.value) == "Company-scoped outreach completion found conflicting state."
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert counts() == (2, 2, 0)
+    assert (
+        factory.sessions[0].commit_count,
+        factory.sessions[0].rollback_count,
+        factory.sessions[0].close_count,
+    ) == (0, 1, 1)
+
+
+@pytest.mark.parametrize("terminal_status", ["DONE", "CANCELLED"])
+def test_terminal_task_creates_one_todo_then_rerun_reuses_it(terminal_status: str) -> None:
+    project_id, company_id = seed_company()
+    with SessionLocal() as session:
+        lead = Lead(company_id=company_id, contact_id=None, status="NEW")
+        session.add(lead)
+        session.flush()
+        terminal = Task(
+            lead_id=lead.id,
+            title=_TITLE,
+            description=_DESCRIPTION,
+            status=terminal_status,
+        )
+        session.add(terminal)
+        session.commit()
+        lead_id, terminal_id = lead.id, terminal.id
+    factory = TrackingFactory()
+
+    first = complete(factory, project_id, company_id)
+    second = complete(factory, project_id, company_id)
+
+    assert first.lead_id == lead_id
+    assert first.task_id != terminal_id
+    assert first.task_created is True
+    assert second.lead_id == first.lead_id
+    assert second.task_id == first.task_id
+    assert second.task_reused is True
+    with SessionLocal() as session:
+        tasks = list(session.scalars(select(Task).where(Task.lead_id == lead_id).order_by(Task.id)))
+        assert [(task.id, task.status) for task in tasks] == [
+            (terminal_id, terminal_status),
+            (first.task_id, "TODO"),
+        ]
 
 
 def test_late_task_failure_rolls_back_new_lead_and_closes_session() -> None:
