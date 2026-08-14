@@ -128,6 +128,11 @@ if TYPE_CHECKING:
         AgentContactPlanInput,
         AgentContactPlanResult,
     )
+    from app.modules.agent.lead_acquisition import (
+        LeadAcquisitionError,
+        LeadAcquisitionInput,
+        LeadAcquisitionResult,
+    )
     from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
     from app.modules.contact_discovery.service import ContactDiscoveryProvider
     from app.providers.openai_decision import OpenAIDecisionClient
@@ -139,6 +144,135 @@ app.add_typer(company_select_app, name="company-select")
 contact_select_app = typer.Typer(help="Contact-selection planning commands.")
 app.add_typer(contact_select_app, name="contact-select")
 app.add_typer(email_draft_app, name="email-draft")
+
+_ACQUIRE_INVALID = "Agent lead acquisition data is invalid."
+_ACQUIRE_INTERNAL = "Agent lead acquisition failed."
+_ACQUIRE_OPTIONS = (
+    "--project-id",
+    "--search-profile-id",
+    "--limit",
+    "--goal",
+    "--export-excel",
+    "--output",
+)
+
+
+def _load_lead_acquisition_dependencies() -> None:
+    from app.modules.agent import lead_acquisition
+
+    namespace = globals()
+    for name in (
+        "LeadAcquisitionError",
+        "LeadAcquisitionInput",
+        "LeadAcquisitionResult",
+    ):
+        namespace.setdefault(name, getattr(lead_acquisition, name))
+
+
+class _AcquireLeadsCommand(TyperCommand):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not any(arg in {"--help", "-h"} for arg in args):
+            for option in _ACQUIRE_OPTIONS:
+                if sum(arg == option or arg.startswith(f"{option}=") for arg in args) > 1:
+                    self._invalid_input()
+        try:
+            return super().parse_args(ctx, args)
+        except UsageError:
+            self._invalid_input()
+
+    @staticmethod
+    def _invalid_input() -> Never:
+        click.echo(_ACQUIRE_INVALID, err=True)
+        raise click.exceptions.Exit(2)
+
+
+def _acquire_integer(value: str, *, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(_ACQUIRE_INVALID) from None
+    if parsed <= 0 or value.strip() != value or (maximum is not None and parsed > maximum):
+        raise ValueError(_ACQUIRE_INVALID)
+    return parsed
+
+
+def execute_agent_lead_acquisition(data: LeadAcquisitionInput) -> LeadAcquisitionResult:
+    from app.modules.lead_acquisition_execution import execute_lead_acquisition
+
+    return execute_lead_acquisition(data, session_factory=SessionLocal)
+
+
+def render_agent_lead_acquisition(result: LeadAcquisitionResult, output: str) -> str:
+    _load_lead_acquisition_dependencies()
+    if type(result) is not LeadAcquisitionResult or output not in {"text", "json"}:
+        raise ValueError(_ACQUIRE_INTERNAL)
+    try:
+        validated = LeadAcquisitionResult(**result.model_dump())
+        values = validated.model_dump(mode="json")
+    except (AttributeError, TypeError, ValueError, ValidationError):
+        raise ValueError(_ACQUIRE_INTERNAL) from None
+    if output == "json":
+        return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    labels = (
+        ("Requested", "requested_limit"),
+        ("Completed", "completed_count"),
+        ("Person scoped", "person_scoped_count"),
+        ("Company scoped", "company_scoped_count"),
+        ("Companies created", "companies_created"),
+        ("Contacts created", "contacts_created"),
+        ("Leads created", "leads_created"),
+        ("Drafts created", "drafts_created"),
+        ("Duplicates", "duplicates_skipped"),
+        ("No selection", "no_selection_count"),
+        ("No contact", "no_contact_count"),
+        ("No email", "no_email_count"),
+        ("Draft failures", "draft_failure_count"),
+    )
+    lines = [f"{label}: {values[field]}" for label, field in labels]
+    lines.extend(
+        (
+            f"Attempts / budget: {values['attempt_count']} / {values['attempt_budget']}",
+            f"Export result: {values['export_status']}",
+            f"Status: {values['status']}",
+        )
+    )
+    return "\n".join(lines)
+
+
+@app.command("acquire-leads", cls=_AcquireLeadsCommand)
+def acquire_leads(
+    project_id: Annotated[str, typer.Option("--project-id", metavar="INTEGER")],
+    search_profile_id: Annotated[str, typer.Option("--search-profile-id", metavar="INTEGER")],
+    limit: Annotated[str, typer.Option("--limit", metavar="INTEGER")],
+    goal: Annotated[str, typer.Option("--goal")],
+    export_excel: Annotated[str | None, typer.Option("--export-excel", metavar="PATH")] = None,
+    output: Annotated[str, typer.Option("--output", help="Output format: text or json.")] = "text",
+) -> None:
+    _load_lead_acquisition_dependencies()
+    try:
+        if output not in {"text", "json"}:
+            raise ValueError(_ACQUIRE_INVALID)
+        from pathlib import Path
+
+        data = LeadAcquisitionInput(
+            project_id=_acquire_integer(project_id),
+            search_profile_id=_acquire_integer(search_profile_id),
+            limit=_acquire_integer(limit, maximum=50),
+            goal=goal,
+            export_file=None if export_excel is None else Path(export_excel),
+        )
+        rendered = render_agent_lead_acquisition(execute_agent_lead_acquisition(data), output)
+    except (ValidationError, ValueError) as error:
+        if isinstance(error, LeadAcquisitionError):
+            typer.echo(str(error), err=True)
+            raise typer.Exit(1) from None
+        typer.echo(_ACQUIRE_INVALID, err=True)
+        raise typer.Exit(2) from None
+    except Exception:
+        typer.echo(_ACQUIRE_INTERNAL, err=True)
+        raise typer.Exit(1) from None
+    typer.echo(rendered)
+
 
 _CONTACT_INVALID = "Agent contact plan data is invalid."
 _CONTACT_INTERNAL = "Agent contact plan failed."
@@ -856,8 +990,10 @@ def apply_contact_selection(
 
 __all__ = [
     "app",
+    "execute_agent_lead_acquisition",
     "execute_agent_company_plan",
     "execute_agent_contact_plan",
+    "render_agent_lead_acquisition",
     "render_agent_company_plan",
     "render_agent_contact_plan",
 ]
