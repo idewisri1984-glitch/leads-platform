@@ -1,5 +1,7 @@
 import json
 from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from time import sleep
 from types import TracebackType
 
@@ -53,6 +55,23 @@ _INCOMPLETE_STATUSES = frozenset({"incomplete", "in_progress", "queued", "cancel
 _ATTRIBUTE_FAILURE = object()
 _RETRY_DELAY_SECONDS = 0.5
 _TRANSIENT_API_STATUS_CODES = frozenset({500, 502, 503, 504})
+
+
+@dataclass(slots=True)
+class _RetryBudget:
+    remaining_attempts: int = 2
+
+    def consume(self) -> bool:
+        if self.remaining_attempts == 0:
+            return False
+        self.remaining_attempts -= 1
+        return True
+
+
+_ACTIVE_RETRY_BUDGET: ContextVar[_RetryBudget | None] = ContextVar(
+    "openai_decision_active_retry_budget",
+    default=None,
+)
 
 
 def _is_retryable(error: OpenAIDecisionError) -> bool:
@@ -209,15 +228,31 @@ class OpenAIDecisionClient:
         )
 
     def decide(self, request: OpenAIDecisionRequest) -> OpenAIDecisionResult:
-        return self._decide(request, retry_available=True)
+        active_budget = _ACTIVE_RETRY_BUDGET.get()
+        if active_budget is not None:
+            return self._decide(
+                request,
+                budget=active_budget,
+                retry_available=False,
+            )
+
+        budget = _RetryBudget()
+        token = _ACTIVE_RETRY_BUDGET.set(budget)
+        try:
+            return self._decide(request, budget=budget, retry_available=True)
+        finally:
+            _ACTIVE_RETRY_BUDGET.reset(token)
 
     def _decide(
         self,
         request: OpenAIDecisionRequest,
         *,
+        budget: _RetryBudget,
         retry_available: bool,
     ) -> OpenAIDecisionResult:
         if self._closed or type(request) is not OpenAIDecisionRequest:
+            raise OpenAIDecisionConfigurationError()
+        if not budget.consume():
             raise OpenAIDecisionConfigurationError()
 
         serialized = _serialize_request(request)
@@ -276,8 +311,27 @@ class OpenAIDecisionClient:
             )
         if translated is not None:
             if retry_available and _is_retryable(translated):
-                self._sleeper(_RETRY_DELAY_SECONDS)
-                return self._decide(request, retry_available=False)
+                translated_sleeper_error: OpenAIDecisionRequestError | None = None
+                try:
+                    self._sleeper(_RETRY_DELAY_SECONDS)
+                except OpenAIDecisionError:
+                    raise
+                except Exception as error:
+                    translated_sleeper_error = OpenAIDecisionRequestError(
+                        diagnostic=_diagnostic(
+                            OpenAIDecisionDiagnosticCategory.INTERNAL_REQUEST_FAILURE,
+                            exception=error,
+                        )
+                    )
+                if translated_sleeper_error is not None:
+                    raise translated_sleeper_error from None
+                if budget.remaining_attempts == 0:
+                    raise translated from None
+                return self._decide(
+                    request,
+                    budget=budget,
+                    retry_available=False,
+                )
             raise translated from None
         if response is None:
             raise OpenAIDecisionResponseError()
