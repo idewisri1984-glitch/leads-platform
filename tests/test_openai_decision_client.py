@@ -1,6 +1,7 @@
 import inspect
 import json
 import traceback
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -127,6 +128,29 @@ class FakeSDK:
         self.close_calls += 1
         if self.close_error is not None:
             raise self.close_error
+
+
+class HostileSDKObject:
+    def __init__(
+        self,
+        *,
+        values: dict[str, object],
+        hostile_name: str,
+        failure: BaseException,
+    ) -> None:
+        object.__setattr__(self, "_values", values)
+        object.__setattr__(self, "_hostile_name", hostile_name)
+        object.__setattr__(self, "_failure", failure)
+
+    def __getattribute__(self, name: str) -> object:
+        if name in {"_values", "_hostile_name", "_failure"}:
+            return object.__getattribute__(self, name)
+        if name == object.__getattribute__(self, "_hostile_name"):
+            raise object.__getattribute__(self, "_failure")
+        values = cast(dict[str, object], object.__getattribute__(self, "_values"))
+        if name in values:
+            return values[name]
+        raise AttributeError(name)
 
 
 def client(fake: FakeSDK | None = None, **changes: object) -> tuple[OpenAIDecisionClient, FakeSDK]:
@@ -492,6 +516,111 @@ def test_unsafe_structured_sdk_metadata_is_discarded() -> None:
     assert all(marker not in repr(raised.value.diagnostic) for marker in markers)
 
 
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "sk-proj-AbCdEf0123456789",
+        "sk-AbCdEf0123456789",
+        "Bearer abcdef123456",
+        "AUTHORIZATION_BEARER_SECRET",
+        "https://private.example/path",
+        "line1\nline2",
+        "nul\x00value",
+        "x" * 200,
+    ],
+)
+def test_field_specific_sdk_metadata_sanitizers_reject_unsafe_values(unsafe: str) -> None:
+    error = api_status_error(code=unsafe, parameter=unsafe, request_id="req_safe-123")
+    wrapper, _ = client(FakeSDK(error=error))
+    with pytest.raises(OpenAIDecisionRequestError) as raised:
+        wrapper.decide(request())
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.openai_error_code is None
+    assert raised.value.diagnostic.parameter is None
+    assert unsafe not in repr(raised.value.diagnostic)
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "sk-proj-AbCdEf0123456789",
+        "sk-AbCdEf0123456789",
+        "Bearer-abcdef123456",
+        "https://private.example/path",
+        "req_" + "x" * 100,
+    ],
+)
+def test_request_id_sanitizer_rejects_credentials_urls_and_overlength(
+    unsafe: str,
+) -> None:
+    sdk_response = response(status="incomplete", request_id=unsafe)
+    wrapper, _ = client(FakeSDK(sdk_response))
+    with pytest.raises(OpenAIDecisionIncompleteError) as raised:
+        wrapper.decide(request())
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.request_id is None
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "https://private.example/path",
+        "sk-proj-AbCdEf0123456789",
+        "unknown_reason",
+        "line1\nline2",
+        "x" * 200,
+    ],
+)
+def test_incomplete_reason_uses_an_explicit_allowlist(unsafe: str) -> None:
+    wrapper, _ = client(FakeSDK(response(status="incomplete", incomplete_reason=unsafe)))
+    with pytest.raises(OpenAIDecisionIncompleteError) as raised:
+        wrapper.decide(request())
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.incomplete_reason is None
+
+
+def test_diagnostic_is_self_validating_frozen_and_slotted() -> None:
+    diagnostic = OpenAIDecisionDiagnostic(
+        category=OpenAIDecisionDiagnosticCategory.API_STATUS,
+        request_id="req_safe-123",
+    )
+    assert not hasattr(diagnostic, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        diagnostic.request_id = "req_changed"  # type: ignore[misc]
+    with pytest.raises(TypeError, match=r"^OpenAI decision diagnostic is invalid\.$"):
+        OpenAIDecisionDiagnostic(
+            category=OpenAIDecisionDiagnosticCategory.API_STATUS,
+            openai_error_code="sk-proj-AbCdEf0123456789",
+        )
+
+
+@pytest.mark.parametrize("kind", ["runtime", "sdk", "response"])
+def test_exception_constructor_never_retains_raw_diagnostic_objects(kind: str) -> None:
+    marker = "RAW_DIAGNOSTIC_OBJECT_MARKER"
+    raw: object
+    if kind == "runtime":
+        raw = RuntimeError(marker)
+    elif kind == "sdk":
+        raw = sdk_error(APIConnectionError)
+    else:
+        raw = SimpleNamespace(output_text=marker)
+    with pytest.raises(
+        TypeError, match=r"^OpenAI decision diagnostic must use the exact safe type\.$"
+    ) as raised:
+        OpenAIDecisionRequestError(diagnostic=raw)  # type: ignore[arg-type]
+    exposed = "\n".join(
+        (str(raised.value), repr(raised.value), "".join(traceback.format_exception(raised.value)))
+    )
+    assert marker not in exposed
+
+
+def test_exception_diagnostic_is_keyword_only() -> None:
+    raw = RuntimeError("RAW_POSITIONAL_OBJECT_MARKER")
+    with pytest.raises(TypeError) as raised:
+        OpenAIDecisionRequestError(raw)  # type: ignore[call-arg]
+    assert "RAW_POSITIONAL_OBJECT_MARKER" not in str(raised.value)
+
+
 def test_public_result_validation_failure_has_safe_diagnostic() -> None:
     wrapper, _ = client()
     with (
@@ -549,6 +678,91 @@ def test_hostile_raw_context_cannot_reach_any_error_representation() -> None:
         )
     )
     assert all(marker not in exposed for marker in markers)
+
+
+def _safe_completed_values() -> dict[str, object]:
+    return {
+        "status": "completed",
+        "output": [SimpleNamespace(content=[SimpleNamespace(type="output_text")])],
+        "output_text": json.dumps(SELECT),
+        "incomplete_details": None,
+        "request_id": "req_safe-123",
+    }
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["status", "output", "content", "type", "output_text"],
+)
+def test_hostile_response_shape_properties_become_controlled_errors(target: str) -> None:
+    marker = f"HOSTILE_{target.upper()}_SECRET"
+    failure = RuntimeError(marker)
+    values = _safe_completed_values()
+    if target == "content":
+        values["output"] = [HostileSDKObject(values={}, hostile_name="content", failure=failure)]
+    elif target == "type":
+        values["output"] = [
+            SimpleNamespace(
+                content=[HostileSDKObject(values={}, hostile_name="type", failure=failure)]
+            )
+        ]
+    sdk_response = HostileSDKObject(values=values, hostile_name=target, failure=failure)
+    wrapper, _ = client(FakeSDK(sdk_response))
+    with pytest.raises(OpenAIDecisionResponseError) as raised:
+        wrapper.decide(request())
+    exposed = "\n".join(
+        (
+            str(raised.value),
+            repr(raised.value),
+            repr(raised.value.diagnostic),
+            "".join(traceback.format_exception(raised.value)),
+        )
+    )
+    assert marker not in exposed
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("target", ["incomplete_details", "reason"])
+def test_hostile_incomplete_detail_properties_remain_controlled(target: str) -> None:
+    marker = f"HOSTILE_{target.upper()}_SECRET"
+    failure = RuntimeError(marker)
+    values = _safe_completed_values() | {"status": "incomplete"}
+    if target == "reason":
+        values["incomplete_details"] = HostileSDKObject(
+            values={}, hostile_name="reason", failure=failure
+        )
+        sdk_response: object = SimpleNamespace(**values)
+    else:
+        sdk_response = HostileSDKObject(
+            values=values, hostile_name="incomplete_details", failure=failure
+        )
+    wrapper, _ = client(FakeSDK(sdk_response))
+    with pytest.raises(OpenAIDecisionIncompleteError) as raised:
+        wrapper.decide(request())
+    exposed = "\n".join(
+        (
+            str(raised.value),
+            repr(raised.value),
+            repr(raised.value.diagnostic),
+            "".join(traceback.format_exception(raised.value)),
+        )
+    )
+    assert marker not in exposed
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.incomplete_reason is None
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), SystemExit()])
+def test_hostile_response_base_exceptions_propagate_by_identity(
+    failure: BaseException,
+) -> None:
+    sdk_response = HostileSDKObject(
+        values=_safe_completed_values(), hostile_name="status", failure=failure
+    )
+    wrapper, _ = client(FakeSDK(sdk_response))
+    with pytest.raises(BaseException) as raised:
+        wrapper.decide(request())
+    assert raised.value is failure
 
 
 class InfrastructureFailure(BaseException):

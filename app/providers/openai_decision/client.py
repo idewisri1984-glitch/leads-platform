@@ -1,5 +1,4 @@
 import json
-import re
 from types import TracebackType
 
 from openai import (
@@ -25,6 +24,13 @@ from app.providers.openai_decision.exceptions import (
     OpenAIDecisionRefusalError,
     OpenAIDecisionRequestError,
     OpenAIDecisionResponseError,
+    _safe_error_code,
+    _safe_exception_class,
+    _safe_http_status,
+    _safe_incomplete_reason,
+    _safe_parameter,
+    _safe_request_id,
+    _safe_response_status,
 )
 from app.providers.openai_decision.prompt import OPENAI_COMPANY_DECISION_INSTRUCTIONS
 from app.providers.openai_decision.schemas import (
@@ -42,36 +48,14 @@ _SCHEMA_DESCRIPTION = (
     "Select at most one supplied Company candidate and recommend one human-reviewed next action."
 )
 _INCOMPLETE_STATUSES = frozenset({"incomplete", "in_progress", "queued", "cancelled"})
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-_SENSITIVE_TOKEN_PARTS = (
-    "authorization",
-    "bearer",
-    "candidate",
-    "goal",
-    "key",
-    "prompt",
-    "secret",
-)
+_ATTRIBUTE_FAILURE = object()
 
 
-def _safe_token(value: object) -> str | None:
-    if type(value) is not str or _SAFE_TOKEN.fullmatch(value) is None:
-        return None
-    lowered = value.casefold()
-    if any(part in lowered for part in _SENSITIVE_TOKEN_PARTS):
-        return None
-    return value
-
-
-def _safe_http_status(value: object) -> int | None:
-    return value if type(value) is int and 100 <= value <= 599 else None
-
-
-def _safe_attribute(source: object, name: str) -> object | None:
+def _safe_attribute(source: object, name: str) -> object:
     try:
         return getattr(source, name, None)
     except Exception:
-        return None
+        return _ATTRIBUTE_FAILURE
 
 
 def _diagnostic(
@@ -84,31 +68,36 @@ def _diagnostic(
     incomplete_details = (
         _safe_attribute(response, "incomplete_details") if response is not None else None
     )
+    incomplete_reason = (
+        _safe_attribute(incomplete_details, "reason")
+        if incomplete_details is not None and incomplete_details is not _ATTRIBUTE_FAILURE
+        else None
+    )
     return OpenAIDecisionDiagnostic(
         category=category,
-        exception_class=_safe_token(type(exception).__name__) if exception is not None else None,
+        exception_class=(
+            _safe_exception_class(type(exception).__name__) if exception is not None else None
+        ),
         http_status=(
             _safe_http_status(_safe_attribute(exception, "status_code"))
             if exception is not None
             else None
         ),
         openai_error_code=(
-            _safe_token(_safe_attribute(exception, "code")) if exception is not None else None
+            _safe_error_code(_safe_attribute(exception, "code")) if exception is not None else None
         ),
         parameter=(
-            _safe_token(_safe_attribute(exception, "param")) if exception is not None else None
+            _safe_parameter(_safe_attribute(exception, "param")) if exception is not None else None
         ),
         request_id=(
-            _safe_token(_safe_attribute(source, "request_id")) if source is not None else None
+            _safe_request_id(_safe_attribute(source, "request_id")) if source is not None else None
         ),
         response_status=(
-            _safe_token(_safe_attribute(response, "status")) if response is not None else None
-        ),
-        incomplete_reason=(
-            _safe_token(_safe_attribute(incomplete_details, "reason"))
-            if incomplete_details is not None
+            _safe_response_status(_safe_attribute(response, "status"))
+            if response is not None
             else None
         ),
+        incomplete_reason=_safe_incomplete_reason(incomplete_reason),
     )
 
 
@@ -125,21 +114,34 @@ def _serialize_request(request: OpenAIDecisionRequest) -> str:
 
 
 def _contains_refusal(response: object) -> bool:
-    output = getattr(response, "output", None)
+    output = _safe_attribute(response, "output")
     if type(output) is not list:
         raise OpenAIDecisionResponseError(
-            _diagnostic(OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID, response=response)
+            diagnostic=_diagnostic(
+                OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID, response=response
+            )
         )
     for item in output:
-        content = getattr(item, "content", None)
+        content = _safe_attribute(item, "content")
         if content is None:
             continue
         if type(content) is not list:
             raise OpenAIDecisionResponseError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID, response=response)
+                diagnostic=_diagnostic(
+                    OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID, response=response
+                )
             )
-        if any(getattr(part, "type", None) == "refusal" for part in content):
-            return True
+        for part in content:
+            part_type = _safe_attribute(part, "type")
+            if part_type is _ATTRIBUTE_FAILURE:
+                raise OpenAIDecisionResponseError(
+                    diagnostic=_diagnostic(
+                        OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID,
+                        response=response,
+                    )
+                )
+            if part_type == "refusal":
+                return True
     return False
 
 
@@ -210,31 +212,33 @@ class OpenAIDecisionClient:
             )
         except (AuthenticationError, PermissionDeniedError) as error:
             translated = OpenAIDecisionAuthenticationError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.AUTHENTICATION, exception=error)
+                diagnostic=_diagnostic(
+                    OpenAIDecisionDiagnosticCategory.AUTHENTICATION, exception=error
+                )
             )
         except RateLimitError as error:
             translated = OpenAIDecisionRateLimitError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.RATE_LIMIT, exception=error)
+                diagnostic=_diagnostic(OpenAIDecisionDiagnosticCategory.RATE_LIMIT, exception=error)
             )
         except APITimeoutError as error:
             translated = OpenAIDecisionRequestError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.TIMEOUT, exception=error)
+                diagnostic=_diagnostic(OpenAIDecisionDiagnosticCategory.TIMEOUT, exception=error)
             )
         except APIConnectionError as error:
             translated = OpenAIDecisionRequestError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.CONNECTION, exception=error)
+                diagnostic=_diagnostic(OpenAIDecisionDiagnosticCategory.CONNECTION, exception=error)
             )
         except APIStatusError as error:
             translated = OpenAIDecisionRequestError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.API_STATUS, exception=error)
+                diagnostic=_diagnostic(OpenAIDecisionDiagnosticCategory.API_STATUS, exception=error)
             )
         except APIError as error:
             translated = OpenAIDecisionRequestError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.API_ERROR, exception=error)
+                diagnostic=_diagnostic(OpenAIDecisionDiagnosticCategory.API_ERROR, exception=error)
             )
         except Exception as error:
             translated = OpenAIDecisionRequestError(
-                _diagnostic(
+                diagnostic=_diagnostic(
                     OpenAIDecisionDiagnosticCategory.INTERNAL_REQUEST_FAILURE,
                     exception=error,
                 )
@@ -244,35 +248,42 @@ class OpenAIDecisionClient:
         if response is None:
             raise OpenAIDecisionResponseError()
 
-        status = getattr(response, "status", None)
-        if status == "failed":
-            raise OpenAIDecisionRequestError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.RESPONSE_FAILED, response=response)
-            )
-        if status in _INCOMPLETE_STATUSES:
-            raise OpenAIDecisionIncompleteError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.RESPONSE_INCOMPLETE, response=response)
-            )
-        if status != "completed":
+        status_value = _safe_attribute(response, "status")
+        status = _safe_response_status(status_value)
+        if status is None:
             raise OpenAIDecisionResponseError(
-                _diagnostic(
+                diagnostic=_diagnostic(
                     OpenAIDecisionDiagnosticCategory.RESPONSE_STATUS_INVALID,
                     response=response,
                 )
             )
+        if status == "failed":
+            raise OpenAIDecisionRequestError(
+                diagnostic=_diagnostic(
+                    OpenAIDecisionDiagnosticCategory.RESPONSE_FAILED, response=response
+                )
+            )
+        if status in _INCOMPLETE_STATUSES:
+            raise OpenAIDecisionIncompleteError(
+                diagnostic=_diagnostic(
+                    OpenAIDecisionDiagnosticCategory.RESPONSE_INCOMPLETE, response=response
+                )
+            )
         if _contains_refusal(response):
             raise OpenAIDecisionRefusalError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.REFUSAL, response=response)
+                diagnostic=_diagnostic(OpenAIDecisionDiagnosticCategory.REFUSAL, response=response)
             )
 
-        output_text = getattr(response, "output_text", None)
+        output_text = _safe_attribute(response, "output_text")
         if (
             type(output_text) is not str
             or not output_text.strip()
             or len(output_text.encode("utf-8")) > _MAX_OUTPUT_BYTES
         ):
             raise OpenAIDecisionResponseError(
-                _diagnostic(OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID, response=response)
+                diagnostic=_diagnostic(
+                    OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID, response=response
+                )
             )
 
         wire: _OpenAIDecisionWireResult | None = None
@@ -283,7 +294,7 @@ class OpenAIDecisionClient:
             parsing_error = True
         if parsing_error or wire is None:
             raise OpenAIDecisionResponseError(
-                _diagnostic(
+                diagnostic=_diagnostic(
                     OpenAIDecisionDiagnosticCategory.WIRE_VALIDATION_FAILED,
                     response=response,
                 )
@@ -295,7 +306,7 @@ class OpenAIDecisionClient:
             and wire.selected_candidate_index not in candidate_indices
         ):
             raise OpenAIDecisionResponseError(
-                _diagnostic(
+                diagnostic=_diagnostic(
                     OpenAIDecisionDiagnosticCategory.RESULT_VALIDATION_FAILED,
                     response=response,
                 )
@@ -325,7 +336,7 @@ class OpenAIDecisionClient:
             result_error = True
         if result_error or result is None:
             raise OpenAIDecisionResponseError(
-                _diagnostic(
+                diagnostic=_diagnostic(
                     OpenAIDecisionDiagnosticCategory.RESULT_VALIDATION_FAILED,
                     response=response,
                 )
