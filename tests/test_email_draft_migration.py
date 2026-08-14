@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.modules.company.models import Company
 from app.modules.contact.models import Contact
+from app.modules.email_delivery.manual_models import ManualEmailSendRecord
+from app.modules.email_delivery.models import EmailDeliveryAttempt
 from app.modules.email_draft.models import EmailDraft
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
@@ -76,7 +78,7 @@ def test_email_draft_migration_round_trip(tmp_path: Path) -> None:
     alembic(database, "check")
 
 
-def _seed_person_draft(database: Path) -> tuple[int, int, int, int, int]:
+def _seed_person_draft(database: Path) -> tuple[int, int, int, int, int, int]:
     engine = create_engine(f"sqlite+pysqlite:///{database}")
     try:
         with Session(engine) as session:
@@ -109,7 +111,7 @@ def _seed_person_draft(database: Path) -> tuple[int, int, int, int, int]:
             )
             session.add(draft)
             session.commit()
-            return project.id, company.id, contact.id, lead.id, task.id
+            return project.id, company.id, contact.id, lead.id, task.id, draft.id
     finally:
         engine.dispose()
 
@@ -151,10 +153,49 @@ def _draft(
     )
 
 
+def _seed_dependent_send_records(
+    database: Path,
+    *,
+    project_id: int,
+    company_id: int,
+    contact_id: int,
+    draft_id: int,
+) -> tuple[int, int]:
+    engine = create_engine(f"sqlite+pysqlite:///{database}")
+    try:
+        with Session(engine) as session:
+            manual_record = ManualEmailSendRecord(
+                project_id=project_id,
+                company_id=company_id,
+                contact_id=contact_id,
+                email_draft_id=draft_id,
+                recipient_email="a@example.com",
+                sent_at=datetime(2026, 8, 13, tzinfo=UTC),
+            )
+            delivery_attempt = EmailDeliveryAttempt(
+                email_draft_id=draft_id,
+                attempt_key="c" * 64,
+                recipient_email="a@example.com",
+                envelope_from="sender@example.com",
+                header_from_email="sender@example.com",
+                header_from_name="Sender",
+                reply_to=None,
+                message_id="<migration-test@example.com>",
+                content_hash="a" * 64,
+                transport_name="fake",
+                security_mode="PLAINTEXT_LOCAL_TEST_ONLY",
+            )
+            session.add_all([manual_record, delivery_attempt])
+            session.commit()
+            return manual_record.id, delivery_attempt.id
+    finally:
+        engine.dispose()
+
+
 def test_company_scoped_nullable_upgrade_and_guarded_downgrade(tmp_path: Path) -> None:
     database = tmp_path / "company-scoped-email-draft.sqlite3"
     alembic(database, "upgrade", "b52cd03e8f71")
-    project_id, company_id, contact_id, lead_id, task_id = _seed_person_draft(database)
+    project_id, company_id, contact_id, lead_id, task_id, _draft_id = _seed_person_draft(database)
     alembic(database, "upgrade", _HEAD)
     engine = create_engine(f"sqlite+pysqlite:///{database}")
     try:
@@ -213,3 +254,59 @@ def test_company_scoped_nullable_upgrade_and_guarded_downgrade(tmp_path: Path) -
     alembic(database, "upgrade", "head")
     assert revision(database) == _HEAD
     alembic(database, "check")
+
+
+def test_populated_dependent_foreign_keys_survive_upgrade_and_downgrade(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "populated-dependent-email-draft.sqlite3"
+    alembic(database, "upgrade", "b52cd03e8f71")
+    project_id, company_id, contact_id, _lead_id, _task_id, draft_id = _seed_person_draft(database)
+    manual_id, attempt_id = _seed_dependent_send_records(
+        database,
+        project_id=project_id,
+        company_id=company_id,
+        contact_id=contact_id,
+        draft_id=draft_id,
+    )
+
+    def assert_preserved(*, nullable: bool) -> None:
+        with sqlite3.connect(database) as connection:
+            contact_column = next(
+                row
+                for row in connection.execute("PRAGMA table_info('email_drafts')")
+                if row[1] == "contact_id"
+            )
+            assert bool(contact_column[3]) is not nullable
+            assert connection.execute(
+                "SELECT id, contact_id FROM email_drafts WHERE id = ?", (draft_id,)
+            ).fetchone() == (draft_id, contact_id)
+            assert connection.execute(
+                "SELECT id, email_draft_id FROM manual_email_send_records WHERE id = ?",
+                (manual_id,),
+            ).fetchone() == (manual_id, draft_id)
+            assert connection.execute(
+                "SELECT id, email_draft_id FROM email_delivery_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone() == (attempt_id, draft_id)
+            assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+            assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert (
+                connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name = '_alembic_tmp_email_drafts'"
+                ).fetchone()
+                is None
+            )
+
+    alembic(database, "upgrade", _HEAD)
+    assert revision(database) == _HEAD
+    assert_preserved(nullable=True)
+
+    alembic(database, "downgrade", "b52cd03e8f71")
+    assert revision(database) == "b52cd03e8f71"
+    assert_preserved(nullable=False)
+
+    alembic(database, "upgrade", _HEAD)
+    assert revision(database) == _HEAD
+    assert_preserved(nullable=True)
