@@ -1,8 +1,9 @@
 import smtplib
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from typer.testing import CliRunner
 
@@ -28,7 +29,7 @@ from app.modules.email_draft.schemas import (
     EmailLanguage,
     EmailTone,
 )
-from app.modules.email_draft.service import EmailDraftService
+from app.modules.email_draft.service import EmailDraftService, EmailDraftStaleContextError
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
 from app.modules.task.models import Task
@@ -116,12 +117,32 @@ def test_person_batch_generates_without_confirmation_and_rerun_skips_before_ai(
     assert first.items[0].result is MissingDraftResultStatus.CREATED
     assert first.items[0].recipient_type == "DECISION_MAKER"
     assert second.ai_call_count == 0
-    assert second.items[0].result is MissingDraftResultStatus.SKIPPED_EXISTING
+    assert second.items == ()
     assert len(fake.calls) == 1
     with factory() as session:
         draft = session.scalar(select(EmailDraft))
         assert draft is not None and draft.contact_id is not None
         assert session.scalar(select(func.count()).select_from(EmailDraft)) == 1
+
+
+def test_pre_ai_duplicate_guard_handles_candidate_selection_race(
+    factory: sessionmaker[Session],
+) -> None:
+    project_id = seed(factory, contact_email="jordan@example.com", company_email=None)
+    batch = service(factory, FakeEmailDraftGenerator())
+    selected_task_ids = batch._candidate_task_ids(project_id, 1)
+    assert len(selected_task_ids) == 1
+    service(factory, FakeEmailDraftGenerator()).run(options(project_id))
+    race_fake = FakeEmailDraftGenerator()
+    with factory() as session:
+        item = batch._process(
+            session=session,
+            task_id=selected_task_ids[0],
+            options=options(project_id),
+            generator=race_fake,
+        )
+    assert item.result is MissingDraftResultStatus.SKIPPED_EXISTING
+    assert race_fake.calls == []
 
 
 def test_company_email_creates_truthful_company_scoped_draft(
@@ -139,6 +160,60 @@ def test_company_email_creates_truthful_company_scoped_draft(
         assert draft.recipient_email == "hello@studio.example"
         assert draft.recipient_name == "Studio 0 team"
     assert fake.calls[0].context.recipient_name == "Studio 0 team"
+
+
+def test_company_email_concurrent_change_is_detected_as_stale(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'stale.sqlite3'}")
+    local_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    Base.metadata.create_all(engine)
+    try:
+        project_id = seed(
+            local_factory,
+            contact_email=None,
+            company_email="old@example.com",
+        )
+        with local_factory() as lookup:
+            task = lookup.scalar(select(Task))
+            assert task is not None
+            lead = lookup.get(Lead, task.lead_id)
+            assert lead is not None
+
+        fake = FakeEmailDraftGenerator()
+
+        class ConcurrentUpdateGenerator:
+            def generate(self, request):
+                with local_factory() as concurrent:
+                    concurrent.execute(update(CompanyEnrichment).values(email="new@example.com"))
+                    concurrent.commit()
+                return fake.generate(request)
+
+        with local_factory() as session, pytest.raises(EmailDraftStaleContextError):
+            EmailDraftService(
+                session=session,
+                repository=EmailDraftRepository(session),
+                generator=ConcurrentUpdateGenerator(),
+            ).generate(
+                EmailDraftGenerationInput(
+                    project_id=project_id,
+                    company_id=lead.company_id,
+                    contact_id=None,
+                    lead_id=lead.id,
+                    task_id=task.id,
+                    sender_name="Alex",
+                    sender_company="Bohemia Bali",
+                    language=EmailLanguage.EN,
+                    tone=EmailTone.PROFESSIONAL,
+                    purpose="initial outreach",
+                    prompt_version="email-outreach-draft-v1",
+                )
+            )
+        with local_factory() as verification:
+            assert verification.scalar(select(func.count()).select_from(EmailDraft)) == 0
+            enrichment = verification.scalar(select(CompanyEnrichment))
+            assert enrichment is not None and enrichment.email == "new@example.com"
+    finally:
+        Base.metadata.drop_all(engine)
+        engine.dispose()
 
 
 @pytest.mark.parametrize("contact_id", [None, 1])
@@ -250,6 +325,52 @@ def test_limit_is_deterministic_and_provider_failure_is_isolated(
     assert limited.ai_call_count == 2
 
 
+def test_existing_drafts_are_filtered_before_limit(factory: sessionmaker[Session]) -> None:
+    project_id = seed(
+        factory,
+        contact_email="valid@example.com",
+        company_email=None,
+        companies=3,
+    )
+    initial = service(factory, FakeEmailDraftGenerator()).run(options(project_id, limit=2))
+    assert [item.result for item in initial.items] == [
+        MissingDraftResultStatus.CREATED,
+        MissingDraftResultStatus.CREATED,
+    ]
+    with factory() as session:
+        expected = session.scalars(select(Company).order_by(Company.id)).all()[2].id
+    fake = FakeEmailDraftGenerator()
+    result = service(factory, fake).run(options(project_id, limit=1))
+    assert len(result.items) == 1
+    assert result.items[0].company_id == expected
+    assert result.items[0].result is MissingDraftResultStatus.CREATED
+    assert result.ai_call_count == 1
+    assert len(fake.calls) == 1
+
+
+def test_post_filter_limit_preserves_mixed_recipient_types(
+    factory: sessionmaker[Session],
+) -> None:
+    project_id = seed(
+        factory,
+        contact_email="person@example.com",
+        company_email="company@example.com",
+        companies=3,
+    )
+    service(factory, FakeEmailDraftGenerator()).run(options(project_id, limit=1))
+    with factory() as session:
+        companies = session.scalars(select(Company).order_by(Company.id)).all()
+        session.execute(
+            update(Contact).where(Contact.company_id == companies[1].id).values(email=None)
+        )
+        session.commit()
+    fake = FakeEmailDraftGenerator()
+    result = service(factory, fake).run(options(project_id, limit=2))
+    assert [item.company_id for item in result.items] == [companies[1].id, companies[2].id]
+    assert [item.recipient_type for item in result.items] == ["COMPANY", "DECISION_MAKER"]
+    assert result.ai_call_count == 2
+
+
 def test_provider_failure_isolated_and_counted(factory: sessionmaker[Session]) -> None:
     project_id = seed(
         factory,
@@ -278,9 +399,34 @@ def test_provider_failure_isolated_and_counted(factory: sessionmaker[Session]) -
         MissingDraftResultStatus.FAILED,
         MissingDraftResultStatus.CREATED,
     ]
+    assert result.items[0].recipient_type == "DECISION_MAKER"
+    assert result.items[0].recipient_email == "valid@example.com"
+    assert result.items[0].contact_id is not None
     assert result.ai_call_count == 2
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(EmailDraft)) == 1
+
+
+def test_company_provider_failure_preserves_resolved_identity(
+    factory: sessionmaker[Session],
+) -> None:
+    project_id = seed(factory, contact_email=None, company_email="info@example.com")
+
+    class FailingGenerator:
+        def generate(self, request):
+            raise EmailDraftProviderUnavailableError("unavailable")
+
+    result = MissingEmailDraftBatchService(
+        session_factory=factory,
+        generator_factory=FailingGenerator,
+    ).run(options(project_id))
+    assert result.items[0].result is MissingDraftResultStatus.FAILED
+    assert result.items[0].recipient_type == "COMPANY"
+    assert result.items[0].recipient_email == "info@example.com"
+    assert result.items[0].contact_id is None
+    assert result.ai_call_count == 1
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(EmailDraft)) == 0
 
 
 def test_generate_missing_cli_requires_no_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
@@ -95,6 +95,11 @@ class _LazyCountingGenerator:
             close()
 
 
+class _ResolvedCandidateFailure(Exception):
+    def __init__(self, item: MissingDraftBatchItem) -> None:
+        self.item = item
+
+
 def _usable_email(value: object) -> str | None:
     if type(value) is not str:
         return None
@@ -123,6 +128,7 @@ class MissingEmailDraftBatchService:
         try:
             for task_id in candidate_ids:
                 session = self._session_factory()
+                item: MissingDraftBatchItem | None = None
                 try:
                     item = self._process(
                         session=session,
@@ -135,8 +141,21 @@ class MissingEmailDraftBatchService:
                     else:
                         session.rollback()
                     items.append(item)
+                except _ResolvedCandidateFailure as error:
+                    session.rollback()
+                    items.append(error.item)
                 except Exception:
                     session.rollback()
+                    if item is not None:
+                        items.append(
+                            replace(
+                                item,
+                                result=MissingDraftResultStatus.FAILED,
+                                draft_id=None,
+                                subject=None,
+                            )
+                        )
+                        continue
                     company = session.scalar(
                         select(Company)
                         .join(Lead, Lead.company_id == Company.id)
@@ -177,6 +196,7 @@ class MissingEmailDraftBatchService:
                     Task.status.in_(
                         (TaskLifecycleStatus.TODO.value, TaskLifecycleStatus.IN_PROGRESS.value)
                     ),
+                    ~select(EmailDraft.id).where(EmailDraft.task_id == Task.id).exists(),
                 )
                 .order_by(Company.id, Task.id.desc())
             )
@@ -253,44 +273,45 @@ class MissingEmailDraftBatchService:
                 None,
                 MissingDraftResultStatus.SKIPPED_NO_EMAIL,
             )
-        if options.dry_run:
-            return MissingDraftBatchItem(
-                company.id,
-                company.name,
-                recipient_type,
-                recipient_email,
-                decision_maker,
-                contact_id,
-                MissingDraftResultStatus.WOULD_CREATE,
-            )
-        result = EmailDraftService(
-            session=session,
-            repository=EmailDraftRepository(session),
-            generator=generator,
-        ).generate(
-            EmailDraftGenerationInput(
-                project_id=options.project_id,
-                company_id=company.id,
-                contact_id=contact_id,
-                lead_id=lead.id,
-                task_id=task.id,
-                sender_name=options.sender_name,
-                sender_company=options.sender_company,
-                language=options.language,
-                tone=options.tone,
-                purpose=options.purpose,
-                value_proposition=options.value_proposition,
-                prompt_version=EMAIL_DRAFT_PROMPT_VERSION,
-            )
-        )
-        return MissingDraftBatchItem(
+        candidate = MissingDraftBatchItem(
             company.id,
             company.name,
             recipient_type,
             recipient_email,
             decision_maker,
             contact_id,
-            MissingDraftResultStatus.CREATED,
-            result.id,
-            result.subject,
+            MissingDraftResultStatus.WOULD_CREATE,
+        )
+        if options.dry_run:
+            return candidate
+        try:
+            result = EmailDraftService(
+                session=session,
+                repository=EmailDraftRepository(session),
+                generator=generator,
+            ).generate(
+                EmailDraftGenerationInput(
+                    project_id=options.project_id,
+                    company_id=company.id,
+                    contact_id=contact_id,
+                    lead_id=lead.id,
+                    task_id=task.id,
+                    sender_name=options.sender_name,
+                    sender_company=options.sender_company,
+                    language=options.language,
+                    tone=options.tone,
+                    purpose=options.purpose,
+                    value_proposition=options.value_proposition,
+                    prompt_version=EMAIL_DRAFT_PROMPT_VERSION,
+                )
+            )
+        except Exception:
+            raise _ResolvedCandidateFailure(
+                replace(candidate, result=MissingDraftResultStatus.FAILED)
+            ) from None
+        return replace(
+            candidate,
+            result=MissingDraftResultStatus.CREATED,
+            draft_id=result.id,
+            subject=result.subject,
         )

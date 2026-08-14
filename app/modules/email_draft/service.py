@@ -275,9 +275,12 @@ class EmailDraftService:
             if data.contact_id is not None
             else None
         )
-        enrichment = self.session.scalar(
-            select(CompanyEnrichment).where(CompanyEnrichment.company_id == data.company_id)
+        enrichment_statement = select(CompanyEnrichment).where(
+            CompanyEnrichment.company_id == data.company_id
         )
+        if populate_existing:
+            enrichment_statement = enrichment_statement.execution_options(populate_existing=True)
+        enrichment = self.session.scalar(enrichment_statement)
         lead = self.session.get(Lead, data.lead_id, populate_existing=populate_existing)
         task = self.session.get(Task, data.task_id, populate_existing=populate_existing)
         if project is None or company is None or lead is None or task is None:
