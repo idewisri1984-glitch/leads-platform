@@ -54,16 +54,15 @@ def _export_excel(
     overwrite: bool,
 ) -> CRMExcelExportResult:
     from app.core.database.session import SessionLocal
-    from app.modules.crm.excel_export import CRMExcelExportService
+    from app.modules.crm.export_execution import execute_crm_excel_export
 
-    with SessionLocal() as session:
-        return CRMExcelExportService().export(
-            session,
-            project_id=project_id,
-            company_id=company_id,
-            output_file=output_file,
-            overwrite=overwrite,
-        )
+    return execute_crm_excel_export(
+        project_id=project_id,
+        company_id=company_id,
+        output_file=output_file,
+        overwrite=overwrite,
+        session_factory=SessionLocal,
+    )
 
 
 def _json_value(value: datetime | int | str | None) -> datetime | int | str | None:

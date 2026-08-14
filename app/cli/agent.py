@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from contextlib import suppress
-from typing import TYPE_CHECKING, Annotated, Any, Never, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Never, Protocol
 
 import typer
 from pydantic import ValidationError
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from typer import _click as click
 from typer._click.exceptions import UsageError
@@ -49,13 +47,24 @@ from app.modules.agent.contact_apply_schemas import (
     AgentContactApplyInput,
     AgentContactApplyResult,
 )
+from app.modules.agent.execution import (
+    CompanyApplyComponents,
+    CompanyPlanComponents,
+    ContactApplyComponents,
+    ContactPlanComponents,
+    execute_company_apply,
+    execute_company_plan,
+    execute_contact_apply,
+    execute_contact_plan,
+)
+from app.modules.agent.execution import (
+    _LazyDecisionFactory as _LazyDecisionFactory,
+)
 from app.modules.company.repository import CompanyRepository
 from app.modules.company_discovery.candidate_promotion import (
     CompanyDiscoveryCandidatePromotionService,
 )
 from app.modules.company_discovery.candidate_review import CompanyDiscoveryCandidateReviewService
-from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
-from app.modules.company_discovery.schemas import DiscoveryProviderResponse
 from app.modules.company_discovery.staging_orchestration import (
     CompanyDiscoveryStagingService,
 )
@@ -75,7 +84,6 @@ from app.modules.search_profile import (
     SearchProfileRepository,
     SearchProfileService,
 )
-from app.modules.search_profile.schemas import SearchQuery
 from app.modules.task.repository import TaskRepository
 
 if TYPE_CHECKING:
@@ -100,7 +108,6 @@ if TYPE_CHECKING:
         AgentCompanyPlanResult,
     )
     from app.modules.agent.company_selection import (
-        AgentCompanySelectionRepository,
         AgentCompanySelectionService,
     )
     from app.modules.agent.contact_plan import (
@@ -121,6 +128,7 @@ if TYPE_CHECKING:
         AgentContactPlanInput,
         AgentContactPlanResult,
     )
+    from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
     from app.modules.contact_discovery.service import ContactDiscoveryProvider
     from app.providers.openai_decision import OpenAIDecisionClient
     from app.providers.serpapi import SerpApiClient
@@ -247,41 +255,17 @@ def execute_agent_contact_plan(
         )
 
         provider_factory = WebsiteContactDiscoveryProvider
-    session = session_factory()
-    committed = False
-    primary = False
-    try:
-        discovery_repository = ContactDiscoveryRepository(session)
-        service = AgentContactPlanService(
-            projects=ProjectRepository(session),
-            companies=CompanyRepository(session),
-            discovery_repository=discovery_repository,
-            provider_factory=provider_factory,
-        )
-        result = service.plan(data)
-        try:
-            session.commit()
-            committed = True
-        except Exception:
-            raise AgentContactPlanPersistenceError(
-                "Contact discovery state could not be persisted."
-            ) from None
-        return result
-    except BaseException:
-        primary = True
-        if not committed:
-            with suppress(Exception):
-                session.rollback()
-        raise
-    finally:
-        if primary:
-            with suppress(Exception):
-                session.close()
-        else:
-            try:
-                session.close()
-            except Exception:
-                raise AgentContactPlanInternalError(_CONTACT_INTERNAL) from None
+    return execute_contact_plan(
+        data,
+        session_factory=session_factory,
+        provider_factory=provider_factory,
+        components=ContactPlanComponents(
+            project_repository=ProjectRepository,
+            company_repository=CompanyRepository,
+            discovery_repository=ContactDiscoveryRepository,
+            plan_service=AgentContactPlanService,
+        ),
+    )
 
 
 @contact_select_app.command("plan", cls=_AgentContactPlanCommand)
@@ -355,6 +339,35 @@ def _load_company_plan_dependencies() -> None:
         namespace.setdefault(name, getattr(company_selection, name))
 
 
+def SerpApiDiscoveryProvider(client: SerpApiClient) -> DiscoveryProvider:
+    from app.modules.company_discovery.serpapi_provider import SerpApiDiscoveryProvider
+
+    return SerpApiDiscoveryProvider(client)
+
+
+class _OpenAIDecisionFactory:
+    def __init__(self) -> None:
+        self._client: OpenAIDecisionClient | None = None
+
+    def __call__(self) -> DecisionBoundary:
+        if self._client is not None:
+            return self._client
+        from app.core.config.settings import settings
+        from app.providers.openai_decision import OpenAIDecisionClient
+
+        self._client = OpenAIDecisionClient(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            timeout_seconds=settings.openai_timeout_seconds,
+            max_output_tokens=settings.openai_max_output_tokens,
+        )
+        return self._client
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+
+
 def _company_plan_error_codes() -> tuple[tuple[type[AgentCompanyPlanError], int], ...]:
     _load_company_plan_dependencies()
     return (
@@ -390,109 +403,6 @@ class _AgentPlanCommand(TyperCommand):
         raise click.exceptions.Exit(2)
 
 
-class _DiscoveryCommitter:
-    def __init__(self, session: Session) -> None:
-        self._session = session
-        self.committed = False
-
-    def commit_discovery(self) -> None:
-        self._session.commit()
-        self.committed = True
-
-
-class _CountedDiscoveryProvider:
-    def __init__(self, provider: DiscoveryProvider) -> None:
-        self._provider = provider
-        self._call_count = 0
-        self._last_query: str | None = None
-
-    @property
-    def provider_name(self) -> str:
-        return self._provider.provider_name
-
-    def search(self, query: SearchQuery) -> DiscoveryProviderResponse:
-        self._call_count += 1
-        self._last_query = query.text
-        return self._provider.search(query)
-
-    def snapshot_call_count(self) -> int:
-        return self._call_count
-
-    def last_query(self) -> str | None:
-        return self._last_query
-
-
-def SerpApiDiscoveryProvider(client: SerpApiClient) -> DiscoveryProvider:
-    from app.modules.company_discovery.serpapi_provider import (
-        SerpApiDiscoveryProvider as Provider,
-    )
-
-    return Provider(client)
-
-
-class _OpenAIDecisionFactory:
-    def __init__(self) -> None:
-        self._client: OpenAIDecisionClient | None = None
-
-    def __call__(self) -> DecisionBoundary:
-        if self._client is not None:
-            return self._client
-        from app.core.config.settings import settings
-        from app.providers.openai_decision import OpenAIDecisionClient
-
-        self._client = OpenAIDecisionClient(
-            api_key=settings.openai_api_key,
-            model=settings.openai_model,
-            timeout_seconds=settings.openai_timeout_seconds,
-            max_output_tokens=settings.openai_max_output_tokens,
-        )
-        return self._client
-
-    def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-
-
-class _LazyDecisionFactory:
-    def __init__(
-        self,
-        factory_factory: Callable[[], _OpenAIDecisionFactory],
-    ) -> None:
-        self._factory_factory = factory_factory
-        self._factory: _OpenAIDecisionFactory | None = None
-
-    def __call__(self) -> DecisionBoundary:
-        boundary: DecisionBoundary | None = None
-        error: AgentCompanyPlanDecisionError | None = None
-        try:
-            if self._factory is None:
-                self._factory = self._factory_factory()
-            boundary = self._factory()
-        except Exception:
-            error = AgentCompanyPlanDecisionError("Company decision provider failed.")
-        if error is not None:
-            raise error
-        if boundary is None:
-            raise AgentCompanyPlanDecisionError("Company decision provider failed.")
-        return boundary
-
-    def close(self) -> None:
-        if self._factory is not None:
-            self._factory.close()
-
-
-def _provider_construction[T](operation: Callable[[], T]) -> T:
-    error: AgentCompanyPlanSearchProviderError | None = None
-    value: T | None = None
-    try:
-        value = operation()
-    except Exception:
-        error = AgentCompanyPlanSearchProviderError("Company search provider failed.")
-    if error is not None:
-        raise error
-    return cast(T, value)
-
-
 def execute_agent_company_plan(
     data: AgentCompanyPlanInput,
     *,
@@ -501,52 +411,27 @@ def execute_agent_company_plan(
     serpapi_client_factory: Callable[..., SerpApiClient] | None = None,
 ) -> AgentCompanyPlanResult:
     _load_company_plan_dependencies()
-    from app.core.config.settings import settings
-    from app.providers.serpapi import SerpApiClient
-
     if serpapi_client_factory is None:
+        from app.providers.serpapi import SerpApiClient
+
         serpapi_client_factory = SerpApiClient
-    session = session_factory()
-    committer: _DiscoveryCommitter | None = None
-    decision_factory = _LazyDecisionFactory(decision_factory_factory)
-    try:
-        committer = _DiscoveryCommitter(session)
-        staging_repository = CompanyDiscoveryStagingRepository(session)
-        query_generator = SearchProfileQueryGenerator()
-        serpapi_client = _provider_construction(
-            lambda: serpapi_client_factory(
-                api_key=settings.serpapi_api_key,
-                base_url=settings.serpapi_base_url,
-                timeout_seconds=settings.serpapi_timeout_seconds,
-            )
-        )
-        concrete_provider = _provider_construction(lambda: SerpApiDiscoveryProvider(serpapi_client))
-        counted_provider = _CountedDiscoveryProvider(concrete_provider)
-        service = AgentCompanyPlanService(
-            projects=ProjectRepository(session),
-            profiles=SearchProfileService(SearchProfileRepository(session)),
-            staging=CompanyDiscoveryStagingService(
-                repository=staging_repository,
-                query_generator=query_generator,
-            ),
-            staging_provider=counted_provider,
-            staging_repository=staging_repository,
-            provider_telemetry=counted_provider,
-            committer=committer,
-            selection=AgentCompanySelectionService(
-                cast(AgentCompanySelectionRepository, staging_repository)
-            ),
-            decision_factory=decision_factory,
-        )
-        return service.plan(data)
-    except BaseException:
-        with suppress(Exception):
-            session.rollback()
-        raise
-    finally:
-        with suppress(Exception):
-            decision_factory.close()
-        session.close()
+    return execute_company_plan(
+        data,
+        session_factory=session_factory,
+        decision_factory_factory=decision_factory_factory,
+        serpapi_client_factory=serpapi_client_factory,
+        components=CompanyPlanComponents(
+            staging_repository=CompanyDiscoveryStagingRepository,
+            query_generator=SearchProfileQueryGenerator,
+            project_repository=ProjectRepository,
+            profile_repository=SearchProfileRepository,
+            profile_service=SearchProfileService,
+            staging_service=CompanyDiscoveryStagingService,
+            selection_service=AgentCompanySelectionService,
+            plan_service=AgentCompanyPlanService,
+            discovery_provider=SerpApiDiscoveryProvider,
+        ),
+    )
 
 
 def render_agent_company_plan(result: AgentCompanyPlanResult, output: str) -> str:
@@ -744,46 +629,27 @@ def _execute_agent_company_apply(
     *,
     session_factory: _SessionFactory = SessionLocal,
 ) -> str:
-    session = session_factory()
-    committed = False
-    primary_active = False
-    try:
-        staging_repository = CompanyDiscoveryStagingRepository(session)
-        company_repository = CompanyRepository(session)
-        service = AgentCompanyApplyService(
-            staging_repository=cast(Any, staging_repository),
-            company_repository=cast(Any, company_repository),
-            review_service=CompanyDiscoveryCandidateReviewService(staging_repository),
-            promotion_service=CompanyDiscoveryCandidatePromotionService(
-                staging_repository, company_repository
-            ),
-        )
-        result = service.apply(data)
+    rendered: str | None = None
+
+    def prepare_result(result: AgentCompanyApplyResult) -> None:
+        nonlocal rendered
         rendered = render_agent_company_apply(result, output)
-        commit_failed = False
-        commit_conflict = False
-        try:
-            session.commit()
-            committed = True
-        except IntegrityError:
-            commit_conflict = True
-        except Exception:
-            commit_failed = True
-        if commit_conflict:
-            raise AgentCompanyApplyConflictError("Agent company apply persistence conflict.")
-        if commit_failed:
-            raise AgentCompanyApplyPersistenceError("Agent company apply could not be persisted.")
-        return rendered
-    except BaseException:
-        primary_active = True
-        if not committed:
-            _cleanup_preserving_primary(session.rollback)
-        raise
-    finally:
-        if primary_active:
-            _cleanup_preserving_primary(session.close)
-        else:
-            session.close()
+
+    execute_company_apply(
+        data,
+        session_factory=session_factory,
+        components=CompanyApplyComponents(
+            staging_repository=CompanyDiscoveryStagingRepository,
+            company_repository=CompanyRepository,
+            review_service=CompanyDiscoveryCandidateReviewService,
+            promotion_service=CompanyDiscoveryCandidatePromotionService,
+            apply_service=AgentCompanyApplyService,
+        ),
+        before_commit=prepare_result,
+    )
+    if rendered is None:
+        raise AgentCompanyApplyInternalError(_APPLY_INTERNAL)
+    return rendered
 
 
 @company_select_app.command("apply", cls=_AgentApplyCommand)
@@ -917,43 +783,30 @@ def _execute_agent_contact_apply(
     *,
     session_factory: _SessionFactory = SessionLocal,
 ) -> str:
-    session = session_factory()
-    committed = False
-    primary_active = False
-    try:
-        discovery_repository = ContactDiscoveryRepository(session)
-        contact_repository = ContactRepository(session)
-        service = AgentContactApplyService(
-            company_repository=cast(Any, CompanyRepository(session)),
-            contact_repository=cast(Any, contact_repository),
-            discovery_repository=cast(Any, discovery_repository),
-            review_service=ContactDiscoveryCandidateReviewService(discovery_repository),
-            promotion_service=ContactDiscoveryCandidatePromotionService(
-                discovery_repository, contact_repository
-            ),
-            lead_repository=cast(Any, LeadRepository(session)),
-            task_repository=cast(Any, TaskRepository(session)),
-        )
-        result = service.apply(data)
+    rendered: str | None = None
+
+    def prepare_result(result: AgentContactApplyResult) -> None:
+        nonlocal rendered
         rendered = render_agent_contact_apply(result, output)
-        try:
-            session.commit()
-            committed = True
-        except Exception:
-            raise AgentContactApplyPersistenceError(
-                "Agent contact apply could not be persisted."
-            ) from None
-        return rendered
-    except BaseException:
-        primary_active = True
-        if not committed:
-            _cleanup_preserving_primary(session.rollback)
-        raise
-    finally:
-        if primary_active:
-            _cleanup_preserving_primary(session.close)
-        else:
-            session.close()
+
+    execute_contact_apply(
+        data,
+        session_factory=session_factory,
+        components=ContactApplyComponents(
+            company_repository=CompanyRepository,
+            contact_repository=ContactRepository,
+            discovery_repository=ContactDiscoveryRepository,
+            review_service=ContactDiscoveryCandidateReviewService,
+            promotion_service=ContactDiscoveryCandidatePromotionService,
+            lead_repository=LeadRepository,
+            task_repository=TaskRepository,
+            apply_service=AgentContactApplyService,
+        ),
+        before_commit=prepare_result,
+    )
+    if rendered is None:
+        raise AgentContactApplyInternalError(_CONTACT_APPLY_INTERNAL)
+    return rendered
 
 
 @contact_select_app.command("apply", cls=_AgentContactApplyCommand)
