@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
 
+import app.cli.agent as agent_cli
 from app.core.database.base import Base
 from app.modules.agent import (
     AgentCompanyPlanDecisionError,
@@ -368,6 +369,46 @@ def test_openai_failure_preserves_committed_discovery(session: Session) -> None:
         assert run is not None
         assert run.run_status == CompanyDiscoveryRunStatus.SUCCEEDED
         assert verification.scalar(select(func.count()).select_from(CompanyDiscoveryCandidate)) == 1
+
+
+def test_live_lazy_factory_reaches_decide_after_committed_discovery(session: Session) -> None:
+    project, profile = seed(session)
+    provider = Provider([provider_result()])
+    decision = Decision(session)
+    service, committer, _ = build_service(session, provider, decision)
+    events: list[str] = []
+
+    class Factory:
+        def __call__(self) -> Decision:
+            events.append("factory_call")
+            return decision
+
+        def close(self) -> None:
+            events.append("close")
+
+    def factory_factory() -> Factory:
+        events.append("factory_construction")
+        return Factory()
+
+    lazy = agent_cli._LazyDecisionFactory(factory_factory)  # type: ignore[arg-type]
+    service.decision_factory = lazy
+
+    try:
+        result = service.plan(
+            AgentCompanyPlanInput(
+                project_id=project.id,
+                search_profile_id=profile.id,
+                goal="Choose",
+            )
+        )
+        assert events == ["factory_construction", "factory_call"]
+    finally:
+        lazy.close()
+
+    assert events == ["factory_construction", "factory_call", "close"]
+    assert len(provider.calls) == committer.calls == decision.calls == 1
+    assert result.openai_call_count == 1
+    assert result.selected_candidate_id is not None
 
 
 @pytest.mark.parametrize(
