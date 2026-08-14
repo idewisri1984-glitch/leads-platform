@@ -97,7 +97,12 @@ def wrapper(handler: Callable[[httpx.Request], httpx.Response]) -> OpenAIDecisio
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         max_retries=0,
     )
-    return OpenAIDecisionClient(api_key=KEY, model=MODEL, openai_client=sdk)
+    return OpenAIDecisionClient(
+        api_key=KEY,
+        model=MODEL,
+        openai_client=sdk,
+        sleeper=lambda _: None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -160,10 +165,12 @@ def test_real_sdk_http_errors_are_mapped(status: int, error: type[Exception]) ->
 
     with pytest.raises(error) as raised:
         wrapper(handler).decide(decision_request())
-    assert calls == 1 and KEY not in str(raised.value) and "raw secret" not in str(raised.value)
+    expected_calls = 2 if status in {429, 500} else 1
+    assert calls == expected_calls
+    assert KEY not in str(raised.value) and "raw secret" not in str(raised.value)
 
 
-def test_real_sdk_transport_timeout_has_zero_retries() -> None:
+def test_real_sdk_transport_timeout_has_one_application_retry() -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -173,7 +180,7 @@ def test_real_sdk_transport_timeout_has_zero_retries() -> None:
 
     with pytest.raises(OpenAIDecisionRequestError):
         wrapper(handler).decide(decision_request())
-    assert calls == 1
+    assert calls == 2
 
 
 def test_real_sdk_rejects_integer_confidence_without_retry_or_disclosure() -> None:
