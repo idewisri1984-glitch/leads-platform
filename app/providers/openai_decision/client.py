@@ -1,4 +1,6 @@
 import json
+from collections.abc import Callable
+from time import sleep
 from types import TracebackType
 
 from openai import (
@@ -49,6 +51,24 @@ _SCHEMA_DESCRIPTION = (
 )
 _INCOMPLETE_STATUSES = frozenset({"incomplete", "in_progress", "queued", "cancelled"})
 _ATTRIBUTE_FAILURE = object()
+_RETRY_DELAY_SECONDS = 0.5
+_TRANSIENT_API_STATUS_CODES = frozenset({500, 502, 503, 504})
+
+
+def _is_retryable(error: OpenAIDecisionError) -> bool:
+    diagnostic = error.diagnostic
+    if diagnostic is None:
+        return False
+    if diagnostic.category in {
+        OpenAIDecisionDiagnosticCategory.CONNECTION,
+        OpenAIDecisionDiagnosticCategory.TIMEOUT,
+        OpenAIDecisionDiagnosticCategory.RATE_LIMIT,
+    }:
+        return True
+    return (
+        diagnostic.category is OpenAIDecisionDiagnosticCategory.API_STATUS
+        and diagnostic.http_status in _TRANSIENT_API_STATUS_CODES
+    )
 
 
 def _safe_attribute(source: object, name: str) -> object:
@@ -154,6 +174,7 @@ class OpenAIDecisionClient:
         timeout_seconds: float = 30.0,
         max_output_tokens: int = 600,
         openai_client: OpenAI | None = None,
+        sleeper: Callable[[float], None] = sleep,
     ) -> None:
         if (
             type(api_key) is not str
@@ -168,6 +189,7 @@ class OpenAIDecisionClient:
             or not 0 < timeout_seconds <= 120
             or type(max_output_tokens) is not int
             or not 100 <= max_output_tokens <= 2000
+            or not callable(sleeper)
         ):
             raise OpenAIDecisionConfigurationError()
 
@@ -175,6 +197,7 @@ class OpenAIDecisionClient:
         self._max_output_tokens = max_output_tokens
         self._owns_client = openai_client is None
         self._closed = False
+        self._sleeper = sleeper
         self._client = (
             openai_client
             if openai_client is not None
@@ -186,6 +209,14 @@ class OpenAIDecisionClient:
         )
 
     def decide(self, request: OpenAIDecisionRequest) -> OpenAIDecisionResult:
+        return self._decide(request, retry_available=True)
+
+    def _decide(
+        self,
+        request: OpenAIDecisionRequest,
+        *,
+        retry_available: bool,
+    ) -> OpenAIDecisionResult:
         if self._closed or type(request) is not OpenAIDecisionRequest:
             raise OpenAIDecisionConfigurationError()
 
@@ -244,6 +275,9 @@ class OpenAIDecisionClient:
                 )
             )
         if translated is not None:
+            if retry_available and _is_retryable(translated):
+                self._sleeper(_RETRY_DELAY_SECONDS)
+                return self._decide(request, retry_available=False)
             raise translated from None
         if response is None:
             raise OpenAIDecisionResponseError()

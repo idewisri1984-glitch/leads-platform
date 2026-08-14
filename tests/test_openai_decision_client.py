@@ -130,6 +130,25 @@ class FakeSDK:
             raise self.close_error
 
 
+class SequencedResponses:
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = outcomes
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        outcome = self.outcomes[len(self.calls) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class SequencedSDK(FakeSDK):
+    def __init__(self, outcomes: list[object]) -> None:
+        super().__init__()
+        self.responses = SequencedResponses(outcomes)
+
+
 class HostileSDKObject:
     def __init__(
         self,
@@ -159,6 +178,7 @@ def client(fake: FakeSDK | None = None, **changes: object) -> tuple[OpenAIDecisi
         "api_key": "test-key",
         "model": "test-model",
         "openai_client": cast(OpenAI, sdk),
+        "sleeper": lambda _: None,
     }
     return OpenAIDecisionClient(**(values | changes)), sdk  # type: ignore[arg-type]
 
@@ -170,6 +190,7 @@ def test_public_signatures_are_bounded() -> None:
         "timeout_seconds",
         "max_output_tokens",
         "openai_client",
+        "sleeper",
     )
     assert tuple(inspect.signature(OpenAIDecisionClient.decide).parameters) == ("self", "request")
 
@@ -261,6 +282,73 @@ def test_exact_single_request_and_safe_public_result(
     assert format_["strict"] is True and format_["description"]
     assert format_["schema"]["additionalProperties"] is False
     assert set(format_["schema"]["required"]) == set(format_["schema"]["properties"])
+
+
+def test_first_attempt_success_does_not_sleep() -> None:
+    sleeper_calls: list[float] = []
+    wrapper, fake = client(sleeper=sleeper_calls.append)
+
+    assert wrapper.decide(request()).decision is OpenAIDecisionKind.SELECT
+    assert len(fake.responses.calls) == 1
+    assert sleeper_calls == []
+
+
+@pytest.mark.parametrize("error_type", [APIConnectionError, APITimeoutError, RateLimitError])
+def test_transient_request_failure_retries_once_then_succeeds(
+    error_type: type[BaseException],
+) -> None:
+    sleeper_calls: list[float] = []
+    sdk = SequencedSDK([sdk_error(error_type, 429), response()])
+    wrapper, _ = client(cast(FakeSDK, sdk), sleeper=sleeper_calls.append)
+
+    result = wrapper.decide(request())
+
+    assert result.decision is OpenAIDecisionKind.SELECT
+    assert len(sdk.responses.calls) == 2
+    assert sleeper_calls == [0.5]
+
+
+@pytest.mark.parametrize("error_type", [APIConnectionError, APITimeoutError, RateLimitError])
+def test_transient_request_failure_twice_raises_final_controlled_error(
+    error_type: type[BaseException],
+) -> None:
+    sleeper_calls: list[float] = []
+    first = sdk_error(error_type, 429)
+    final = sdk_error(error_type, 429)
+    sdk = SequencedSDK([first, final])
+    wrapper, _ = client(cast(FakeSDK, sdk), sleeper=sleeper_calls.append)
+
+    with pytest.raises((OpenAIDecisionRequestError, OpenAIDecisionRateLimitError)) as raised:
+        wrapper.decide(request())
+
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.exception_class == type(final).__name__
+    assert len(sdk.responses.calls) == 2
+    assert sleeper_calls == [0.5]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_transient_server_status_retries_once(status: int) -> None:
+    sleeper_calls: list[float] = []
+    sdk = SequencedSDK([sdk_error(APIStatusError, status), response()])
+    wrapper, _ = client(cast(FakeSDK, sdk), sleeper=sleeper_calls.append)
+
+    assert wrapper.decide(request()).decision is OpenAIDecisionKind.SELECT
+    assert len(sdk.responses.calls) == 2
+    assert sleeper_calls == [0.5]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 422])
+def test_nontransient_api_status_does_not_retry(status: int) -> None:
+    sleeper_calls: list[float] = []
+    sdk = SequencedSDK([sdk_error(APIStatusError, status)])
+    wrapper, _ = client(cast(FakeSDK, sdk), sleeper=sleeper_calls.append)
+
+    with pytest.raises(OpenAIDecisionRequestError):
+        wrapper.decide(request())
+
+    assert len(sdk.responses.calls) == 1
+    assert sleeper_calls == []
 
 
 @pytest.mark.parametrize("status", ["incomplete", "in_progress", "queued", "cancelled"])
@@ -475,7 +563,18 @@ def test_sdk_errors_are_sanitized_without_context(
     assert raised.value.diagnostic.category is category
     assert raised.value.diagnostic.exception_class == type(source).__name__
     assert raised.value.__cause__ is None and raised.value.__context__ is None
-    assert len(fake.responses.calls) == 1
+    expected_calls = (
+        2
+        if category
+        in {
+            OpenAIDecisionDiagnosticCategory.RATE_LIMIT,
+            OpenAIDecisionDiagnosticCategory.CONNECTION,
+            OpenAIDecisionDiagnosticCategory.TIMEOUT,
+            OpenAIDecisionDiagnosticCategory.API_STATUS,
+        }
+        else 1
+    )
+    assert len(fake.responses.calls) == expected_calls
 
 
 def test_api_status_preserves_only_allowlisted_structured_metadata() -> None:
@@ -783,10 +882,12 @@ class TruthinessGuardFakeSDK(FakeSDK):
     "source", [KeyboardInterrupt(), SystemExit(), GeneratorExit(), InfrastructureFailure()]
 )
 def test_base_exceptions_propagate_by_identity(source: BaseException) -> None:
-    wrapper, fake = client(FakeSDK(error=source))
+    sleeper_calls: list[float] = []
+    wrapper, fake = client(FakeSDK(error=source), sleeper=sleeper_calls.append)
     with pytest.raises(BaseException) as raised:
         wrapper.decide(request())
     assert raised.value is source and len(fake.responses.calls) == 1
+    assert sleeper_calls == []
 
 
 def test_client_ownership_close_and_context_manager() -> None:

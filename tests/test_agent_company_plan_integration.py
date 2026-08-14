@@ -148,6 +148,23 @@ class Decision:
         )
 
 
+class TwoAttemptDecision(Decision):
+    def decide(self, request: OpenAIDecisionRequest) -> OpenAIDecisionResult:
+        self.calls += 1
+        assert self.session.scalar(select(func.count()).select_from(CompanyDiscoveryRun)) == 1
+        self.calls += 1
+        return OpenAIDecisionResult(
+            decision=OpenAIDecisionKind.SELECT,
+            selected_candidate_index=1,
+            confidence=0.9,
+            company_fit=OpenAICompanyFit.HIGH,
+            rationale="Strong fit after one transient provider failure",
+            next_action_title="Review",
+            next_action_description="Review before outreach",
+            human_review_required=True,
+        )
+
+
 class ForeignSelection:
     def __init__(
         self,
@@ -275,6 +292,34 @@ def test_real_staging_selection_and_transaction_boundary(session: Session) -> No
     assert result.query == provider.calls[0].text
     assert provider.calls[0].limit == 5
     assert session.scalar(select(func.count()).select_from(CompanyDiscoveryRun)) == 1
+    assert session.scalar(select(func.count()).select_from(Company)) == 0
+    assert session.scalar(select(func.count()).select_from(Contact)) == 0
+    assert session.scalar(select(func.count()).select_from(Lead)) == 0
+    assert session.scalar(select(func.count()).select_from(Task)) == 0
+
+
+def test_two_decision_attempts_do_not_repeat_discovery_or_business_persistence(
+    session: Session,
+) -> None:
+    project, profile = seed(session)
+    provider = Provider([provider_result()])
+    decision = TwoAttemptDecision(session)
+    service, committer, generator = build_service(session, provider, decision)
+
+    result = service.plan(
+        AgentCompanyPlanInput(
+            project_id=project.id,
+            search_profile_id=profile.id,
+            goal="Choose the strongest company",
+        )
+    )
+
+    assert result.selected_candidate_id is not None
+    assert len(provider.calls) == committer.calls == generator.calls == 1
+    assert result.serpapi_call_count == 1
+    assert decision.calls == 2
+    assert session.scalar(select(func.count()).select_from(CompanyDiscoveryRun)) == 1
+    assert session.scalar(select(func.count()).select_from(CompanyDiscoveryCandidate)) == 1
     assert session.scalar(select(func.count()).select_from(Company)) == 0
     assert session.scalar(select(func.count()).select_from(Contact)) == 0
     assert session.scalar(select(func.count()).select_from(Lead)) == 0
