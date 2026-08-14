@@ -24,6 +24,28 @@ class LeadRepository:
         source: str | None = None,
         notes: str | None = None,
     ) -> Lead:
+        lead = self.create_pending(
+            company_id=company_id,
+            contact_id=contact_id,
+            status=status,
+            source=source,
+            notes=notes,
+        )
+
+        self.session.commit()
+        self.session.refresh(lead)
+
+        return lead
+
+    def create_pending(
+        self,
+        *,
+        company_id: int,
+        contact_id: int | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        notes: str | None = None,
+    ) -> Lead:
         lead = Lead(
             company_id=company_id,
             contact_id=contact_id,
@@ -33,8 +55,7 @@ class LeadRepository:
         )
 
         self.session.add(lead)
-        self.session.commit()
-        self.session.refresh(lead)
+        self.session.flush()
 
         return lead
 
