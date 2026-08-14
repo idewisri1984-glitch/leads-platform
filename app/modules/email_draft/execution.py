@@ -38,6 +38,7 @@ def execute_email_draft_generation(
     *,
     session_factory: SessionFactory,
     generator_factory: Callable[[], EmailDraftGenerator] | None = None,
+    before_commit: Callable[[EmailDraftRead], object] | None = None,
 ) -> EmailDraftRead:
     from app.modules.email_draft.repository import EmailDraftRepository
     from app.modules.email_draft.service import EmailDraftPersistenceError, EmailDraftService
@@ -53,6 +54,8 @@ def execute_email_draft_generation(
             repository=EmailDraftRepository(session),
             generator=generator,
         ).generate(data)
+        if before_commit is not None:
+            before_commit(result)
         try:
             session.commit()
             committed = True

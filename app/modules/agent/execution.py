@@ -139,10 +139,15 @@ class _LazyDecisionFactory:
 def _provider_construction[T](operation: Callable[[], T]) -> T:
     from app.modules.agent.company_plan import AgentCompanyPlanSearchProviderError
 
+    error: AgentCompanyPlanSearchProviderError | None = None
+    value: T | None = None
     try:
-        return operation()
+        value = operation()
     except Exception:
-        raise AgentCompanyPlanSearchProviderError("Company search provider failed.") from None
+        error = AgentCompanyPlanSearchProviderError("Company search provider failed.")
+    if error is not None:
+        raise error
+    return cast(T, value)
 
 
 def execute_company_plan(
@@ -227,17 +232,23 @@ def execute_company_apply(
         result = cast("AgentCompanyApplyResult", service.apply(data))
         if before_commit is not None:
             before_commit(result)
+        conflict_error: AgentCompanyApplyConflictError | None = None
+        persistence_error: AgentCompanyApplyPersistenceError | None = None
         try:
             session.commit()
             committed = True
         except IntegrityError:
-            raise AgentCompanyApplyConflictError(
+            conflict_error = AgentCompanyApplyConflictError(
                 "Agent company apply persistence conflict."
-            ) from None
+            )
         except Exception:
-            raise AgentCompanyApplyPersistenceError(
+            persistence_error = AgentCompanyApplyPersistenceError(
                 "Agent company apply could not be persisted."
-            ) from None
+            )
+        if conflict_error is not None:
+            raise conflict_error
+        if persistence_error is not None:
+            raise persistence_error
         return result
     except BaseException:
         failed = True

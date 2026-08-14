@@ -347,14 +347,18 @@ def execute_generate(
 ) -> str:
     from app.modules.email_draft.execution import execute_email_draft_generation
 
-    return render_email_draft(
-        execute_email_draft_generation(
-            data,
-            session_factory=session_factory,
-            generator_factory=generator_factory,
-        ),
-        output,
+    rendered: list[str] = []
+
+    def prepare_result(result: EmailDraftRead) -> None:
+        rendered.append(render_email_draft(result, output))
+
+    execute_email_draft_generation(
+        data,
+        session_factory=session_factory,
+        generator_factory=generator_factory,
+        before_commit=prepare_result,
     )
+    return rendered[0]
 
 
 def execute_generate_missing(
