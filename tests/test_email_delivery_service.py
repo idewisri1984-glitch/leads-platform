@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.core.database import SessionLocal
 from app.modules.company.models import Company
@@ -13,6 +13,7 @@ from app.modules.email_delivery.service import (
     ConfirmedEmailSendCommand,
     ConfirmedEmailSendService,
     EmailDeliveryAlreadyAttemptedError,
+    EmailDeliveryCompanyScopedDraftError,
     EmailDeliveryConfigurationError,
     EmailDeliveryConfirmationRequiredError,
     EmailDeliveryNotApprovedError,
@@ -152,6 +153,19 @@ def _service(session: object, transport: RecordingTransport, sender=None):
         sender=sender or _sender(),
         clock=lambda: NOW,
     )
+
+
+def test_company_scoped_draft_is_rejected_before_attempt_or_transport() -> None:
+    ids = _records()
+    with SessionLocal() as session:
+        session.execute(update(EmailDraft).where(EmailDraft.id == ids[3]).values(contact_id=None))
+        session.commit()
+    transport = RecordingTransport()
+    with SessionLocal() as session, pytest.raises(EmailDeliveryCompanyScopedDraftError):
+        _service(session, transport).send(_command(ids))
+    assert transport.calls == []
+    with SessionLocal() as session:
+        assert session.scalar(select(func.count()).select_from(EmailDeliveryAttempt)) == 0
 
 
 def test_confirmed_approved_send_persists_one_accepted_attempt() -> None:

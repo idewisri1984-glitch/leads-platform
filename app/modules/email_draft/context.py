@@ -30,9 +30,10 @@ class EmailDraftContextError(ValueError):
 class EmailDraftSourceRecords:
     project: object
     company: object
-    contact: object
+    contact: object | None
     lead: object
     task: object
+    company_email: str | None = None
 
 
 def sanitize_context_data(value: object, maximum: int) -> str | None:
@@ -72,10 +73,20 @@ def _id(record: object, name: str = "id") -> int:
 def build_email_personalization_context(
     records: EmailDraftSourceRecords,
 ) -> EmailPersonalizationContext:
-    first_name = cast(str, _text(records.contact, "first_name", 100, required=True))
-    last_name = _text(records.contact, "last_name", 100)
-    recipient_name = first_name if last_name is None else f"{first_name} {last_name}"
-    raw_email = getattr(records.contact, "email", None)
+    contact = records.contact
+    if contact is None:
+        company_name = cast(str, _text(records.company, "name", 255, required=True))
+        recipient_name = f"{company_name} team"
+        recipient_role = None
+        contact_id = None
+        raw_email = records.company_email
+    else:
+        first_name = cast(str, _text(contact, "first_name", 100, required=True))
+        last_name = _text(contact, "last_name", 100)
+        recipient_name = first_name if last_name is None else f"{first_name} {last_name}"
+        recipient_role = _text(contact, "job_title", 150)
+        contact_id = _id(contact)
+        raw_email = getattr(contact, "email", None)
     try:
         email = normalize_discovered_email(raw_email) if type(raw_email) is str else None
     except (TypeError, ValueError):
@@ -92,9 +103,9 @@ def build_email_personalization_context(
         company_country=_text(records.company, "country", 100),
         company_industry=_text(records.company, "industry", 100),
         company_notes_data=_text(records.company, "notes", 1000),
-        contact_id=_id(records.contact),
+        contact_id=contact_id,
         recipient_name=recipient_name,
-        recipient_role=_text(records.contact, "job_title", 150),
+        recipient_role=recipient_role,
         recipient_email=email,
         lead_id=_id(records.lead),
         lead_status=cast(str, _text(records.lead, "status", 50, required=True)),

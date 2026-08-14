@@ -47,8 +47,8 @@ class EmailDraft(Base):
     company_id: Mapped[int] = mapped_column(
         ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    contact_id: Mapped[int] = mapped_column(
-        ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False, index=True
+    contact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contacts.id", ondelete="CASCADE"), nullable=True, index=True
     )
     lead_id: Mapped[int] = mapped_column(
         ForeignKey("leads.id", ondelete="CASCADE"), nullable=False, index=True
@@ -89,6 +89,11 @@ class EmailDraft(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+
+
+def draft_is_sendable(draft: EmailDraft) -> bool:
+    """Return whether Contact-scoped delivery workflows may accept a draft."""
+    return draft.contact_id is not None
 
 
 _IMMUTABLE_REVIEWED_FIELDS = (

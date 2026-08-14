@@ -1,10 +1,12 @@
 from datetime import UTC, datetime
 
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.modules.company.models import Company
+from app.modules.company_enrichment.models import CompanyEnrichment
 from app.modules.contact.models import Contact
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
@@ -268,17 +270,26 @@ class EmailDraftService:
     ) -> EmailDraftSourceRecords:
         project = self.session.get(Project, data.project_id, populate_existing=populate_existing)
         company = self.session.get(Company, data.company_id, populate_existing=populate_existing)
-        contact = self.session.get(Contact, data.contact_id, populate_existing=populate_existing)
+        contact = (
+            self.session.get(Contact, data.contact_id, populate_existing=populate_existing)
+            if data.contact_id is not None
+            else None
+        )
+        enrichment = self.session.scalar(
+            select(CompanyEnrichment).where(CompanyEnrichment.company_id == data.company_id)
+        )
         lead = self.session.get(Lead, data.lead_id, populate_existing=populate_existing)
         task = self.session.get(Task, data.task_id, populate_existing=populate_existing)
-        if project is None or company is None or contact is None or lead is None or task is None:
+        if project is None or company is None or lead is None or task is None:
             raise EmailDraftNotFoundError(_NOT_FOUND)
         if (
             company.project_id != project.id
-            or contact.company_id != company.id
             or lead.company_id != company.id
-            or lead.contact_id != contact.id
             or task.lead_id != lead.id
+            or (
+                contact is not None
+                and (contact.company_id != company.id or lead.contact_id != contact.id)
+            )
         ):
             raise EmailDraftScopeError(_SCOPE)
         if task.status not in {
@@ -286,7 +297,15 @@ class EmailDraftService:
             TaskLifecycleStatus.IN_PROGRESS.value,
         }:
             raise EmailDraftNotEligibleError(_NOT_ELIGIBLE)
-        return EmailDraftSourceRecords(project, company, contact, lead, task)
+        company_email = enrichment.email if enrichment is not None else None
+        return EmailDraftSourceRecords(
+            project=project,
+            company=company,
+            contact=contact,
+            lead=lead,
+            task=task,
+            company_email=company_email,
+        )
 
     @staticmethod
     def _context(records: EmailDraftSourceRecords) -> EmailPersonalizationContext:
@@ -338,16 +357,20 @@ class EmailDraftService:
     def _get_draft(
         self, data: EmailDraftReviewInput | EmailDraftScopeInput, *, for_update: bool
     ) -> EmailDraft:
-        arguments = {
-            "project_id": data.project_id,
-            "company_id": data.company_id,
-            "contact_id": data.contact_id,
-            "draft_id": data.draft_id,
-        }
         if for_update:
-            draft = self.repository.get_for_scope_for_update(**arguments)
+            draft = self.repository.get_for_scope_for_update(
+                project_id=data.project_id,
+                company_id=data.company_id,
+                contact_id=data.contact_id,
+                draft_id=data.draft_id,
+            )
         else:
-            draft = self.repository.get_for_scope(**arguments)
+            draft = self.repository.get_for_scope(
+                project_id=data.project_id,
+                company_id=data.company_id,
+                contact_id=data.contact_id,
+                draft_id=data.draft_id,
+            )
         if draft is None:
             raise EmailDraftNotFoundError(_NOT_FOUND)
         return draft

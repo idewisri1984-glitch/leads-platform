@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import SessionLocal
@@ -16,6 +16,7 @@ from app.modules.email_delivery.manual_schemas import (
 from app.modules.email_delivery.manual_service import (
     ManualOutreachAlreadySentError,
     ManualOutreachAutomaticAttemptError,
+    ManualOutreachCompanyScopedDraftError,
     ManualOutreachService,
     ManualOutreachStaleContextError,
 )
@@ -59,6 +60,25 @@ def test_export_returns_exact_copy_package_without_persistence() -> None:
         assert result.subject == "Reviewed subject"
         assert result.text_body == "Reviewed plain-text body with sufficient stable content."
         assert result.manual_send_record_id is None
+        assert session.scalar(select(func.count()).select_from(ManualEmailSendRecord)) == 0
+
+
+def test_company_scoped_draft_is_rejected_before_manual_record() -> None:
+    ids = _records()
+    command = _command(ids)
+    with SessionLocal() as session:
+        session.execute(
+            update(EmailDraft)
+            .where(EmailDraft.id == command.email_draft_id)
+            .values(contact_id=None)
+        )
+        session.commit()
+    with SessionLocal() as session, pytest.raises(ManualOutreachCompanyScopedDraftError):
+        ManualOutreachService(
+            session,
+            ManualEmailSendRecordRepository(session),
+        ).mark_sent(_confirmed(ids))
+    with SessionLocal() as session:
         assert session.scalar(select(func.count()).select_from(ManualEmailSendRecord)) == 0
 
 

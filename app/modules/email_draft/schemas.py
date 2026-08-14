@@ -50,7 +50,7 @@ class EmailPersonalizationContext(BaseModel):
     company_country: str | None
     company_industry: str | None
     company_notes_data: str | None
-    contact_id: int
+    contact_id: int | None
     recipient_name: str
     recipient_role: str | None
     recipient_email: str
@@ -61,10 +61,15 @@ class EmailPersonalizationContext(BaseModel):
     task_title: str
     task_description_data: str | None
 
-    @field_validator("project_id", "company_id", "contact_id", "lead_id", "task_id", mode="before")
+    @field_validator("project_id", "company_id", "lead_id", "task_id", mode="before")
     @classmethod
     def validate_ids(cls, value: object) -> int:
         return positive_id(value)
+
+    @field_validator("contact_id", mode="before")
+    @classmethod
+    def validate_contact_id(cls, value: object) -> int | None:
+        return None if value is None else positive_id(value)
 
     @field_validator("project_name", "company_name", "recipient_name", mode="before")
     @classmethod
@@ -117,7 +122,7 @@ class EmailDraftGenerationInput(BaseModel):
 
     project_id: int
     company_id: int
-    contact_id: int
+    contact_id: int | None
     lead_id: int
     task_id: int
     sender_name: str
@@ -128,10 +133,15 @@ class EmailDraftGenerationInput(BaseModel):
     value_proposition: str | None = None
     prompt_version: str
 
-    @field_validator("project_id", "company_id", "contact_id", "lead_id", "task_id", mode="before")
+    @field_validator("project_id", "company_id", "lead_id", "task_id", mode="before")
     @classmethod
     def validate_ids(cls, value: object) -> int:
         return positive_id(value)
+
+    @field_validator("contact_id", mode="before")
+    @classmethod
+    def validate_contact_id(cls, value: object) -> int | None:
+        return None if value is None else positive_id(value)
 
     @field_validator("sender_name", mode="before")
     @classmethod
@@ -233,14 +243,19 @@ class EmailDraftReviewInput(BaseModel):
 
     project_id: int
     company_id: int
-    contact_id: int
+    contact_id: int | None
     draft_id: int
     confirmed: bool
 
-    @field_validator("project_id", "company_id", "contact_id", "draft_id", mode="before")
+    @field_validator("project_id", "company_id", "draft_id", mode="before")
     @classmethod
     def validate_ids(cls, value: object) -> int:
         return positive_id(value)
+
+    @field_validator("contact_id", mode="before")
+    @classmethod
+    def validate_contact_id(cls, value: object) -> int | None:
+        return None if value is None else positive_id(value)
 
     @field_validator("confirmed", mode="before")
     @classmethod
@@ -255,13 +270,18 @@ class EmailDraftScopeInput(BaseModel):
 
     project_id: int
     company_id: int
-    contact_id: int
+    contact_id: int | None
     draft_id: int
 
-    @field_validator("project_id", "company_id", "contact_id", "draft_id", mode="before")
+    @field_validator("project_id", "company_id", "draft_id", mode="before")
     @classmethod
     def validate_ids(cls, value: object) -> int:
         return positive_id(value)
+
+    @field_validator("contact_id", mode="before")
+    @classmethod
+    def validate_contact_id(cls, value: object) -> int | None:
+        return None if value is None else positive_id(value)
 
 
 class EmailDraftRead(BaseModel):
@@ -270,7 +290,7 @@ class EmailDraftRead(BaseModel):
     id: int
     project_id: int
     company_id: int
-    contact_id: int
+    contact_id: int | None
     lead_id: int
     task_id: int
     recipient_email: str

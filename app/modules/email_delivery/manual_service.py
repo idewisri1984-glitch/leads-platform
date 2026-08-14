@@ -9,7 +9,7 @@ from app.modules.company.models import Company
 from app.modules.contact.models import Contact
 from app.modules.contact_discovery.normalization import normalize_discovered_email
 from app.modules.email_draft.context import build_content_hash
-from app.modules.email_draft.models import EmailDraft, EmailDraftStatus
+from app.modules.email_draft.models import EmailDraft, EmailDraftStatus, draft_is_sendable
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
 from app.modules.task.models import Task, TaskLifecycleStatus
@@ -50,6 +50,10 @@ class ManualOutreachConfirmationRequiredError(ManualOutreachError):
 
 
 class ManualOutreachNotFoundError(ManualOutreachError):
+    pass
+
+
+class ManualOutreachCompanyScopedDraftError(ManualOutreachNotFoundError):
     pass
 
 
@@ -129,7 +133,7 @@ class ManualOutreachService:
                 ManualEmailSendRecordCreate(
                     project_id=draft.project_id,
                     company_id=draft.company_id,
-                    contact_id=draft.contact_id,
+                    contact_id=self._contact_id(draft),
                     email_draft_id=draft.id,
                     recipient_email=draft.recipient_email,
                     sent_at=self._utc(self.clock()),
@@ -165,6 +169,8 @@ class ManualOutreachService:
     def _load_authoritative_draft(self, data: ManualEmailDraftScope) -> tuple[EmailDraft, Company]:
         self.session.expire_all()
         draft = self.session.get(EmailDraft, data.email_draft_id, populate_existing=True)
+        if draft is not None and not draft_is_sendable(draft):
+            raise ManualOutreachCompanyScopedDraftError("COMPANY_SCOPED_DRAFT_NOT_SENDABLE")
         if (
             draft is None
             or draft.project_id != data.project_id
@@ -213,6 +219,12 @@ class ManualOutreachService:
         return draft, company
 
     @staticmethod
+    def _contact_id(draft: EmailDraft) -> int:
+        if draft.contact_id is None:
+            raise ManualOutreachCompanyScopedDraftError("COMPANY_SCOPED_DRAFT_NOT_SENDABLE")
+        return draft.contact_id
+
+    @staticmethod
     def _package(
         draft: EmailDraft,
         company: Company,
@@ -221,7 +233,7 @@ class ManualOutreachService:
         return ManualEmailCopyPackage(
             project_id=draft.project_id,
             company_id=draft.company_id,
-            contact_id=draft.contact_id,
+            contact_id=ManualOutreachService._contact_id(draft),
             lead_id=draft.lead_id,
             task_id=draft.task_id,
             email_draft_id=draft.id,
