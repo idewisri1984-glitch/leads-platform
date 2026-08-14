@@ -414,3 +414,65 @@ def test_decision_factory_is_lazy_and_failure_closes_session(
     assert str(caught.value) == "Company decision provider failed."
     assert factory_calls == 1
     assert session.rollbacks == session.closes == 1
+
+
+def test_lazy_decision_factory_returns_boundary_without_runtime_protocol_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(agent_cli, "DecisionBoundary", raising=False)
+    events: list[str] = []
+
+    class Boundary:
+        pass
+
+    boundary = Boundary()
+
+    class Factory:
+        def __call__(self) -> object:
+            events.append("factory_call")
+            return boundary
+
+        def close(self) -> None:
+            events.append("close")
+
+    factory = Factory()
+
+    def factory_factory() -> object:
+        events.append("factory_construction")
+        return factory
+
+    lazy = agent_cli._LazyDecisionFactory(factory_factory)  # type: ignore[arg-type]
+
+    assert "DecisionBoundary" not in agent_cli.__dict__
+    assert lazy() is boundary
+    assert lazy() is boundary
+    assert events == ["factory_construction", "factory_call", "factory_call"]
+
+    lazy.close()
+    assert events == ["factory_construction", "factory_call", "factory_call", "close"]
+
+
+def test_lazy_decision_factory_sanitizes_client_construction_failure() -> None:
+    events: list[str] = []
+
+    class FailingFactory:
+        def __call__(self) -> object:
+            events.append("factory_call")
+            raise RuntimeError("secret OpenAI client configuration")
+
+        def close(self) -> None:
+            events.append("close")
+
+    lazy = agent_cli._LazyDecisionFactory(  # type: ignore[arg-type]
+        lambda: FailingFactory()  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(AgentCompanyPlanDecisionError) as caught:
+        lazy()
+
+    assert str(caught.value) == "Company decision provider failed."
+    assert caught.value.__cause__ is caught.value.__context__ is None
+    assert events == ["factory_call"]
+
+    lazy.close()
+    assert events == ["factory_call", "close"]

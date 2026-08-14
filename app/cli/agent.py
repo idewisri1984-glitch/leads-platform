@@ -472,7 +472,9 @@ class _LazyDecisionFactory:
             error = AgentCompanyPlanDecisionError("Company decision provider failed.")
         if error is not None:
             raise error
-        return cast(DecisionBoundary, boundary)
+        if boundary is None:
+            raise AgentCompanyPlanDecisionError("Company decision provider failed.")
+        return boundary
 
     def close(self) -> None:
         if self._factory is not None:
