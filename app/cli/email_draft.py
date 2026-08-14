@@ -387,6 +387,74 @@ def execute_generate(
         _cleanup(session.close) if failed else session.close()
 
 
+def execute_generate_missing(
+    *,
+    project_id: int,
+    limit: int,
+    sender_name: str,
+    sender_company: str,
+    purpose: str,
+    value_proposition: str | None,
+    language: EmailLanguage,
+    tone: EmailTone,
+    dry_run: bool,
+    output: str,
+    session_factory: _SessionFactory = SessionLocal,
+    generator_factory: Callable[[], EmailDraftGenerator] | None = None,
+) -> str:
+    from app.modules.email_draft.batch import (
+        MissingDraftBatchOptions,
+        MissingEmailDraftBatchService,
+    )
+
+    service = MissingEmailDraftBatchService(
+        session_factory=session_factory,
+        generator_factory=generator_factory or _OpenAIGeneratorFactory(),
+    )
+    result = service.run(
+        MissingDraftBatchOptions(
+            project_id=project_id,
+            limit=limit,
+            sender_name=sender_name,
+            sender_company=sender_company,
+            purpose=purpose,
+            value_proposition=value_proposition,
+            language=language,
+            tone=tone,
+            dry_run=dry_run,
+        )
+    )
+    items_payload: list[dict[str, object]] = [
+        {
+            "company_id": item.company_id,
+            "company_name": item.company_name,
+            "recipient_type": item.recipient_type,
+            "recipient_email": item.recipient_email,
+            "decision_maker": item.decision_maker,
+            "contact_id": item.contact_id,
+            "result": item.result.value,
+            "draft_id": item.draft_id,
+            "subject": item.subject,
+        }
+        for item in result.items
+    ]
+    payload: dict[str, object] = {
+        "candidate_count": result.candidate_count,
+        "selected_limit": result.selected_limit,
+        "ai_call_count": result.ai_call_count,
+        "items": items_payload,
+    }
+    if output == "json":
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    lines = [
+        f"candidate_count={result.candidate_count}",
+        f"selected_limit={result.selected_limit}",
+        f"ai_call_count={result.ai_call_count}",
+    ]
+    lines.extend(json.dumps(item, ensure_ascii=False, sort_keys=True) for item in items_payload)
+    return "\n".join(lines)
+
+
 def execute_show(
     data: EmailDraftScopeInput,
     output: str,
@@ -618,11 +686,45 @@ def generate(
     typer.echo(rendered)
 
 
-def _scope(project_id: str, company_id: str, contact_id: str, draft_id: str) -> dict[str, int]:
+@app.command("generate-missing", cls=_EmailDraftCommand)
+def generate_missing(
+    project_id: Annotated[str, typer.Option("--project-id")],
+    sender_name: Annotated[str, typer.Option("--sender-name")],
+    sender_company: Annotated[str, typer.Option("--sender-company")],
+    purpose: Annotated[str, typer.Option("--purpose")],
+    limit: Annotated[str, typer.Option("--limit")] = "20",
+    language: Annotated[str, typer.Option("--language")] = "en",
+    tone: Annotated[str, typer.Option("--tone")] = "professional",
+    value_proposition: Annotated[str | None, typer.Option("--value-proposition")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output: Annotated[str, typer.Option("--output")] = "text",
+) -> None:
+    """Generate a bounded batch of eligible missing drafts without sending email."""
+    try:
+        rendered = execute_generate_missing(
+            project_id=_positive(project_id),
+            limit=_positive(limit),
+            sender_name=sender_name,
+            sender_company=sender_company,
+            purpose=purpose,
+            value_proposition=value_proposition,
+            language=EmailLanguage(language),
+            tone=EmailTone(tone),
+            dry_run=dry_run,
+            output=_output(output),
+        )
+    except Exception as error:
+        _handle_error(error)
+    typer.echo(rendered)
+
+
+def _scope(
+    project_id: str, company_id: str, contact_id: str | None, draft_id: str
+) -> dict[str, int | None]:
     return {
         "project_id": _positive(project_id),
         "company_id": _positive(company_id),
-        "contact_id": _positive(contact_id),
+        "contact_id": None if contact_id is None else _positive(contact_id),
         "draft_id": _positive(draft_id),
     }
 
@@ -631,8 +733,8 @@ def _scope(project_id: str, company_id: str, contact_id: str, draft_id: str) -> 
 def show(
     project_id: Annotated[str, typer.Option("--project-id")],
     company_id: Annotated[str, typer.Option("--company-id")],
-    contact_id: Annotated[str, typer.Option("--contact-id")],
     draft_id: Annotated[str, typer.Option("--draft-id")],
+    contact_id: Annotated[str | None, typer.Option("--contact-id")] = None,
     output: Annotated[str, typer.Option("--output")] = "text",
 ) -> None:
     try:
@@ -649,7 +751,7 @@ def _review_command(
     action: str,
     project_id: str,
     company_id: str,
-    contact_id: str,
+    contact_id: str | None,
     draft_id: str,
     yes: bool,
     output: str,
@@ -670,8 +772,8 @@ def _review_command(
 def approve(
     project_id: Annotated[str, typer.Option("--project-id")],
     company_id: Annotated[str, typer.Option("--company-id")],
-    contact_id: Annotated[str, typer.Option("--contact-id")],
     draft_id: Annotated[str, typer.Option("--draft-id")],
+    contact_id: Annotated[str | None, typer.Option("--contact-id")] = None,
     yes: Annotated[bool, typer.Option("--yes")] = False,
     output: Annotated[str, typer.Option("--output")] = "text",
 ) -> None:
@@ -682,8 +784,8 @@ def approve(
 def reject(
     project_id: Annotated[str, typer.Option("--project-id")],
     company_id: Annotated[str, typer.Option("--company-id")],
-    contact_id: Annotated[str, typer.Option("--contact-id")],
     draft_id: Annotated[str, typer.Option("--draft-id")],
+    contact_id: Annotated[str | None, typer.Option("--contact-id")] = None,
     yes: Annotated[bool, typer.Option("--yes")] = False,
     output: Annotated[str, typer.Option("--output")] = "text",
 ) -> None:

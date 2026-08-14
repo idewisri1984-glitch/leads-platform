@@ -9,7 +9,7 @@ class EmailDraftRepository:
         self.session = session
 
     def get_for_scope(
-        self, *, project_id: int, company_id: int, contact_id: int, draft_id: int
+        self, *, project_id: int, company_id: int, contact_id: int | None, draft_id: int
     ) -> EmailDraft | None:
         return self.session.scalar(
             select(EmailDraft).where(
@@ -21,7 +21,7 @@ class EmailDraftRepository:
         )
 
     def get_for_scope_for_update(
-        self, *, project_id: int, company_id: int, contact_id: int, draft_id: int
+        self, *, project_id: int, company_id: int, contact_id: int | None, draft_id: int
     ) -> EmailDraft | None:
         return self.session.scalar(
             select(EmailDraft)

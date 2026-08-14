@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, inspect
 _ROOT = Path(__file__).resolve().parents[1]
 _PREVIOUS_REVISION = "a41bc92d7e60"
 _REVISION = "b52cd03e8f71"
+_HEAD = "c71e3a9d4f20"
 
 
 def _alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -61,5 +62,5 @@ def test_manual_outreach_migration_upgrade_downgrade_reupgrade(tmp_path: Path) -
             row[1] for row in connection.execute("PRAGMA table_info('email_drafts')")
         }
     _alembic(database, "upgrade", "head")
-    assert _revision(database) == _REVISION
+    assert _revision(database) == _HEAD
     _alembic(database, "check")

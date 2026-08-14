@@ -14,7 +14,7 @@ from app.modules.company.models import Company
 from app.modules.contact.models import Contact
 from app.modules.contact_discovery.normalization import normalize_discovered_email
 from app.modules.email_draft.context import build_content_hash
-from app.modules.email_draft.models import EmailDraft, EmailDraftStatus
+from app.modules.email_draft.models import EmailDraft, EmailDraftStatus, draft_is_sendable
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
 from app.modules.task.models import Task, TaskLifecycleStatus
@@ -250,6 +250,10 @@ class EmailDeliveryNotFoundError(EmailDeliveryServiceError):
     pass
 
 
+class EmailDeliveryCompanyScopedDraftError(EmailDeliveryNotFoundError):
+    pass
+
+
 class EmailDeliveryNotApprovedError(EmailDeliveryServiceError):
     pass
 
@@ -471,6 +475,8 @@ class ConfirmedEmailSendService:
         draft: EmailDraft | None = self.session.get(
             EmailDraft, data.email_draft_id, populate_existing=True
         )
+        if draft is not None and not draft_is_sendable(draft):
+            raise EmailDeliveryCompanyScopedDraftError("COMPANY_SCOPED_DRAFT_NOT_SENDABLE")
         if (
             draft is None
             or draft.project_id != data.project_id
