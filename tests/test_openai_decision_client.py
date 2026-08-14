@@ -1,5 +1,6 @@
 import inspect
 import json
+import traceback
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -8,6 +9,8 @@ import httpx
 import pytest
 from openai import (
     APIConnectionError,
+    APIError,
+    APIStatusError,
     APITimeoutError,
     AuthenticationError,
     OpenAI,
@@ -29,6 +32,10 @@ from app.providers.openai_decision import (
     OpenAIDecisionRequestError,
     OpenAIDecisionResponseError,
     OpenAIDecisionResult,
+)
+from app.providers.openai_decision.exceptions import (
+    OpenAIDecisionDiagnostic,
+    OpenAIDecisionDiagnosticCategory,
 )
 from app.providers.openai_decision.prompt import OPENAI_COMPANY_DECISION_INSTRUCTIONS
 
@@ -74,7 +81,12 @@ def request(count: int = 1) -> OpenAIDecisionRequest:
 
 
 def response(
-    payload: dict[str, object] = SELECT, *, status: str = "completed", refusal: bool = False
+    payload: dict[str, object] = SELECT,
+    *,
+    status: str = "completed",
+    refusal: bool = False,
+    incomplete_reason: str | None = None,
+    request_id: object = None,
 ) -> SimpleNamespace:
     content = (
         [SimpleNamespace(type="refusal", refusal="secret refusal")]
@@ -82,7 +94,13 @@ def response(
         else [SimpleNamespace(type="output_text")]
     )
     return SimpleNamespace(
-        status=status, output=[SimpleNamespace(content=content)], output_text=json.dumps(payload)
+        status=status,
+        output=[SimpleNamespace(content=content)],
+        output_text=json.dumps(payload),
+        incomplete_details=(
+            SimpleNamespace(reason=incomplete_reason) if incomplete_reason is not None else None
+        ),
+        request_id=request_id,
     )
 
 
@@ -224,31 +242,70 @@ def test_exact_single_request_and_safe_public_result(
 @pytest.mark.parametrize("status", ["incomplete", "in_progress", "queued", "cancelled"])
 def test_noncompleted_statuses_are_mapped_before_parsing(status: str) -> None:
     wrapper, _ = client(FakeSDK(response(status=status)))
-    with pytest.raises(OpenAIDecisionIncompleteError):
+    with pytest.raises(OpenAIDecisionIncompleteError) as raised:
         wrapper.decide(request())
+    assert raised.value.diagnostic == OpenAIDecisionDiagnostic(
+        category=OpenAIDecisionDiagnosticCategory.RESPONSE_INCOMPLETE,
+        response_status=status,
+    )
+
+
+def test_incomplete_reason_is_preserved_only_as_a_safe_token() -> None:
+    wrapper, _ = client(
+        FakeSDK(response(status="incomplete", incomplete_reason="max_output_tokens"))
+    )
+    with pytest.raises(OpenAIDecisionIncompleteError) as raised:
+        wrapper.decide(request())
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.incomplete_reason == "max_output_tokens"
 
 
 def test_failed_unknown_and_refusal_statuses_are_sanitized() -> None:
     cases = [
-        (response(status="failed"), OpenAIDecisionRequestError),
-        (response(status="unknown"), OpenAIDecisionResponseError),
-        (response(refusal=True), OpenAIDecisionRefusalError),
+        (
+            response(status="failed"),
+            OpenAIDecisionRequestError,
+            OpenAIDecisionDiagnosticCategory.RESPONSE_FAILED,
+        ),
+        (
+            response(status="unknown"),
+            OpenAIDecisionResponseError,
+            OpenAIDecisionDiagnosticCategory.RESPONSE_STATUS_INVALID,
+        ),
+        (
+            response(refusal=True),
+            OpenAIDecisionRefusalError,
+            OpenAIDecisionDiagnosticCategory.REFUSAL,
+        ),
     ]
-    for sdk_response, error in cases:
+    for sdk_response, error, category in cases:
         wrapper, _ = client(FakeSDK(sdk_response))
         with pytest.raises(error) as raised:
             wrapper.decide(request())
         assert "secret" not in str(raised.value)
+        assert raised.value.diagnostic.category is category
 
 
-@pytest.mark.parametrize("output", ["", " ", "not json", "```json\n{}\n```", "x" * 10001])
-def test_invalid_output_is_never_repaired(output: str) -> None:
+@pytest.mark.parametrize(
+    "output,category",
+    [
+        ("", OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID),
+        (" ", OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID),
+        ("not json", OpenAIDecisionDiagnosticCategory.WIRE_VALIDATION_FAILED),
+        ("```json\n{}\n```", OpenAIDecisionDiagnosticCategory.WIRE_VALIDATION_FAILED),
+        ("x" * 10001, OpenAIDecisionDiagnosticCategory.OUTPUT_INVALID),
+    ],
+)
+def test_invalid_output_is_never_repaired(
+    output: str, category: OpenAIDecisionDiagnosticCategory
+) -> None:
     sdk_response = response()
     sdk_response.output_text = output
     wrapper, fake = client(FakeSDK(sdk_response))
     with pytest.raises(OpenAIDecisionResponseError) as raised:
         wrapper.decide(request())
     assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert raised.value.diagnostic.category is category
     assert len(fake.responses.calls) == 1
 
 
@@ -264,14 +321,21 @@ def test_invalid_output_is_never_repaired(output: str) -> None:
 )
 def test_schema_invalid_or_inconsistent_json_is_rejected(changes: dict[str, object]) -> None:
     wrapper, _ = client(FakeSDK(response(SELECT | changes)))
-    with pytest.raises(OpenAIDecisionResponseError):
+    with pytest.raises(OpenAIDecisionResponseError) as raised:
         wrapper.decide(request())
+    assert (
+        raised.value.diagnostic.category is OpenAIDecisionDiagnosticCategory.WIRE_VALIDATION_FAILED
+    )
 
 
 def test_selected_index_must_exist_in_submitted_request() -> None:
     wrapper, _ = client(FakeSDK(response(SELECT | {"selected_candidate_index": 2})))
-    with pytest.raises(OpenAIDecisionResponseError):
+    with pytest.raises(OpenAIDecisionResponseError) as raised:
         wrapper.decide(request())
+    assert (
+        raised.value.diagnostic.category
+        is OpenAIDecisionDiagnosticCategory.RESULT_VALIDATION_FAILED
+    )
 
 
 def test_integer_confidence_is_rejected_without_retry_or_context() -> None:
@@ -296,19 +360,83 @@ def sdk_error(error_type: type[BaseException], status: int = 500) -> BaseExcepti
     return error_type("raw secret key candidate", response=resp, body={})  # type: ignore[call-arg]
 
 
+def api_status_error(
+    *,
+    code: str = "server_error",
+    parameter: str = "text.format",
+    request_id: str = "req_safe-123",
+) -> APIStatusError:
+    req = httpx.Request("POST", "https://example.test/v1/responses")
+    resp = httpx.Response(
+        503,
+        request=req,
+        headers={"x-request-id": request_id},
+    )
+    return APIStatusError(
+        "raw secret key candidate",
+        response=resp,
+        body={"code": code, "param": parameter},
+    )
+
+
+def generic_api_error() -> APIError:
+    req = httpx.Request("POST", "https://example.test/v1/responses")
+    return APIError(
+        "raw secret key candidate",
+        request=req,
+        body={"code": "provider_error", "param": "input"},
+    )
+
+
 @pytest.mark.parametrize(
-    "source,target",
+    "source,target,category",
     [
-        (sdk_error(AuthenticationError, 401), OpenAIDecisionAuthenticationError),
-        (sdk_error(PermissionDeniedError, 403), OpenAIDecisionAuthenticationError),
-        (sdk_error(RateLimitError, 429), OpenAIDecisionRateLimitError),
-        (sdk_error(APIConnectionError), OpenAIDecisionRequestError),
-        (sdk_error(APITimeoutError), OpenAIDecisionRequestError),
-        (RuntimeError("raw secret"), OpenAIDecisionRequestError),
+        (
+            sdk_error(AuthenticationError, 401),
+            OpenAIDecisionAuthenticationError,
+            OpenAIDecisionDiagnosticCategory.AUTHENTICATION,
+        ),
+        (
+            sdk_error(PermissionDeniedError, 403),
+            OpenAIDecisionAuthenticationError,
+            OpenAIDecisionDiagnosticCategory.AUTHENTICATION,
+        ),
+        (
+            sdk_error(RateLimitError, 429),
+            OpenAIDecisionRateLimitError,
+            OpenAIDecisionDiagnosticCategory.RATE_LIMIT,
+        ),
+        (
+            sdk_error(APIConnectionError),
+            OpenAIDecisionRequestError,
+            OpenAIDecisionDiagnosticCategory.CONNECTION,
+        ),
+        (
+            sdk_error(APITimeoutError),
+            OpenAIDecisionRequestError,
+            OpenAIDecisionDiagnosticCategory.TIMEOUT,
+        ),
+        (
+            api_status_error(),
+            OpenAIDecisionRequestError,
+            OpenAIDecisionDiagnosticCategory.API_STATUS,
+        ),
+        (
+            generic_api_error(),
+            OpenAIDecisionRequestError,
+            OpenAIDecisionDiagnosticCategory.API_ERROR,
+        ),
+        (
+            RuntimeError("raw secret"),
+            OpenAIDecisionRequestError,
+            OpenAIDecisionDiagnosticCategory.INTERNAL_REQUEST_FAILURE,
+        ),
     ],
 )
 def test_sdk_errors_are_sanitized_without_context(
-    source: BaseException, target: type[Exception]
+    source: BaseException,
+    target: type[Exception],
+    category: OpenAIDecisionDiagnosticCategory,
 ) -> None:
     wrapper, fake = client(FakeSDK(error=source))
     with pytest.raises(target) as raised:
@@ -319,8 +447,108 @@ def test_sdk_errors_are_sanitized_without_context(
         "OpenAI decision request failed.",
     }
     assert "secret" not in str(raised.value)
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.category is category
+    assert raised.value.diagnostic.exception_class == type(source).__name__
     assert raised.value.__cause__ is None and raised.value.__context__ is None
     assert len(fake.responses.calls) == 1
+
+
+def test_api_status_preserves_only_allowlisted_structured_metadata() -> None:
+    wrapper, _ = client(FakeSDK(error=api_status_error()))
+    with pytest.raises(OpenAIDecisionRequestError) as raised:
+        wrapper.decide(request())
+    assert raised.value.diagnostic == OpenAIDecisionDiagnostic(
+        category=OpenAIDecisionDiagnosticCategory.API_STATUS,
+        exception_class="APIStatusError",
+        http_status=503,
+        openai_error_code="server_error",
+        parameter="text.format",
+        request_id="req_safe-123",
+    )
+
+
+def test_unsafe_structured_sdk_metadata_is_discarded() -> None:
+    markers = (
+        "sk-SECRET_API_KEY",
+        "PRIVATE_CANDIDATE_MARKER",
+        "Bearer_PRIVATE_AUTHORIZATION",
+    )
+    wrapper, _ = client(
+        FakeSDK(
+            error=api_status_error(
+                code=markers[0],
+                parameter=markers[1],
+                request_id=markers[2],
+            )
+        )
+    )
+    with pytest.raises(OpenAIDecisionRequestError) as raised:
+        wrapper.decide(request())
+    assert raised.value.diagnostic is not None
+    assert raised.value.diagnostic.openai_error_code is None
+    assert raised.value.diagnostic.parameter is None
+    assert raised.value.diagnostic.request_id is None
+    assert all(marker not in repr(raised.value.diagnostic) for marker in markers)
+
+
+def test_public_result_validation_failure_has_safe_diagnostic() -> None:
+    wrapper, _ = client()
+    with (
+        patch(
+            "app.providers.openai_decision.client.OpenAIDecisionResult",
+            side_effect=ValueError("PRIVATE_RESULT_MARKER"),
+        ),
+        pytest.raises(OpenAIDecisionResponseError) as raised,
+    ):
+        wrapper.decide(request())
+    assert (
+        raised.value.diagnostic.category
+        is OpenAIDecisionDiagnosticCategory.RESULT_VALIDATION_FAILED
+    )
+    assert "PRIVATE_RESULT_MARKER" not in str(raised.value)
+    assert "PRIVATE_RESULT_MARKER" not in repr(raised.value.diagnostic)
+
+
+def test_hostile_raw_context_cannot_reach_any_error_representation() -> None:
+    markers = (
+        "sk-SECRET_API_KEY",
+        "PRIVATE_GOAL_MARKER",
+        "PRIVATE_CANDIDATE_MARKER",
+        "PRIVATE_SNIPPET_MARKER",
+        "PRIVATE_SERIALIZED_INPUT",
+        "PRIVATE_RESPONSE_BODY",
+        "Bearer_PRIVATE_AUTHORIZATION",
+        "RAW_SDK_MESSAGE_MARKER",
+    )
+    source = RuntimeError(" ".join(markers))
+    hostile_request = OpenAIDecisionRequest(
+        goal=markers[1],
+        candidates=(
+            OpenAIDecisionCandidate(
+                index=1,
+                name=markers[2],
+                website=None,
+                country=None,
+                city=None,
+                industry=None,
+                snippet=markers[3],
+                website_summary=markers[4],
+            ),
+        ),
+    )
+    wrapper, _ = client(FakeSDK(error=source))
+    with pytest.raises(OpenAIDecisionRequestError) as raised:
+        wrapper.decide(hostile_request)
+    exposed = "\n".join(
+        (
+            str(raised.value),
+            repr(raised.value),
+            repr(raised.value.diagnostic),
+            "".join(traceback.format_exception(raised.value)),
+        )
+    )
+    assert all(marker not in exposed for marker in markers)
 
 
 class InfrastructureFailure(BaseException):
