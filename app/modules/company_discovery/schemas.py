@@ -1,6 +1,6 @@
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.company_import.schemas import (
     CompanyIngestionError,
@@ -28,6 +28,19 @@ StopReason = Literal[
     "response_too_large",
     "provider_error",
 ]
+
+ProviderRequestFailureSubtype = Literal["TRANSPORT", "HTTP_CLIENT", "VALIDATION"]
+
+
+class DiscoveryProviderDiagnostic(BaseModel):
+    """Provider-neutral request metadata safe for application results."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    category: Literal["request_error"]
+    subtype: ProviderRequestFailureSubtype
+    http_status: int | None = Field(default=None, ge=400, le=499)
+    provider_code: Literal["request_error"] = "request_error"
 
 
 class DiscoveryProviderResult(BaseModel):
@@ -96,6 +109,7 @@ class SearchProfileDiscoveryProviderError(BaseModel):
 
     code: ProviderErrorCode
     message: str
+    diagnostic: DiscoveryProviderDiagnostic | None = None
 
     @field_validator("message", mode="before")
     @classmethod

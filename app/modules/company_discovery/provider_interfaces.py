@@ -1,6 +1,9 @@
 from typing import Protocol, runtime_checkable
 
-from app.modules.company_discovery.schemas import DiscoveryProviderResponse
+from app.modules.company_discovery.schemas import (
+    DiscoveryProviderDiagnostic,
+    DiscoveryProviderResponse,
+)
 from app.modules.search_profile.schemas import SearchQuery
 
 
@@ -13,7 +16,14 @@ class DiscoveryProviderConfigurationError(DiscoveryProviderError):
 
 
 class DiscoveryProviderRequestError(DiscoveryProviderError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: DiscoveryProviderDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class DiscoveryProviderRateLimitError(DiscoveryProviderRequestError):

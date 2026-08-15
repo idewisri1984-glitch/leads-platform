@@ -183,7 +183,16 @@ def execute_lead_acquisition(
                     discovery_provider=SerpApiDiscoveryProvider,
                 ),
             )
-        except (AgentCompanyPlanSearchProviderError, AgentCompanyPlanDecisionError):
+        except AgentCompanyPlanSearchProviderError as exc:
+            raise LeadAcquisitionProviderStopError(
+                "Lead acquisition provider stopped.",
+                discovery_call_count=exc.discovery_call_count,
+                decision_call_count=exc.decision_call_count,
+                discovery_run_count=exc.discovery_run_count,
+                candidate_count=exc.candidate_count,
+                diagnostic=exc.diagnostic,
+            ) from None
+        except AgentCompanyPlanDecisionError:
             raise LeadAcquisitionProviderStopError("Lead acquisition provider stopped.") from None
         return CompanyPlanOutcome(
             discovery_run_id=result.discovery_run_id,

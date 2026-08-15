@@ -12,6 +12,7 @@ from app.modules.company_discovery.profile_execution import (
     SearchProfileDiscoveryExecutionError,
 )
 from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
+from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
 from app.modules.company_discovery.staging_orchestration import (
     CompanyDiscoveryBoundedPlanRunResult,
     CompanyDiscoveryStagingServiceError,
@@ -70,7 +71,22 @@ class AgentCompanyPlanSearchProfileNotReadyError(AgentCompanyPlanError):
 
 
 class AgentCompanyPlanSearchProviderError(AgentCompanyPlanError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        discovery_call_count: int = 0,
+        decision_call_count: int = 0,
+        discovery_run_count: int = 0,
+        candidate_count: int = 0,
+        diagnostic: DiscoveryProviderDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.discovery_call_count = discovery_call_count
+        self.decision_call_count = decision_call_count
+        self.discovery_run_count = discovery_run_count
+        self.candidate_count = candidate_count
+        self.diagnostic = diagnostic
 
 
 class AgentCompanyPlanDiscoveryDataError(AgentCompanyPlanError):
@@ -283,7 +299,13 @@ class AgentCompanyPlanService:
         if staging.status is CompanyDiscoveryRunStatus.FAILED:
             if staging.error_code in _DISCOVERY_DATA_ERROR_CODES:
                 raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
-            raise AgentCompanyPlanSearchProviderError(_PROVIDER_FAILED)
+            raise AgentCompanyPlanSearchProviderError(
+                _PROVIDER_FAILED,
+                discovery_call_count=provider_call_count,
+                discovery_run_count=int(staging.run_persisted),
+                candidate_count=len(staging.candidates),
+                diagnostic=staging.provider_diagnostic,
+            )
         if (
             staging.status is CompanyDiscoveryRunStatus.PARTIAL
             and staging.error_code in _DISCOVERY_DATA_ERROR_CODES

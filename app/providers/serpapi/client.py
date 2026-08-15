@@ -11,6 +11,7 @@ from app.providers.serpapi.exceptions import (
     SerpApiQuotaExceededError,
     SerpApiRateLimitError,
     SerpApiRequestError,
+    SerpApiRequestFailureSubtype,
     SerpApiResponseError,
     SerpApiResponseTooLargeError,
 )
@@ -82,7 +83,10 @@ class SerpApiClient:
             raise SerpApiConfigurationError("SERPAPI_API_KEY is required to use SerpAPI.")
 
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
-            raise SerpApiRequestError("SerpAPI result limit must be between 1 and 100.")
+            raise SerpApiRequestError(
+                "SerpAPI result limit must be between 1 and 100.",
+                subtype=SerpApiRequestFailureSubtype.VALIDATION,
+            )
 
         request_google_country_code = self._normalize_iso_country_code(iso_country_code)
 
@@ -103,6 +107,7 @@ class SerpApiClient:
         if request_google_country_code is not None:
             params["gl"] = request_google_country_code
 
+        transport_failed = False
         try:
             with self._http_client.stream(
                 "GET", self._base_url, params=params, timeout=self._timeout_seconds
@@ -110,7 +115,13 @@ class SerpApiClient:
                 status_code = response.status_code
                 body = self._read_bounded_body(response)
         except httpx.HTTPError:
-            raise SerpApiRequestError("SerpAPI request failed.") from None
+            transport_failed = True
+
+        if transport_failed:
+            raise SerpApiRequestError(
+                "SerpAPI request failed.",
+                subtype=SerpApiRequestFailureSubtype.TRANSPORT,
+            )
 
         if status_code in {401, 403}:
             raise SerpApiAuthenticationError("SerpAPI authentication failed.")
@@ -122,7 +133,11 @@ class SerpApiClient:
             raise SerpApiRateLimitError("SerpAPI rate limit exceeded.")
 
         if 400 <= status_code < 500:
-            raise SerpApiRequestError("SerpAPI request returned an unsuccessful status.")
+            raise SerpApiRequestError(
+                "SerpAPI request returned an unsuccessful status.",
+                subtype=SerpApiRequestFailureSubtype.HTTP_CLIENT,
+                http_status=status_code,
+            )
 
         if status_code >= 500:
             raise SerpApiProviderError("SerpAPI provider request failed.")
@@ -252,7 +267,10 @@ class SerpApiClient:
         ]
 
         if not parts:
-            raise SerpApiRequestError("At least one SerpAPI search query part is required.")
+            raise SerpApiRequestError(
+                "At least one SerpAPI search query part is required.",
+                subtype=SerpApiRequestFailureSubtype.VALIDATION,
+            )
 
         return " ".join(parts)
 
@@ -261,16 +279,30 @@ class SerpApiClient:
             return None
 
         if isinstance(iso_country_code, bool) or not isinstance(iso_country_code, str):
-            raise SerpApiRequestError("SerpAPI country code was invalid.") from None
+            raise SerpApiRequestError(
+                "SerpAPI country code was invalid.",
+                subtype=SerpApiRequestFailureSubtype.VALIDATION,
+            )
 
         normalized = iso_country_code.strip()
         if not normalized:
-            raise SerpApiRequestError("SerpAPI country code was invalid.") from None
+            raise SerpApiRequestError(
+                "SerpAPI country code was invalid.",
+                subtype=SerpApiRequestFailureSubtype.VALIDATION,
+            )
 
+        invalid_country = False
         try:
-            return get_country_target(normalized).serpapi_gl
+            country_target = get_country_target(normalized)
         except ValueError:
-            raise SerpApiRequestError("SerpAPI country code was invalid.") from None
+            invalid_country = True
+            country_target = None
+        if invalid_country or country_target is None:
+            raise SerpApiRequestError(
+                "SerpAPI country code was invalid.",
+                subtype=SerpApiRequestFailureSubtype.VALIDATION,
+            )
+        return country_target.serpapi_gl
 
     def _parse_company_result(self, raw_result: object) -> SerpApiCompanyResult | None:
         if not isinstance(raw_result, dict):

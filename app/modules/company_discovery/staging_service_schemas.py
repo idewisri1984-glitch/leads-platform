@@ -5,6 +5,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
+from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
 from app.modules.company_discovery.staging_normalization import (
     normalize_country_code,
     normalize_display_name,
@@ -188,6 +189,7 @@ class CompanyDiscoveryStagingRunResult(BaseModel):
     stopped_early: bool = False
     stop_reason: str | None = None
     error_code: str | None = Field(default=None, max_length=100)
+    provider_diagnostic: DiscoveryProviderDiagnostic | None = None
     candidates: list[CompanyDiscoveryStagingCandidatePreview] = Field(default_factory=list)
     completed_at: datetime | None = None
 
