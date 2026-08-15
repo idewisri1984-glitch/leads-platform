@@ -34,6 +34,7 @@ def make_client(
     *,
     api_key: str | None = API_KEY,
     max_response_bytes: int = 2_000_000,
+    sleeper: Callable[[float], None] = lambda _: None,
 ) -> SerpApiClient:
     return SerpApiClient(
         api_key=api_key,
@@ -41,6 +42,7 @@ def make_client(
         timeout_seconds=5.0,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         max_response_bytes=max_response_bytes,
+        sleeper=sleeper,
     )
 
 
@@ -499,7 +501,246 @@ def test_timeout_error_does_not_chain_unsafe_httpx_exception() -> None:
         )
 
     assert API_KEY not in str(exc_info.value)
-    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__cause__ is exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        httpx.ConnectError,
+        httpx.ReadError,
+        httpx.RemoteProtocolError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+    ],
+)
+def test_transport_failure_retries_once_then_succeeds(
+    error_type: type[httpx.RequestError],
+) -> None:
+    calls = 0
+    sleeper_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error_type("transient", request=request)
+        return httpx.Response(200, json={"organic_results": []}, request=request)
+
+    client = make_client(handler, sleeper=sleeper_calls.append)
+
+    assert (
+        client.search_companies(
+            query="companies", country=None, city=None, industry=None, limit=10
+        ).results
+        == []
+    )
+    assert calls == client.snapshot_call_count() == 2
+    assert sleeper_calls == [0.5]
+
+
+def test_two_transport_failures_stop_at_exact_aggregate_bound() -> None:
+    calls = 0
+    sleeper_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("secret", request=request)
+
+    client = make_client(handler, sleeper=sleeper_calls.append)
+    with pytest.raises(SerpApiRequestError) as captured:
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    assert calls == client.snapshot_call_count() == 2
+    assert sleeper_calls == [0.5]
+    assert captured.value.diagnostic is not None
+    assert captured.value.diagnostic.subtype.value == "TRANSPORT"
+    assert captured.value.__cause__ is captured.value.__context__ is None
+
+
+def test_sleeper_failure_is_detached_and_counts_only_first_http_attempt() -> None:
+    transport_secret = "SECRET_TRANSPORT_TOKEN api_key=transport"
+    sleeper_secret = "SECRET_SLEEPER_TOKEN api_key=sleeper"
+    http_calls = 0
+    sleeper_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        raise httpx.ConnectError(transport_secret, request=request)
+
+    def failing_sleeper(delay: float) -> None:
+        sleeper_calls.append(delay)
+        raise RuntimeError(sleeper_secret)
+
+    client = make_client(handler, sleeper=failing_sleeper)
+    with pytest.raises(SerpApiRequestError) as captured:
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    error = captured.value
+    exposed = f"{error!s} {error!r} {error.args!r} {error.diagnostic!r}"
+    assert error.__cause__ is error.__context__ is None
+    assert transport_secret not in exposed
+    assert sleeper_secret not in exposed
+    assert http_calls == client.snapshot_call_count() == 1
+    assert sleeper_calls == [0.5]
+
+
+@pytest.mark.parametrize(
+    "status,error_type,subtype",
+    [
+        (400, SerpApiRequestError, "HTTP_CLIENT"),
+        (408, SerpApiRequestError, "HTTP_CLIENT"),
+        (401, SerpApiAuthenticationError, None),
+        (403, SerpApiAuthenticationError, None),
+        (429, SerpApiRateLimitError, None),
+        (500, SerpApiProviderError, None),
+        (502, SerpApiProviderError, None),
+        (503, SerpApiProviderError, None),
+        (504, SerpApiProviderError, None),
+        (507, SerpApiProviderError, None),
+        (508, SerpApiProviderError, None),
+        (511, SerpApiProviderError, None),
+    ],
+)
+def test_received_http_status_never_retries(
+    status: int,
+    error_type: type[Exception],
+    subtype: str | None,
+) -> None:
+    calls = 0
+    sleeper_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status, json={"error": "safe"}, request=request)
+
+    client = make_client(handler, sleeper=sleeper_calls.append)
+    with pytest.raises(error_type) as captured:
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    assert calls == client.snapshot_call_count() == 1
+    assert sleeper_calls == []
+    if subtype is not None:
+        diagnostic = cast(SerpApiRequestError, captured.value).diagnostic
+        assert diagnostic is not None and diagnostic.subtype.value == subtype
+
+
+def test_http_status_error_400_is_not_retried() -> None:
+    calls = 0
+    sleeper_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        response = httpx.Response(400, request=request)
+        raise httpx.HTTPStatusError("secret", request=request, response=response)
+
+    client = make_client(handler, sleeper=sleeper_calls.append)
+    with pytest.raises(SerpApiRequestError) as captured:
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    assert calls == client.snapshot_call_count() == 1
+    assert sleeper_calls == []
+    assert captured.value.diagnostic is not None
+    assert captured.value.diagnostic.subtype.value == "HTTP_CLIENT"
+    assert captured.value.diagnostic.http_status == 400
+
+
+@pytest.mark.parametrize(
+    "status,error_type,subtype",
+    [
+        (400, SerpApiRequestError, "HTTP_CLIENT"),
+        (401, SerpApiAuthenticationError, None),
+        (429, SerpApiRateLimitError, None),
+        (503, SerpApiProviderError, None),
+    ],
+)
+def test_transport_then_authoritative_status_uses_final_failure(
+    status: int,
+    error_type: type[Exception],
+    subtype: str | None,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("first secret", request=request)
+        return httpx.Response(status, json={"error": "safe"}, request=request)
+
+    client = make_client(handler)
+    with pytest.raises(error_type) as captured:
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    assert calls == client.snapshot_call_count() == 2
+    if subtype is not None:
+        diagnostic = cast(SerpApiRequestError, captured.value).diagnostic
+        assert diagnostic is not None and diagnostic.subtype.value == subtype
+
+
+def test_transport_then_response_error_uses_final_failure() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadError("first secret", request=request)
+        return httpx.Response(200, content=b"not-json", request=request)
+
+    client = make_client(handler)
+    with pytest.raises(SerpApiResponseError):
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+    assert calls == client.snapshot_call_count() == 2
+
+
+def test_validation_never_retries_or_sleeps() -> None:
+    calls = 0
+    sleeper_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={}, request=request)
+
+    client = make_client(handler, sleeper=sleeper_calls.append)
+    with pytest.raises(SerpApiRequestError):
+        client.search_companies(query=None, country=None, city=None, industry=None, limit=10)
+    assert calls == client.snapshot_call_count() == 0
+    assert sleeper_calls == []
+
+
+def test_reentrant_sleeper_cannot_create_third_http_attempt() -> None:
+    calls = 0
+    sleeper_calls: list[float] = []
+    client: SerpApiClient | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("first", request=request)
+        if calls == 2:
+            return httpx.Response(200, json={"organic_results": []}, request=request)
+        raise AssertionError("third HTTP attempt")
+
+    def reentrant_sleeper(delay: float) -> None:
+        sleeper_calls.append(delay)
+        assert client is not None
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    client = make_client(handler, sleeper=reentrant_sleeper)
+    with pytest.raises(SerpApiRequestError):
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    assert calls == client.snapshot_call_count() == 2
+    assert sleeper_calls == [0.5]
 
 
 def test_malformed_json_raises_controlled_response_error() -> None:
