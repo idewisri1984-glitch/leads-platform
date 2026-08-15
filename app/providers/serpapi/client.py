@@ -1,4 +1,8 @@
 import json
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
+from time import sleep
 from typing import Any
 
 import httpx
@@ -7,6 +11,7 @@ from app.core.country_targets import get_country_target
 from app.providers.serpapi.exceptions import (
     SerpApiAuthenticationError,
     SerpApiConfigurationError,
+    SerpApiError,
     SerpApiProviderError,
     SerpApiQuotaExceededError,
     SerpApiRateLimitError,
@@ -26,6 +31,8 @@ from app.providers.serpapi.schemas import (
 
 DEFAULT_MAX_RESPONSE_BYTES = 2_000_000
 _MAX_CONFIGURED_RESPONSE_BYTES = 20_000_000
+_MAX_HTTP_ATTEMPTS = 2
+_RETRY_DELAY_SECONDS = 0.5
 _JSON_RESTRICTOR = (
     "search_metadata.{status},"
     "search_information.{total_results,organic_results_state},"
@@ -43,6 +50,23 @@ _EMPTY_ORGANIC_STATES = frozenset({"empty", "fully empty", "no results"})
 _NO_RESULTS_MESSAGES = frozenset({"google hasn't returned any results for this query."})
 
 
+@dataclass(slots=True)
+class _RetryBudget:
+    remaining_attempts: int = _MAX_HTTP_ATTEMPTS
+
+    def consume(self) -> bool:
+        if self.remaining_attempts == 0:
+            return False
+        self.remaining_attempts -= 1
+        return True
+
+
+_ACTIVE_RETRY_BUDGET: ContextVar[_RetryBudget | None] = ContextVar(
+    "serpapi_active_retry_budget",
+    default=None,
+)
+
+
 class SerpApiClient:
     """
     Minimal SerpAPI Google organic search client.
@@ -56,6 +80,7 @@ class SerpApiClient:
         timeout_seconds: float,
         http_client: httpx.Client | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        sleeper: Callable[[float], None] = sleep,
     ) -> None:
         if (
             isinstance(max_response_bytes, bool)
@@ -63,12 +88,15 @@ class SerpApiClient:
             or not 1 <= max_response_bytes <= _MAX_CONFIGURED_RESPONSE_BYTES
         ):
             raise SerpApiConfigurationError("SerpAPI response byte limit is invalid.")
+        if not callable(sleeper):
+            raise SerpApiConfigurationError("SerpAPI retry sleeper is invalid.")
         self._api_key = api_key.strip() if api_key is not None else None
         self._base_url = base_url
         self._timeout_seconds = timeout_seconds
         self._http_client = http_client or httpx.Client()
         self._max_response_bytes = max_response_bytes
         self._provider_call_count = 0
+        self._sleeper = sleeper
 
     def snapshot_call_count(self) -> int:
         return self._provider_call_count
@@ -82,6 +110,47 @@ class SerpApiClient:
         industry: str | None,
         limit: int,
         iso_country_code: str | None = None,
+    ) -> SerpApiSearchResponse:
+        active_budget = _ACTIVE_RETRY_BUDGET.get()
+        if active_budget is not None:
+            return self._search_companies(
+                query=query,
+                country=country,
+                city=city,
+                industry=industry,
+                limit=limit,
+                iso_country_code=iso_country_code,
+                budget=active_budget,
+                retry_available=False,
+            )
+
+        budget = _RetryBudget()
+        token = _ACTIVE_RETRY_BUDGET.set(budget)
+        try:
+            return self._search_companies(
+                query=query,
+                country=country,
+                city=city,
+                industry=industry,
+                limit=limit,
+                iso_country_code=iso_country_code,
+                budget=budget,
+                retry_available=True,
+            )
+        finally:
+            _ACTIVE_RETRY_BUDGET.reset(token)
+
+    def _search_companies(
+        self,
+        *,
+        query: str | None,
+        country: str | None,
+        city: str | None,
+        industry: str | None,
+        limit: int,
+        iso_country_code: str | None,
+        budget: _RetryBudget,
+        retry_available: bool,
     ) -> SerpApiSearchResponse:
         if not self._api_key:
             raise SerpApiConfigurationError("SERPAPI_API_KEY is required to use SerpAPI.")
@@ -111,10 +180,15 @@ class SerpApiClient:
         if request_google_country_code is not None:
             params["gl"] = request_google_country_code
 
-        transport_failed = False
         status_error_code: int | None = None
         status_code: int | None = None
         body = b""
+        transport_failed = False
+        if not budget.consume():
+            raise SerpApiRequestError(
+                "SerpAPI request failed.",
+                subtype=SerpApiRequestFailureSubtype.TRANSPORT,
+            )
         self._provider_call_count += 1
         try:
             with self._http_client.stream(
@@ -128,10 +202,35 @@ class SerpApiClient:
             transport_failed = True
 
         if transport_failed:
+            if retry_available:
+                try:
+                    self._sleeper(_RETRY_DELAY_SECONDS)
+                except SerpApiError:
+                    raise
+                except Exception:
+                    raise SerpApiRequestError(
+                        "SerpAPI request failed.",
+                        subtype=SerpApiRequestFailureSubtype.TRANSPORT,
+                    ) from None
+                if budget.remaining_attempts == 0:
+                    raise SerpApiRequestError(
+                        "SerpAPI request failed.",
+                        subtype=SerpApiRequestFailureSubtype.TRANSPORT,
+                    ) from None
+                return self._search_companies(
+                    query=query,
+                    country=country,
+                    city=city,
+                    industry=industry,
+                    limit=limit,
+                    iso_country_code=iso_country_code,
+                    budget=budget,
+                    retry_available=False,
+                )
             raise SerpApiRequestError(
                 "SerpAPI request failed.",
                 subtype=SerpApiRequestFailureSubtype.TRANSPORT,
-            )
+            ) from None
 
         if status_error_code is not None:
             status_code = status_error_code

@@ -53,6 +53,7 @@ def _client(handler: Callable[[httpx.Request], httpx.Response]) -> SerpApiClient
         base_url="https://example.invalid/search",
         timeout_seconds=1.0,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleeper=lambda _: None,
     )
 
 
@@ -231,7 +232,7 @@ def test_seven_successes_then_failed_invocation_preserve_all_counts() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal http_calls
         http_calls += 1
-        if http_calls == 8:
+        if http_calls in {8, 9}:
             raise httpx.ReadError("controlled transport failure", request=request)
         return httpx.Response(200, json={"organic_results": []}, request=request)
 
@@ -270,12 +271,109 @@ def test_seven_successes_then_failed_invocation_preserve_all_counts() -> None:
 
     assert result.attempt_count == 8
     assert result.discovery_run_count == 8
-    assert result.company_discovery_call_count == 8
+    assert result.company_discovery_call_count == 9
     assert result.company_decision_call_count == 7
     assert result.status is LeadAcquisitionStatus.PARTIAL_PROVIDER_STOP
     assert result.budget_exhausted is False
     assert result.completed_count == 0
-    assert http_calls == 8
+    assert http_calls == 9
+
+
+def test_stage6_transport_retry_success_preserves_one_logical_attempt() -> None:
+    http_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        if http_calls == 1:
+            raise httpx.ConnectError("transient", request=request)
+        return httpx.Response(200, json={"organic_results": []}, request=request)
+
+    counted = _CountedDiscoveryProvider(SerpApiDiscoveryProvider(_client(handler)))
+    query = SearchQuery(
+        text="interior design",
+        profile_id=1,
+        profile_name="Profile",
+        country="United States",
+        city=None,
+        source_template="{target_customer_type}",
+        country_code="US",
+        limit=5,
+    )
+
+    def plan(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+        before = counted.snapshot_call_count()
+        counted.search(query)
+        return CompanyPlanOutcome(1, 1, 1, counted.snapshot_call_count() - before, 1)
+
+    dependencies = LeadAcquisitionDependencies(
+        company_plan=plan,
+        company_apply=lambda *args: CompanyApplyOutcome(1, True, False),
+        contact_plan=lambda *args: (_ for _ in ()).throw(
+            LeadAcquisitionContactUnavailableError("unavailable", discovery_call_count=0)
+        ),
+        contact_apply=lambda *args: (_ for _ in ()).throw(AssertionError(args)),
+        company_email=lambda company_id: "company@example.com",
+        company_complete=lambda *args: CompanyCompletionOutcome(1, 1, True, False, True, False),
+        draft_generate=lambda *args: DraftOutcome(
+            1, None, 1, "company@example.com", "DRAFT", True, False
+        ),
+        export_crm=lambda *args: (_ for _ in ()).throw(AssertionError(args)),
+    )
+
+    result = LeadAcquisitionService(dependencies).acquire(_input())
+
+    assert result.attempt_count == 1
+    assert result.discovery_run_count == 1
+    assert result.company_discovery_call_count == 2
+    assert result.status is LeadAcquisitionStatus.COMPLETE
+    assert http_calls == 2
+
+
+def test_stage6_double_transport_stops_after_one_logical_attempt() -> None:
+    http_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        raise httpx.ReadError("transport", request=request)
+
+    counted = _CountedDiscoveryProvider(SerpApiDiscoveryProvider(_client(handler)))
+    query = SearchQuery(
+        text="interior design",
+        profile_id=1,
+        profile_name="Profile",
+        country="United States",
+        city=None,
+        source_template="{target_customer_type}",
+        country_code="US",
+        limit=5,
+    )
+
+    def plan(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+        before = counted.snapshot_call_count()
+        try:
+            counted.search(query)
+        except DiscoveryProviderRequestError:
+            raise LeadAcquisitionProviderStopError(
+                "stop",
+                discovery_call_count=counted.snapshot_call_count() - before,
+                discovery_run_count=1,
+                diagnostic=DiscoveryProviderDiagnostic(
+                    category="request_error", subtype="TRANSPORT"
+                ),
+            ) from None
+        raise AssertionError("transport unexpectedly recovered")
+
+    result = LeadAcquisitionService(_dependencies(plan)).acquire(_input())
+
+    assert result.attempt_count == 1
+    assert result.discovery_run_count == 1
+    assert result.company_discovery_call_count == 2
+    assert result.status is LeadAcquisitionStatus.PARTIAL_PROVIDER_STOP
+    assert result.provider_diagnostic is not None
+    assert result.provider_diagnostic.subtype == "TRANSPORT"
+    assert http_calls == 2
 
 
 @pytest.mark.parametrize("failed_call_count", [0, 1])
