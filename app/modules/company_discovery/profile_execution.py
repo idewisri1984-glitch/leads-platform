@@ -16,6 +16,7 @@ from app.modules.company_discovery.result_adapter import (
     provider_result_to_ingestion_item,
 )
 from app.modules.company_discovery.schemas import (
+    DiscoveryProviderDiagnostic,
     ProviderErrorCode,
     SearchProfileDiscoveryAdapterError,
     SearchProfileDiscoveryDryRunResult,
@@ -117,9 +118,14 @@ class SearchProfileDiscoveryService:
                 stopped_early = True
                 stop_reason = "rate_limit_error"
                 break
-            except DiscoveryProviderRequestError:
+            except DiscoveryProviderRequestError as exc:
                 query_results.append(
-                    self._provider_error_result(query, provider_name, "request_error")
+                    self._provider_error_result(
+                        query,
+                        provider_name,
+                        "request_error",
+                        diagnostic=exc.diagnostic,
+                    )
                 )
                 continue
             except DiscoveryProviderResponseTooLargeError:
@@ -231,6 +237,8 @@ class SearchProfileDiscoveryService:
         query: SearchQuery,
         provider_name: str,
         code: ProviderErrorCode,
+        *,
+        diagnostic: DiscoveryProviderDiagnostic | None = None,
     ) -> SearchProfileDiscoveryQueryResult:
         return SearchProfileDiscoveryQueryResult(
             query=query,
@@ -241,6 +249,7 @@ class SearchProfileDiscoveryService:
             provider_error=SearchProfileDiscoveryProviderError(
                 code=code,
                 message=_PROVIDER_ERROR_MESSAGES[code],
+                diagnostic=diagnostic,
             ),
         )
 

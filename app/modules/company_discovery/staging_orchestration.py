@@ -10,6 +10,7 @@ from app.modules.company_discovery.profile_execution import (
 )
 from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
 from app.modules.company_discovery.schemas import (
+    DiscoveryProviderDiagnostic,
     SearchProfileDiscoveryDryRunResult,
     SearchProfileDiscoveryQueryResult,
 )
@@ -330,6 +331,7 @@ class CompanyDiscoveryStagingService:
                 stopped_early=execution_result.stopped_early,
                 stop_reason=execution_result.stop_reason,
                 error_code=error_code,
+                provider_diagnostic=self._first_provider_diagnostic(execution_result),
                 candidates=[self._candidate_preview(item) for item in adapter_rows.values()],
             )
 
@@ -369,6 +371,7 @@ class CompanyDiscoveryStagingService:
                 candidates_protected += 1 if upsert_result.protected else 0
 
         completed_at = datetime.now(UTC)
+        provider_diagnostic = self._first_provider_diagnostic(execution_result)
         candidate_count = (
             candidate_upserts
             if status in (CompanyDiscoveryRunStatus.SUCCEEDED, CompanyDiscoveryRunStatus.PARTIAL)
@@ -384,6 +387,12 @@ class CompanyDiscoveryStagingService:
                 candidate_count=candidate_count,
                 completed_at=completed_at,
                 error_code=error_code,
+                error_subtype=(
+                    provider_diagnostic.subtype if provider_diagnostic is not None else None
+                ),
+                error_http_status=(
+                    provider_diagnostic.http_status if provider_diagnostic is not None else None
+                ),
             ),
         )
 
@@ -411,6 +420,7 @@ class CompanyDiscoveryStagingService:
             stopped_early=execution_result.stopped_early,
             stop_reason=execution_result.stop_reason,
             error_code=error_code,
+            provider_diagnostic=provider_diagnostic,
             run_id=run.id,
             run_persisted=True,
             completed_at=completed_at,
@@ -744,6 +754,15 @@ class CompanyDiscoveryStagingService:
                 return query_result.provider_error.code
         return None
 
+    def _first_provider_diagnostic(
+        self,
+        result: SearchProfileDiscoveryDryRunResult,
+    ) -> DiscoveryProviderDiagnostic | None:
+        for query_result in result.query_results:
+            if query_result.provider_error is not None:
+                return query_result.provider_error.diagnostic
+        return None
+
     def _create_run(
         self,
         *,
@@ -815,6 +834,7 @@ class CompanyDiscoveryStagingService:
         stop_reason: str | None,
         error_code: str | None,
         candidates: list[CompanyDiscoveryStagingCandidatePreview],
+        provider_diagnostic: DiscoveryProviderDiagnostic | None = None,
         run_id: int | None = None,
         run_persisted: bool = False,
         completed_at: datetime | None = None,
@@ -848,6 +868,7 @@ class CompanyDiscoveryStagingService:
             stopped_early=stopped_early,
             stop_reason=stop_reason,
             error_code=error_code,
+            provider_diagnostic=provider_diagnostic,
             candidates=candidates,
             completed_at=completed_at,
         )

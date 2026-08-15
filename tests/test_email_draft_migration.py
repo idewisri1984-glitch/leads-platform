@@ -23,7 +23,7 @@ from app.modules.task.models import Task
 
 _ROOT = Path(__file__).resolve().parents[1]
 _REVISION = "9d6e7f8091a2"
-_HEAD = "c71e3a9d4f20"
+_HEAD = "d82f4c6a91b3"
 _HEAD_MIGRATION = (
     _ROOT / "alembic" / "versions" / "c71e3a9d4f20_allow_company_scoped_email_drafts.py"
 )

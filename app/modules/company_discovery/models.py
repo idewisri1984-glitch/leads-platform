@@ -78,6 +78,8 @@ class CompanyDiscoveryRun(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(100))
+    error_subtype: Mapped[str | None] = mapped_column(String(32))
+    error_http_status: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

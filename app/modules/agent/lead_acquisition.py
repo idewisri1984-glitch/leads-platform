@@ -7,6 +7,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
+
 _STRICT = ConfigDict(frozen=True, strict=True, extra="forbid")
 
 
@@ -33,10 +35,16 @@ class LeadAcquisitionProviderStopError(LeadAcquisitionError):
         *,
         discovery_call_count: int = 0,
         decision_call_count: int = 0,
+        discovery_run_count: int = 0,
+        candidate_count: int = 0,
+        diagnostic: DiscoveryProviderDiagnostic | None = None,
     ) -> None:
         super().__init__(message)
         self.discovery_call_count = discovery_call_count
         self.decision_call_count = decision_call_count
+        self.discovery_run_count = discovery_run_count
+        self.candidate_count = candidate_count
+        self.diagnostic = diagnostic
 
 
 class LeadAcquisitionCompanyUnavailableError(LeadAcquisitionError):
@@ -141,6 +149,7 @@ class LeadAcquisitionResult(BaseModel):
     completed_draft_ids: tuple[int, ...]
     company_discovery_call_count: int
     company_decision_call_count: int
+    provider_diagnostic: DiscoveryProviderDiagnostic | None = None
     contact_discovery_call_count: int
     contact_decision_call_count: int
     draft_generation_call_count: int
@@ -329,6 +338,7 @@ class _State:
     candidate_count: int = 0
     company_discovery_call_count: int = 0
     company_decision_call_count: int = 0
+    provider_diagnostic: DiscoveryProviderDiagnostic | None = None
     contact_discovery_call_count: int = 0
     contact_decision_call_count: int = 0
     draft_generation_call_count: int = 0
@@ -377,6 +387,9 @@ class LeadAcquisitionService:
             except LeadAcquisitionProviderStopError as error:
                 state.company_discovery_call_count += error.discovery_call_count
                 state.company_decision_call_count += error.decision_call_count
+                state.discovery_run_count += error.discovery_run_count
+                state.candidate_count += error.candidate_count
+                state.provider_diagnostic = error.diagnostic
                 provider_stopped = True
                 break
             state.company_discovery_call_count += plan.discovery_call_count
@@ -529,6 +542,7 @@ class LeadAcquisitionService:
             completed_draft_ids=tuple(state.completed_draft_ids),
             company_discovery_call_count=state.company_discovery_call_count,
             company_decision_call_count=state.company_decision_call_count,
+            provider_diagnostic=state.provider_diagnostic,
             contact_discovery_call_count=state.contact_discovery_call_count,
             contact_decision_call_count=state.contact_decision_call_count,
             draft_generation_call_count=state.draft_generation_call_count,

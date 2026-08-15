@@ -11,6 +11,7 @@ from app.modules.company_discovery.provider_interfaces import (
     DiscoveryProviderResponseTooLargeError,
 )
 from app.modules.company_discovery.schemas import (
+    DiscoveryProviderDiagnostic,
     DiscoveryProviderResponse,
     DiscoveryProviderResult,
 )
@@ -41,7 +42,18 @@ class SerpApiDiscoveryProvider:
     def provider_name(self) -> str:
         return "serpapi"
 
+    def snapshot_call_count(self) -> int | None:
+        snapshot = getattr(self.client, "snapshot_call_count", None)
+        if not callable(snapshot):
+            return None
+        value = snapshot()
+        if type(value) is not int or value < 0:
+            return None
+        return value
+
     def search(self, query: SearchQuery) -> DiscoveryProviderResponse:
+        request_failed = False
+        request_diagnostic: DiscoveryProviderDiagnostic | None = None
         try:
             response = self.client.search_companies(
                 query=query.text,
@@ -75,12 +87,24 @@ class SerpApiDiscoveryProvider:
             raise DiscoveryProviderResponseError(
                 "Discovery provider response was invalid."
             ) from None
-        except SerpApiRequestError:
-            raise DiscoveryProviderRequestError("Discovery provider request failed.") from None
+        except SerpApiRequestError as exc:
+            request_failed = True
+            if exc.diagnostic is not None:
+                request_diagnostic = DiscoveryProviderDiagnostic(
+                    category="request_error",
+                    subtype=exc.diagnostic.subtype.value,
+                    http_status=exc.diagnostic.http_status,
+                )
         except SerpApiProviderError:
             raise DiscoveryProviderError("Discovery provider failed.") from None
         except SerpApiError:
             raise DiscoveryProviderError("Discovery provider failed.") from None
+
+        if request_failed:
+            raise DiscoveryProviderRequestError(
+                "Discovery provider request failed.",
+                diagnostic=request_diagnostic,
+            ) from None
 
         response_query = response.query.strip() or query.text
 

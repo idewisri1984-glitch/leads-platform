@@ -1,0 +1,328 @@
+from collections.abc import Callable
+
+import httpx
+import pytest
+
+from app.modules.agent.execution import _CountedDiscoveryProvider
+from app.modules.agent.lead_acquisition import (
+    CompanyApplyOutcome,
+    CompanyCompletionOutcome,
+    CompanyPlanOutcome,
+    DraftOutcome,
+    LeadAcquisitionContactUnavailableError,
+    LeadAcquisitionDependencies,
+    LeadAcquisitionInput,
+    LeadAcquisitionProviderStopError,
+    LeadAcquisitionService,
+    LeadAcquisitionStatus,
+)
+from app.modules.company_discovery.provider_interfaces import DiscoveryProviderRequestError
+from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
+from app.modules.company_discovery.serpapi_provider import SerpApiDiscoveryProvider
+from app.modules.search_profile.schemas import SearchQuery
+from app.providers.serpapi.client import SerpApiClient
+from app.providers.serpapi.exceptions import (
+    SerpApiRequestError,
+    SerpApiRequestFailureSubtype,
+)
+
+
+def _search(
+    client: SerpApiClient,
+    *,
+    query: str | None = "interior design",
+    country: str | None = None,
+    city: str | None = None,
+    industry: str | None = None,
+    limit: int = 5,
+    iso_country_code: str | None = "US",
+) -> object:
+    return client.search_companies(
+        query=query,
+        country=country,
+        city=city,
+        industry=industry,
+        limit=limit,
+        iso_country_code=iso_country_code,
+    )
+
+
+def _client(handler: Callable[[httpx.Request], httpx.Response]) -> SerpApiClient:
+    return SerpApiClient(
+        api_key="safe-key",
+        base_url="https://example.invalid/search",
+        timeout_seconds=1.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _dependencies(company_plan: Callable[[int, int, str], CompanyPlanOutcome]) -> object:
+    def unexpected(*args: object, **kwargs: object) -> object:
+        raise AssertionError((args, kwargs))
+
+    return LeadAcquisitionDependencies(
+        company_plan=company_plan,
+        company_apply=unexpected,
+        contact_plan=unexpected,
+        contact_apply=unexpected,
+        company_email=unexpected,
+        company_complete=unexpected,
+        draft_generate=unexpected,
+        export_crm=unexpected,
+    )
+
+
+def _input() -> LeadAcquisitionInput:
+    return LeadAcquisitionInput(
+        project_id=1,
+        search_profile_id=1,
+        limit=1,
+        goal="Find a relevant design firm",
+    )
+
+
+def test_transport_error_has_detached_safe_diagnostic() -> None:
+    secret = "api_key=hostile-secret&credential=leak"
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError(secret, request=request)
+
+    with pytest.raises(SerpApiRequestError) as captured:
+        _search(_client(fail))
+
+    error = captured.value
+    assert error.diagnostic is not None
+    assert error.diagnostic.subtype is SerpApiRequestFailureSubtype.TRANSPORT
+    assert error.diagnostic.http_status is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    exposed = f"{error!s} {error!r} {error.args!r} {error.diagnostic!r}"
+    assert secret not in exposed
+    assert "hostile-secret" not in exposed
+
+
+@pytest.mark.parametrize("status", [400, 404, 422])
+def test_http_client_error_preserves_only_status(status: int) -> None:
+    body = "provider-body api_key=secret"
+    client = _client(lambda request: httpx.Response(status, text=body, request=request))
+
+    with pytest.raises(SerpApiRequestError) as captured:
+        _search(client)
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic is not None
+    assert diagnostic.subtype is SerpApiRequestFailureSubtype.HTTP_CLIENT
+    assert diagnostic.http_status == status
+    assert body not in repr(captured.value)
+
+
+def test_http_status_error_is_status_based_not_transport() -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(400, request=request)
+        raise httpx.HTTPStatusError("hostile-secret", request=request, response=response)
+
+    with pytest.raises(SerpApiRequestError) as captured:
+        _search(_client(fail))
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic is not None
+    assert diagnostic.subtype is SerpApiRequestFailureSubtype.HTTP_CLIENT
+    assert diagnostic.http_status == 400
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "hostile-secret" not in repr(captured.value)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"limit": 0},
+        {"query": None, "country": None, "city": None, "industry": None},
+        {"iso_country_code": "invalid-country"},
+    ],
+)
+def test_local_request_validation_is_classified(changes: dict[str, object]) -> None:
+    client = _client(lambda request: httpx.Response(200, json={}, request=request))
+
+    with pytest.raises(SerpApiRequestError) as captured:
+        _search(
+            client,
+            query=changes.get("query", "interior design"),
+            country=changes.get("country"),
+            city=changes.get("city"),
+            industry=changes.get("industry"),
+            limit=changes.get("limit", 5),
+            iso_country_code=changes.get("iso_country_code", "US"),
+        )
+
+    assert captured.value.diagnostic is not None
+    assert captured.value.diagnostic.subtype is SerpApiRequestFailureSubtype.VALIDATION
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_failed_provider_invocation_is_counted() -> None:
+    diagnostic = DiscoveryProviderDiagnostic(
+        category="request_error",
+        subtype="TRANSPORT",
+    )
+
+    def fail(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+        raise LeadAcquisitionProviderStopError(
+            "stop",
+            discovery_call_count=1,
+            discovery_run_count=1,
+            diagnostic=diagnostic,
+        )
+
+    result = LeadAcquisitionService(_dependencies(fail)).acquire(_input())
+
+    assert result.attempt_count == 1
+    assert result.discovery_run_count == 1
+    assert result.company_discovery_call_count == 1
+    assert result.company_decision_call_count == 0
+    assert result.status is LeadAcquisitionStatus.PARTIAL_PROVIDER_STOP
+    assert result.budget_exhausted is False
+    assert result.provider_diagnostic == diagnostic
+
+
+def test_pre_provider_failure_does_not_count_provider_call() -> None:
+    def fail(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+        raise LeadAcquisitionProviderStopError("stop")
+
+    result = LeadAcquisitionService(_dependencies(fail)).acquire(_input())
+
+    assert result.attempt_count == 1
+    assert result.discovery_run_count == 0
+    assert result.company_discovery_call_count == 0
+    assert result.status is LeadAcquisitionStatus.PARTIAL_PROVIDER_STOP
+
+
+def test_production_counter_does_not_count_local_validation() -> None:
+    http_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        return httpx.Response(200, json={"organic_results": []}, request=request)
+
+    counted = _CountedDiscoveryProvider(SerpApiDiscoveryProvider(_client(handler)))
+    query = SearchQuery.model_construct(
+        text="interior design",
+        profile_id=1,
+        profile_name="Profile",
+        country="United States",
+        city=None,
+        source_template="{target_customer_type}",
+        country_code="ZZ",
+        limit=5,
+    )
+
+    with pytest.raises(DiscoveryProviderRequestError):
+        counted.search(query)
+
+    assert counted.snapshot_call_count() == 0
+    assert http_calls == 0
+
+
+def test_seven_successes_then_failed_invocation_preserve_all_counts() -> None:
+    http_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        if http_calls == 8:
+            raise httpx.ReadError("controlled transport failure", request=request)
+        return httpx.Response(200, json={"organic_results": []}, request=request)
+
+    counted = _CountedDiscoveryProvider(SerpApiDiscoveryProvider(_client(handler)))
+    query = SearchQuery(
+        text="interior design",
+        profile_id=1,
+        profile_name="Profile",
+        country="United States",
+        city=None,
+        source_template="{target_customer_type}",
+        country_code="US",
+        limit=5,
+    )
+
+    def plan(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+        before_calls = counted.snapshot_call_count()
+        try:
+            counted.search(query)
+        except DiscoveryProviderRequestError:
+            raise LeadAcquisitionProviderStopError(
+                "stop",
+                discovery_call_count=counted.snapshot_call_count() - before_calls,
+                discovery_run_count=1,
+            ) from None
+        calls = counted.snapshot_call_count()
+        return CompanyPlanOutcome(
+            discovery_run_id=calls,
+            candidate_count=0,
+            selected_candidate_id=None,
+            discovery_call_count=1,
+            decision_call_count=1,
+        )
+
+    result = LeadAcquisitionService(_dependencies(plan)).acquire(_input())
+
+    assert result.attempt_count == 8
+    assert result.discovery_run_count == 8
+    assert result.company_discovery_call_count == 8
+    assert result.company_decision_call_count == 7
+    assert result.status is LeadAcquisitionStatus.PARTIAL_PROVIDER_STOP
+    assert result.budget_exhausted is False
+    assert result.completed_count == 0
+    assert http_calls == 8
+
+
+@pytest.mark.parametrize("failed_call_count", [0, 1])
+def test_contact_failure_telemetry_preserves_company_email_fallback(
+    failed_call_count: int,
+) -> None:
+    def company_plan(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+        return CompanyPlanOutcome(1, 1, 1, 1, 1)
+
+    def contact_plan(project_id: int, company_id: int, goal: str) -> object:
+        raise LeadAcquisitionContactUnavailableError(
+            "contact unavailable",
+            discovery_call_count=failed_call_count,
+        )
+
+    dependencies = LeadAcquisitionDependencies(
+        company_plan=company_plan,
+        company_apply=lambda project_id, run_id, candidate_id: CompanyApplyOutcome(
+            company_id=1,
+            created=True,
+            reused=False,
+        ),
+        contact_plan=contact_plan,
+        contact_apply=lambda *args: (_ for _ in ()).throw(AssertionError(args)),
+        company_email=lambda company_id: "company@example.com",
+        company_complete=lambda project_id, company_id, title: CompanyCompletionOutcome(
+            lead_id=1,
+            task_id=1,
+            lead_created=True,
+            lead_reused=False,
+            task_created=True,
+            task_reused=False,
+        ),
+        draft_generate=lambda *args: DraftOutcome(
+            draft_id=1,
+            contact_id=None,
+            lead_id=1,
+            recipient_email="company@example.com",
+            status="DRAFT",
+            created=True,
+            reused=False,
+        ),
+        export_crm=lambda *args: (_ for _ in ()).throw(AssertionError(args)),
+    )
+
+    result = LeadAcquisitionService(dependencies).acquire(_input())
+
+    assert result.status is LeadAcquisitionStatus.COMPLETE
+    assert result.contact_discovery_call_count == failed_call_count
+    assert result.company_scoped_count == 1
