@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from typer.testing import CliRunner
 
@@ -12,6 +13,7 @@ from app.modules.agent.lead_acquisition import (
 )
 
 runner = CliRunner()
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def result() -> LeadAcquisitionResult:
@@ -61,6 +63,7 @@ def result() -> LeadAcquisitionResult:
 def test_help_exposes_required_contract() -> None:
     completed = runner.invoke(app, ["acquire-leads", "--help"], color=False)
     assert completed.exit_code == 0
+    normalized_stdout = ANSI_ESCAPE.sub("", completed.stdout)
     for option in (
         "--project-id",
         "--search-profile-id",
@@ -70,7 +73,7 @@ def test_help_exposes_required_contract() -> None:
         "--overwrite-export",
         "--output",
     ):
-        assert option in completed.stdout
+        assert option in normalized_stdout
 
 
 def test_json_output_is_deterministic_and_stdout_only(monkeypatch) -> None:
