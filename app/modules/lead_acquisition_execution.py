@@ -130,10 +130,9 @@ def execute_lead_acquisition(
     from app.modules.crm.export_execution import execute_crm_excel_export
     from app.modules.email_draft.context import EMAIL_DRAFT_PROMPT_VERSION
     from app.modules.email_draft.execution import execute_email_draft_generation
-    from app.modules.email_draft.models import EmailDraft, EmailDraftStatus
+    from app.modules.email_draft.models import EmailDraft
     from app.modules.email_draft.schemas import (
         EmailDraftGenerationInput,
-        EmailDraftRead,
         EmailLanguage,
         EmailTone,
     )
@@ -218,24 +217,7 @@ def execute_lead_acquisition(
             AgentCompanyApplyStaleHandoffError,
         ):
             raise LeadAcquisitionCompanyUnavailableError("Company is unavailable.") from None
-        return CompanyApplyOutcome(result.company_id, result.company_created)
-
-    def existing_target(project_id: int, company_id: int) -> DraftOutcome | None:
-        with session_factory() as session:
-            draft = session.scalar(
-                select(EmailDraft)
-                .where(
-                    EmailDraft.project_id == project_id,
-                    EmailDraft.company_id == company_id,
-                    EmailDraft.status == EmailDraftStatus.DRAFT.value,
-                )
-                .order_by(EmailDraft.id)
-            )
-            return (
-                None
-                if draft is None
-                else _draft_outcome(EmailDraftRead.model_validate(draft), False)
-            )
+        return CompanyApplyOutcome(result.company_id, result.company_created, result.company_reused)
 
     def contact_plan(project_id: int, company_id: int, goal: str) -> ContactPlanOutcome:
         try:
@@ -299,7 +281,11 @@ def execute_lead_acquisition(
             result.lead_id,
             result.task_id,
             result.contact_created,
+            result.contact_reused,
             result.lead_created,
+            result.lead_reused,
+            result.task_created,
+            result.task_reused,
         )
 
     def company_email(company_id: int) -> str | None:
@@ -315,7 +301,14 @@ def execute_lead_acquisition(
                 trusted_recipient_email=email,
             )
         )
-        return CompanyCompletionOutcome(result.lead_id, result.task_id, result.lead_created)
+        return CompanyCompletionOutcome(
+            result.lead_id,
+            result.task_id,
+            result.lead_created,
+            result.lead_reused,
+            result.task_created,
+            result.task_reused,
+        )
 
     def draft_generate(
         project_id: int,
@@ -326,20 +319,17 @@ def execute_lead_acquisition(
         goal: str,
     ) -> DraftOutcome:
         with session_factory() as session:
-            existing = session.scalar(
-                select(EmailDraft)
-                .where(
-                    EmailDraft.project_id == project_id,
-                    EmailDraft.company_id == company_id,
-                    EmailDraft.contact_id == contact_id,
-                    EmailDraft.lead_id == lead_id,
-                    EmailDraft.task_id == task_id,
-                    EmailDraft.status == EmailDraftStatus.DRAFT.value,
+            preexisting_ids = set(
+                session.scalars(
+                    select(EmailDraft.id).where(
+                        EmailDraft.project_id == project_id,
+                        EmailDraft.company_id == company_id,
+                        EmailDraft.contact_id == contact_id,
+                        EmailDraft.lead_id == lead_id,
+                        EmailDraft.task_id == task_id,
+                    )
                 )
-                .order_by(EmailDraft.id)
             )
-            if existing is not None:
-                return _draft_outcome(EmailDraftRead.model_validate(existing), False)
         try:
             result = execute_email_draft_generation(
                 EmailDraftGenerationInput(
@@ -370,14 +360,15 @@ def execute_lead_acquisition(
             EmailDraftStaleContextError,
         ):
             raise LeadAcquisitionDraftFailure("Email draft generation failed.") from None
-        return _draft_outcome(result, True)
+        created = result.id not in preexisting_ids
+        return _draft_outcome(result, created, not created)
 
-    def export_crm(project_id: int, output_file: Path) -> ExportOutcome:
+    def export_crm(project_id: int, output_file: Path, overwrite: bool) -> ExportOutcome:
         result = execute_crm_excel_export(
             project_id=project_id,
             company_id=None,
             output_file=output_file,
-            overwrite=True,
+            overwrite=overwrite,
             session_factory=session_factory,
         )
         return ExportOutcome(result.output_file)
@@ -385,7 +376,6 @@ def execute_lead_acquisition(
     dependencies = LeadAcquisitionDependencies(
         company_plan=company_plan,
         company_apply=company_apply,
-        existing_target=existing_target,
         contact_plan=contact_plan,
         contact_apply=contact_apply,
         company_email=company_email,
@@ -396,7 +386,7 @@ def execute_lead_acquisition(
     return LeadAcquisitionService(dependencies).acquire(data)
 
 
-def _draft_outcome(result: Any, created: bool) -> DraftOutcome:
+def _draft_outcome(result: Any, created: bool, reused: bool) -> DraftOutcome:
     return DraftOutcome(
         draft_id=result.id,
         contact_id=result.contact_id,
@@ -404,6 +394,7 @@ def _draft_outcome(result: Any, created: bool) -> DraftOutcome:
         recipient_email=result.recipient_email,
         status=result.status,
         created=created,
+        reused=reused,
     )
 
 

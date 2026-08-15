@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.modules.agent.lead_acquisition import (
     CompanyApplyOutcome,
@@ -40,7 +41,6 @@ class Scenario:
         return LeadAcquisitionDependencies(
             company_plan=self.company_plan,
             company_apply=self.company_apply,
-            existing_target=self.existing_target,
             contact_plan=self.contact_plan,
             contact_apply=self.contact_apply,
             company_email=self.company_email,
@@ -66,20 +66,8 @@ class Scenario:
         self.calls.append(("company_apply", candidate))
         if self.mode == "company_unavailable":
             raise LeadAcquisitionCompanyUnavailableError("unavailable")
-        return CompanyApplyOutcome(candidate, self.mode != "duplicate")
-
-    def existing_target(self, _project: int, company: int) -> DraftOutcome | None:
-        self.calls.append(("existing_target", company))
-        if self.mode == "duplicate":
-            return DraftOutcome(
-                900 + company,
-                company,
-                company,
-                f"p{company}@x.test",
-                "DRAFT",
-                False,
-            )
-        return self.completed.get(company)
+        created = self.mode not in {"duplicate", "person_reused", "company_reused"}
+        return CompanyApplyOutcome(candidate, created, not created)
 
     def contact_plan(self, _project: int, company: int, _goal: str) -> ContactPlanOutcome:
         self.calls.append(("contact_plan", company))
@@ -87,6 +75,7 @@ class Scenario:
             raise LeadAcquisitionContactUnavailableError("unavailable")
         if self.mode in {
             "company",
+            "company_reused",
             "company_conflict",
             "no_email",
             "contact_no_email",
@@ -100,7 +89,18 @@ class Scenario:
         self, _project: int, company: int, _candidate: int, _goal: str, _token: str
     ) -> ContactApplyOutcome:
         self.calls.append(("contact_apply", company))
-        return ContactApplyOutcome(company + 100, company + 200, company + 300, True, True)
+        created = self.mode != "person_reused"
+        return ContactApplyOutcome(
+            company + 100,
+            company + 200,
+            company + 300,
+            created,
+            not created,
+            created,
+            not created,
+            created,
+            not created,
+        )
 
     def company_email(self, company: int) -> str | None:
         self.calls.append(("company_email", company))
@@ -114,7 +114,15 @@ class Scenario:
         self.calls.append(("company_complete", company))
         if self.mode == "company_conflict":
             raise RuntimeError("typed company-scoped conflict")
-        return CompanyCompletionOutcome(company + 200, company + 300, True)
+        created = self.mode != "company_reused"
+        return CompanyCompletionOutcome(
+            company + 200,
+            company + 300,
+            created,
+            not created,
+            created,
+            not created,
+        )
 
     def draft_generate(
         self,
@@ -129,16 +137,32 @@ class Scenario:
         if self.mode == "draft_failure" or company in self.draft_failures:
             raise LeadAcquisitionDraftFailure("failed")
         email = f"person{company}@studio.test" if contact else f"office{company}@studio.test"
-        outcome = DraftOutcome(company + 400, contact, lead, email, "DRAFT", True)
+        created = self.mode not in {"duplicate", "person_reused", "company_reused"}
+        created = created and company not in self.completed
+        outcome = DraftOutcome(
+            company + 400,
+            contact,
+            lead,
+            email,
+            "DRAFT",
+            created,
+            not created,
+        )
         self.completed[company] = outcome
         return outcome
 
-    def export_crm(self, _project: int, output: Path) -> ExportOutcome:
-        self.calls.append(("export", 0))
+    def export_crm(self, _project: int, output: Path, overwrite: bool) -> ExportOutcome:
+        self.calls.append(("export", int(overwrite)))
         return ExportOutcome(output)
 
 
-def acquire(scenario: Scenario, limit: int, *, export: Path | None = None):
+def acquire(
+    scenario: Scenario,
+    limit: int,
+    *,
+    export: Path | None = None,
+    overwrite_export: bool = False,
+):
     return LeadAcquisitionService(scenario.dependencies()).acquire(
         LeadAcquisitionInput(
             project_id=1,
@@ -146,6 +170,7 @@ def acquire(scenario: Scenario, limit: int, *, export: Path | None = None):
             limit=limit,
             goal="Find relevant design firms",
             export_file=export,
+            overwrite_export=overwrite_export,
         )
     )
 
@@ -303,3 +328,123 @@ print(json.dumps(forbidden))
         [sys.executable, "-c", script], check=True, capture_output=True, text=True
     )
     assert json.loads(completed.stdout) == []
+
+
+def test_stale_draft_failure_calls_canonical_boundary_and_never_completes() -> None:
+    scenario = Scenario(["draft_failure"])
+
+    result = acquire(scenario, 1)
+
+    assert result.completed_count == 0
+    assert result.drafts_created == 0
+    assert result.drafts_reused == 0
+    assert result.draft_failure_count == result.attempt_budget
+    assert "draft_generate" in [name for name, _ in scenario.calls]
+
+
+def test_current_canonical_draft_is_reused_without_counting_as_new() -> None:
+    scenario = Scenario(["duplicate"])
+    dependencies = replace(
+        scenario.dependencies(),
+        company_plan=lambda _project, _profile, _goal: CompanyPlanOutcome(1, 1, 1, 0, 0),
+    )
+
+    result = LeadAcquisitionService(dependencies).acquire(
+        LeadAcquisitionInput(
+            project_id=1,
+            search_profile_id=3,
+            limit=1,
+            goal="Find relevant design firms",
+        )
+    )
+
+    assert result.completed_count == 0
+    assert result.drafts_created == 0
+    assert result.drafts_reused == result.attempt_budget
+    assert result.duplicates_skipped == result.attempt_budget
+    assert scenario.completed[1].draft_id == 401
+
+
+def test_authoritative_provider_counts_are_summed_without_guessing() -> None:
+    scenario = Scenario(["person"])
+    dependencies = replace(
+        scenario.dependencies(),
+        company_plan=lambda _project, _profile, _goal: CompanyPlanOutcome(1, 2, 1, 3, 2),
+        contact_plan=lambda _project, _company, _goal: ContactPlanOutcome(
+            1, "person1@studio.test", "a" * 64, 4, 1
+        ),
+    )
+
+    result = LeadAcquisitionService(dependencies).acquire(
+        LeadAcquisitionInput(
+            project_id=1,
+            search_profile_id=3,
+            limit=1,
+            goal="Find relevant design firms",
+        )
+    )
+
+    assert result.company_discovery_call_count == 3
+    assert result.company_decision_call_count == 2
+    assert result.contact_discovery_call_count == 4
+    assert result.contact_decision_call_count == 1
+
+
+def test_provider_failure_before_invocation_reports_zero_calls() -> None:
+    scenario = Scenario(["provider_stop"])
+
+    result = acquire(scenario, 1)
+
+    assert result.company_discovery_call_count == 0
+    assert result.company_decision_call_count == 0
+
+
+def test_mixed_created_and_reused_entity_counters_are_exact() -> None:
+    scenario = Scenario(["person", "person_reused", "company"])
+
+    result = acquire(scenario, 2)
+
+    assert (result.companies_created, result.companies_reused) == (2, 1)
+    assert (result.contacts_created, result.contacts_reused) == (1, 1)
+    assert (result.leads_created, result.leads_reused) == (2, 1)
+    assert (result.tasks_created, result.tasks_reused) == (2, 1)
+    assert (result.drafts_created, result.drafts_reused) == (2, 1)
+    assert len(result.completed_task_ids) == 2
+
+
+def test_export_overwrite_is_explicit_and_failure_preserves_acquisition(tmp_path: Path) -> None:
+    allowed = Scenario(["person"])
+    output = tmp_path / "allowed.xlsx"
+    successful = acquire(allowed, 1, export=output, overwrite_export=True)
+    assert successful.completed_count == 1
+    assert successful.export_status.value == "SUCCEEDED"
+    assert allowed.calls[-1] == ("export", 1)
+
+    denied = Scenario(["person"])
+
+    def fail_existing(_project: int, _output: Path, overwrite: bool) -> ExportOutcome:
+        assert overwrite is False
+        raise FileExistsError("exists")
+
+    failed = LeadAcquisitionService(
+        replace(denied.dependencies(), export_crm=fail_existing)
+    ).acquire(
+        LeadAcquisitionInput(
+            project_id=1,
+            search_profile_id=3,
+            limit=1,
+            goal="Find relevant design firms",
+            export_file=tmp_path / "existing.xlsx",
+        )
+    )
+    assert failed.completed_count == 1
+    assert failed.export_status.value == "FAILED"
+
+
+def test_result_rejects_duplicate_completed_identifiers() -> None:
+    valid = acquire(Scenario(["person", "person"]), 2)
+    payload = valid.model_dump()
+    payload["completed_task_ids"] = (valid.completed_task_ids[0],) * 2
+
+    with pytest.raises(ValidationError, match="Completed identifiers are invalid"):
+        type(valid)(**payload)

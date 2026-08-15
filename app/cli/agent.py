@@ -153,6 +153,7 @@ _ACQUIRE_OPTIONS = (
     "--limit",
     "--goal",
     "--export-excel",
+    "--overwrite-export",
     "--output",
 )
 
@@ -219,9 +220,15 @@ def render_agent_lead_acquisition(result: LeadAcquisitionResult, output: str) ->
         ("Person scoped", "person_scoped_count"),
         ("Company scoped", "company_scoped_count"),
         ("Companies created", "companies_created"),
+        ("Companies reused", "companies_reused"),
         ("Contacts created", "contacts_created"),
+        ("Contacts reused", "contacts_reused"),
         ("Leads created", "leads_created"),
+        ("Leads reused", "leads_reused"),
+        ("Tasks created", "tasks_created"),
+        ("Tasks reused", "tasks_reused"),
         ("Drafts created", "drafts_created"),
+        ("Drafts reused", "drafts_reused"),
         ("Duplicates", "duplicates_skipped"),
         ("No selection", "no_selection_count"),
         ("No contact", "no_contact_count"),
@@ -246,6 +253,13 @@ def acquire_leads(
     limit: Annotated[str, typer.Option("--limit", metavar="INTEGER")],
     goal: Annotated[str, typer.Option("--goal")],
     export_excel: Annotated[str | None, typer.Option("--export-excel", metavar="PATH")] = None,
+    overwrite_export: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite-export",
+            help="Allow an existing CRM Excel export file to be replaced.",
+        ),
+    ] = False,
     output: Annotated[str, typer.Option("--output", help="Output format: text or json.")] = "text",
 ) -> None:
     _load_lead_acquisition_dependencies()
@@ -260,6 +274,7 @@ def acquire_leads(
             limit=_acquire_integer(limit, maximum=50),
             goal=goal,
             export_file=None if export_excel is None else Path(export_excel),
+            overwrite_export=overwrite_export,
         )
         rendered = render_agent_lead_acquisition(execute_agent_lead_acquisition(data), output)
     except (ValidationError, ValueError) as error:

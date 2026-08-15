@@ -27,7 +27,16 @@ class LeadAcquisitionError(ValueError):
 
 
 class LeadAcquisitionProviderStopError(LeadAcquisitionError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        discovery_call_count: int = 0,
+        decision_call_count: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.discovery_call_count = discovery_call_count
+        self.decision_call_count = decision_call_count
 
 
 class LeadAcquisitionCompanyUnavailableError(LeadAcquisitionError):
@@ -35,7 +44,16 @@ class LeadAcquisitionCompanyUnavailableError(LeadAcquisitionError):
 
 
 class LeadAcquisitionContactUnavailableError(LeadAcquisitionError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        discovery_call_count: int = 0,
+        decision_call_count: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.discovery_call_count = discovery_call_count
+        self.decision_call_count = decision_call_count
 
 
 class LeadAcquisitionDraftFailure(LeadAcquisitionError):
@@ -50,6 +68,7 @@ class LeadAcquisitionInput(BaseModel):
     limit: int
     goal: str
     export_file: Path | None = None
+    overwrite_export: bool = False
 
     @field_validator("project_id", "search_profile_id", mode="before")
     @classmethod
@@ -79,6 +98,12 @@ class LeadAcquisitionInput(BaseModel):
             raise ValueError("Goal is invalid.") from None
         return normalized
 
+    @model_validator(mode="after")
+    def validate_export(self) -> LeadAcquisitionInput:
+        if self.overwrite_export and self.export_file is None:
+            raise ValueError("Export overwrite requires an export file.")
+        return self
+
 
 class LeadAcquisitionResult(BaseModel):
     model_config = _STRICT
@@ -90,9 +115,15 @@ class LeadAcquisitionResult(BaseModel):
     person_scoped_count: int
     company_scoped_count: int
     companies_created: int
+    companies_reused: int
     contacts_created: int
+    contacts_reused: int
     leads_created: int
+    leads_reused: int
+    tasks_created: int
+    tasks_reused: int
     drafts_created: int
+    drafts_reused: int
     duplicates_skipped: int
     no_selection_count: int
     no_contact_count: int
@@ -106,6 +137,7 @@ class LeadAcquisitionResult(BaseModel):
     completed_company_ids: tuple[int, ...]
     completed_contact_ids: tuple[int, ...]
     completed_lead_ids: tuple[int, ...]
+    completed_task_ids: tuple[int, ...]
     completed_draft_ids: tuple[int, ...]
     company_discovery_call_count: int
     company_decision_call_count: int
@@ -123,9 +155,15 @@ class LeadAcquisitionResult(BaseModel):
             self.person_scoped_count,
             self.company_scoped_count,
             self.companies_created,
+            self.companies_reused,
             self.contacts_created,
+            self.contacts_reused,
             self.leads_created,
+            self.leads_reused,
+            self.tasks_created,
+            self.tasks_reused,
             self.drafts_created,
+            self.drafts_reused,
             self.duplicates_skipped,
             self.no_selection_count,
             self.no_contact_count,
@@ -147,18 +185,34 @@ class LeadAcquisitionResult(BaseModel):
             raise ValueError("Completion counts are inconsistent.")
         if self.completed_count > self.requested_limit or self.attempt_count > self.attempt_budget:
             raise ValueError("Acquisition bounds are inconsistent.")
+        if self.budget_exhausted and self.attempt_count != self.attempt_budget:
+            raise ValueError("Budget exhaustion is inconsistent.")
         if (
             any(
                 len(values) != self.completed_count
                 for values in (
                     self.completed_company_ids,
                     self.completed_lead_ids,
+                    self.completed_task_ids,
                     self.completed_draft_ids,
                 )
             )
             or len(self.completed_contact_ids) != self.person_scoped_count
         ):
             raise ValueError("Completed identifiers are inconsistent.")
+        identifier_groups = (
+            self.completed_company_ids,
+            self.completed_contact_ids,
+            self.completed_lead_ids,
+            self.completed_task_ids,
+            self.completed_draft_ids,
+        )
+        if any(
+            any(type(identifier) is not int or identifier <= 0 for identifier in identifiers)
+            or len(set(identifiers)) != len(identifiers)
+            for identifiers in identifier_groups
+        ):
+            raise ValueError("Completed identifiers are invalid.")
         if self.status is LeadAcquisitionStatus.COMPLETE:
             if self.completed_count != self.requested_limit or self.budget_exhausted:
                 raise ValueError("Complete acquisition state is inconsistent.")
@@ -187,6 +241,7 @@ class CompanyPlanOutcome:
 class CompanyApplyOutcome:
     company_id: int
     created: bool
+    reused: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +259,11 @@ class ContactApplyOutcome:
     lead_id: int
     task_id: int
     contact_created: bool
+    contact_reused: bool
     lead_created: bool
+    lead_reused: bool
+    task_created: bool
+    task_reused: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +271,9 @@ class CompanyCompletionOutcome:
     lead_id: int
     task_id: int
     lead_created: bool
+    lead_reused: bool
+    task_created: bool
+    task_reused: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +284,7 @@ class DraftOutcome:
     recipient_email: str
     status: str
     created: bool
+    reused: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,13 +296,12 @@ class ExportOutcome:
 class LeadAcquisitionDependencies:
     company_plan: Callable[[int, int, str], CompanyPlanOutcome]
     company_apply: Callable[[int, int, int], CompanyApplyOutcome]
-    existing_target: Callable[[int, int], DraftOutcome | None]
     contact_plan: Callable[[int, int, str], ContactPlanOutcome]
     contact_apply: Callable[[int, int, int, str, str], ContactApplyOutcome]
     company_email: Callable[[int], str | None]
     company_complete: Callable[[int, int, str], CompanyCompletionOutcome]
     draft_generate: Callable[[int, int, int | None, int, int, str], DraftOutcome]
-    export_crm: Callable[[int, Path], ExportOutcome]
+    export_crm: Callable[[int, Path, bool], ExportOutcome]
 
 
 @dataclass(slots=True)
@@ -248,9 +310,15 @@ class _State:
     person_scoped_count: int = 0
     company_scoped_count: int = 0
     companies_created: int = 0
+    companies_reused: int = 0
     contacts_created: int = 0
+    contacts_reused: int = 0
     leads_created: int = 0
+    leads_reused: int = 0
+    tasks_created: int = 0
+    tasks_reused: int = 0
     drafts_created: int = 0
+    drafts_reused: int = 0
     duplicates_skipped: int = 0
     no_selection_count: int = 0
     no_contact_count: int = 0
@@ -267,6 +335,7 @@ class _State:
     completed_company_ids: list[int] = field(default_factory=list)
     completed_contact_ids: list[int] = field(default_factory=list)
     completed_lead_ids: list[int] = field(default_factory=list)
+    completed_task_ids: list[int] = field(default_factory=list)
     completed_draft_ids: list[int] = field(default_factory=list)
 
 
@@ -301,17 +370,19 @@ class LeadAcquisitionService:
 
         while state.completed_count < data.limit and state.attempt_count < attempt_budget:
             state.attempt_count += 1
-            state.company_discovery_call_count += 1
             try:
                 plan = self._dependencies.company_plan(
                     data.project_id, data.search_profile_id, data.goal
                 )
-            except LeadAcquisitionProviderStopError:
+            except LeadAcquisitionProviderStopError as error:
+                state.company_discovery_call_count += error.discovery_call_count
+                state.company_decision_call_count += error.decision_call_count
                 provider_stopped = True
                 break
+            state.company_discovery_call_count += plan.discovery_call_count
+            state.company_decision_call_count += plan.decision_call_count
             state.discovery_run_count += 1
             state.candidate_count += plan.candidate_count
-            state.company_decision_call_count += plan.decision_call_count
             if plan.selected_candidate_id is None:
                 state.no_selection_count += 1
                 continue
@@ -323,19 +394,20 @@ class LeadAcquisitionService:
             except LeadAcquisitionCompanyUnavailableError:
                 state.no_selection_count += 1
                 continue
+            _require_exclusive(company.created, company.reused)
             state.companies_created += int(company.created)
-            if self._dependencies.existing_target(data.project_id, company.company_id) is not None:
-                state.duplicates_skipped += 1
-                continue
+            state.companies_reused += int(company.reused)
 
             contact: ContactApplyOutcome | None = None
-            state.contact_discovery_call_count += 1
             try:
                 contact_plan = self._dependencies.contact_plan(
                     data.project_id, company.company_id, data.goal
                 )
+                state.contact_discovery_call_count += contact_plan.discovery_call_count
                 state.contact_decision_call_count += contact_plan.decision_call_count
-            except LeadAcquisitionContactUnavailableError:
+            except LeadAcquisitionContactUnavailableError as error:
+                state.contact_discovery_call_count += error.discovery_call_count
+                state.contact_decision_call_count += error.decision_call_count
                 contact_plan = ContactPlanOutcome(None, None, None, 0, 0)
 
             selected_email = _usable_email(contact_plan.selected_email)
@@ -356,8 +428,15 @@ class LeadAcquisitionService:
                     contact = None
 
             if contact is not None and selected_email is not None:
+                _require_exclusive(contact.contact_created, contact.contact_reused)
+                _require_exclusive(contact.lead_created, contact.lead_reused)
+                _require_exclusive(contact.task_created, contact.task_reused)
                 state.contacts_created += int(contact.contact_created)
+                state.contacts_reused += int(contact.contact_reused)
                 state.leads_created += int(contact.lead_created)
+                state.leads_reused += int(contact.lead_reused)
+                state.tasks_created += int(contact.task_created)
+                state.tasks_reused += int(contact.task_reused)
                 self._complete_draft(
                     data,
                     state,
@@ -377,7 +456,12 @@ class LeadAcquisitionService:
             completion = self._dependencies.company_complete(
                 data.project_id, company.company_id, company_email
             )
+            _require_exclusive(completion.lead_created, completion.lead_reused)
+            _require_exclusive(completion.task_created, completion.task_reused)
             state.leads_created += int(completion.lead_created)
+            state.leads_reused += int(completion.lead_reused)
+            state.tasks_created += int(completion.task_created)
+            state.tasks_reused += int(completion.task_reused)
             self._complete_draft(
                 data,
                 state,
@@ -403,7 +487,9 @@ class LeadAcquisitionService:
         if data.export_file is not None:
             export_file = str(data.export_file)
             try:
-                exported = self._dependencies.export_crm(data.project_id, data.export_file)
+                exported = self._dependencies.export_crm(
+                    data.project_id, data.export_file, data.overwrite_export
+                )
                 export_file = str(exported.output_file)
                 export_status = LeadAcquisitionExportStatus.SUCCEEDED
             except Exception:
@@ -417,9 +503,15 @@ class LeadAcquisitionService:
             person_scoped_count=state.person_scoped_count,
             company_scoped_count=state.company_scoped_count,
             companies_created=state.companies_created,
+            companies_reused=state.companies_reused,
             contacts_created=state.contacts_created,
+            contacts_reused=state.contacts_reused,
             leads_created=state.leads_created,
+            leads_reused=state.leads_reused,
+            tasks_created=state.tasks_created,
+            tasks_reused=state.tasks_reused,
             drafts_created=state.drafts_created,
+            drafts_reused=state.drafts_reused,
             duplicates_skipped=state.duplicates_skipped,
             no_selection_count=state.no_selection_count,
             no_contact_count=state.no_contact_count,
@@ -433,6 +525,7 @@ class LeadAcquisitionService:
             completed_company_ids=tuple(state.completed_company_ids),
             completed_contact_ids=tuple(state.completed_contact_ids),
             completed_lead_ids=tuple(state.completed_lead_ids),
+            completed_task_ids=tuple(state.completed_task_ids),
             completed_draft_ids=tuple(state.completed_draft_ids),
             company_discovery_call_count=state.company_discovery_call_count,
             company_decision_call_count=state.company_decision_call_count,
@@ -470,19 +563,27 @@ class LeadAcquisitionService:
         ):
             state.draft_failure_count += 1
             return
-        if not draft.created:
+        _require_exclusive(draft.created, draft.reused)
+        state.drafts_created += int(draft.created)
+        state.drafts_reused += int(draft.reused)
+        if draft.reused:
             state.duplicates_skipped += 1
             return
-        state.drafts_created += 1
         state.completed_count += 1
         state.completed_company_ids.append(company_id)
         state.completed_lead_ids.append(lead_id)
+        state.completed_task_ids.append(task_id)
         state.completed_draft_ids.append(draft.draft_id)
         if contact_id is None:
             state.company_scoped_count += 1
         else:
             state.person_scoped_count += 1
             state.completed_contact_ids.append(contact_id)
+
+
+def _require_exclusive(created: bool, reused: bool) -> None:
+    if type(created) is not bool or type(reused) is not bool or created == reused:
+        raise LeadAcquisitionError("Materialization outcome is inconsistent.")
 
 
 __all__ = [
