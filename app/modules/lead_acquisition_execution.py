@@ -160,13 +160,23 @@ def execute_lead_acquisition(
 
         contact_provider_factory = WebsiteContactDiscoveryProvider
 
-    def company_plan(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+    def company_plan(
+        project_id: int,
+        profile_id: int,
+        goal: str,
+        query_template_offset: int = 0,
+        excluded_decision_fingerprints: tuple[str, ...] = (),
+        include_promoted_candidates: bool = False,
+    ) -> CompanyPlanOutcome:
         try:
             result = execute_company_plan(
                 AgentCompanyPlanInput(
                     project_id=project_id,
                     search_profile_id=profile_id,
                     goal=goal,
+                    query_template_offset=query_template_offset,
+                    excluded_decision_fingerprints=excluded_decision_fingerprints,
+                    include_promoted_candidates=include_promoted_candidates,
                 ),
                 session_factory=session_factory,
                 decision_factory_factory=decision_factory_factory,
@@ -200,6 +210,27 @@ def execute_lead_acquisition(
             selected_candidate_id=result.selected_candidate_id,
             discovery_call_count=result.serpapi_call_count,
             decision_call_count=result.openai_call_count,
+            decision_request_fingerprint=getattr(result, "decision_request_fingerprint", None),
+            decision_suppressed=getattr(result, "decision_suppressed", False),
+            existing_company_id=getattr(result, "selected_existing_company_id", None),
+            candidate_ids=getattr(result, "eligible_candidate_ids", ()),
+            candidate_domains=getattr(result, "eligible_candidate_domains", ()),
+        )
+
+    def company_plan_attempt(
+        project_id: int,
+        profile_id: int,
+        goal: str,
+        query_template_offset: int,
+        excluded_decision_fingerprints: tuple[str, ...],
+    ) -> CompanyPlanOutcome:
+        return company_plan(
+            project_id,
+            profile_id,
+            goal,
+            query_template_offset,
+            excluded_decision_fingerprints,
+            True,
         )
 
     def company_apply(project_id: int, run_id: int, candidate_id: int) -> CompanyApplyOutcome:
@@ -325,6 +356,25 @@ def execute_lead_acquisition(
             result.task_reused,
         )
 
+    def company_already_complete(project_id: int, company_id: int) -> bool:
+        from app.modules.email_draft.models import EmailDraftStatus
+
+        with session_factory() as session:
+            return (
+                session.scalar(
+                    select(EmailDraft.id)
+                    .where(
+                        EmailDraft.project_id == project_id,
+                        EmailDraft.company_id == company_id,
+                        EmailDraft.status.in_(
+                            (EmailDraftStatus.DRAFT.value, EmailDraftStatus.APPROVED.value)
+                        ),
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
+
     def draft_generate(
         project_id: int,
         company_id: int,
@@ -397,6 +447,8 @@ def execute_lead_acquisition(
         company_complete=company_complete,
         draft_generate=draft_generate,
         export_crm=export_crm,
+        company_plan_attempt=company_plan_attempt,
+        company_already_complete=company_already_complete,
     )
     return LeadAcquisitionService(dependencies).acquire(data)
 

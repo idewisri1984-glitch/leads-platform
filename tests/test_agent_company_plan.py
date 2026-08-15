@@ -687,3 +687,23 @@ def test_valid_matching_no_selection_constructs_decision_and_resolves_once() -> 
     assert events == ["commit", "prepare", "revalidate", "factory", "decide", "resolve"]
     assert decision.calls == result.openai_call_count == 1
     assert result.selected_candidate_id is result.selected_candidate_index is None
+
+
+def test_identical_acquisition_request_is_suppressed_before_second_decision_call() -> None:
+    service, *_ = make_service()
+    first = service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+    assert first.decision_request_fingerprint is not None
+
+    repeated = service.plan(
+        AgentCompanyPlanInput(
+            project_id=3,
+            search_profile_id=7,
+            goal="goal",
+            excluded_decision_fingerprints=(first.decision_request_fingerprint,),
+        )
+    )
+
+    assert repeated.decision_request_fingerprint == first.decision_request_fingerprint
+    assert repeated.decision_suppressed is True
+    assert repeated.openai_call_count == 0
+    assert repeated.decision is None

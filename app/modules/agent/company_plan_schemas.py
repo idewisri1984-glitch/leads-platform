@@ -1,6 +1,6 @@
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator, model_validator
 
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
 from app.providers.openai_decision import (
@@ -26,6 +26,9 @@ class AgentCompanyPlanInput(BaseModel):
     project_id: int
     search_profile_id: int
     goal: str
+    query_template_offset: int = 0
+    excluded_decision_fingerprints: tuple[str, ...] = ()
+    include_promoted_candidates: bool = False
 
     @field_validator("project_id", "search_profile_id", mode="before")
     @classmethod
@@ -40,6 +43,22 @@ class AgentCompanyPlanInput(BaseModel):
         if type(value) is not str or not value.strip() or len(value) > 1000:
             raise ValueError("Goal is invalid.")
         return _require_utf8(value)
+
+    @field_validator("query_template_offset", mode="before")
+    @classmethod
+    def validate_query_template_offset(cls, value: object) -> object:
+        if type(value) is not int or not 0 <= value <= 99:
+            raise ValueError("Query template offset is invalid.")
+        return value
+
+    @field_validator("excluded_decision_fingerprints", mode="before")
+    @classmethod
+    def validate_excluded_fingerprints(cls, value: object) -> object:
+        if type(value) is not tuple or any(
+            type(item) is not str or len(item) != 64 for item in value
+        ):
+            raise ValueError("Decision fingerprints are invalid.")
+        return value
 
 
 class AgentCompanyPlanResult(BaseModel):
@@ -65,6 +84,31 @@ class AgentCompanyPlanResult(BaseModel):
     openai_call_count: int
     crm_mutated: Literal[False]
     candidate_promoted: Literal[False]
+    _decision_request_fingerprint: str | None = PrivateAttr(default=None)
+    _decision_suppressed: bool = PrivateAttr(default=False)
+    _selected_existing_company_id: int | None = PrivateAttr(default=None)
+    _eligible_candidate_ids: tuple[int, ...] = PrivateAttr(default=())
+    _eligible_candidate_domains: tuple[str, ...] = PrivateAttr(default=())
+
+    @property
+    def decision_request_fingerprint(self) -> str | None:
+        return self._decision_request_fingerprint
+
+    @property
+    def decision_suppressed(self) -> bool:
+        return self._decision_suppressed
+
+    @property
+    def selected_existing_company_id(self) -> int | None:
+        return self._selected_existing_company_id
+
+    @property
+    def eligible_candidate_ids(self) -> tuple[int, ...]:
+        return self._eligible_candidate_ids
+
+    @property
+    def eligible_candidate_domains(self) -> tuple[str, ...]:
+        return self._eligible_candidate_domains
 
     @field_validator("project_id", "search_profile_id", "discovery_run_id", mode="before")
     @classmethod

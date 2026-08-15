@@ -227,6 +227,7 @@ class SearchProfileRunOptions(BaseModel):
     result_limit_per_query: int | None = Field(default=None, ge=1, le=100)
     total_result_ceiling: int | None = Field(default=None, ge=1, le=1000)
     country_codes: tuple[str, ...] | None = Field(default=None)
+    query_template_offset: int = Field(default=0, ge=0, le=99)
 
     @field_validator("country_codes", mode="before")
     @classmethod

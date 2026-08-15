@@ -396,3 +396,45 @@ def test_persisted_first_target_survives_second_target_draft_failure(monkeypatch
         assert draft_a.lead_id == lead_a.id and draft_a.task_id == task_a.id
         assert draft_a.recipient_email == "office@studio.example"
         assert draft_b is None
+
+
+def test_promoted_existing_company_recovers_without_reapply_or_send_state(monkeypatch) -> None:
+    project_id, company_id = _seed_company()
+    monkeypatch.setattr(
+        "app.modules.agent.execution.execute_company_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            discovery_run_id=501,
+            staged_candidate_count=1,
+            selected_candidate_id=601,
+            serpapi_call_count=0,
+            openai_call_count=1,
+            decision_request_fingerprint="e" * 64,
+            decision_suppressed=False,
+            selected_existing_company_id=company_id,
+            eligible_candidate_ids=(601,),
+            eligible_candidate_domains=("https://studio.example",),
+        ),
+    )
+
+    def reject_reapply(*args, **kwargs):
+        raise AssertionError("Existing promoted company must not be applied again.")
+
+    monkeypatch.setattr("app.modules.agent.execution.execute_company_apply", reject_reapply)
+    monkeypatch.setattr(
+        "app.modules.agent.execution.execute_contact_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            selected_candidate_id=None,
+            selected_contact_email=None,
+            handoff_token=None,
+            provider_call_count=0,
+            decision=SimpleNamespace(value="NO_SELECTION"),
+        ),
+    )
+
+    result = _run(project_id, FakeEmailDraftGenerator)
+
+    assert result.completed_count == 1
+    assert result.completed_company_ids == (company_id,)
+    assert (result.companies_created, result.companies_reused) == (0, 1)
+    assert (result.contacts_created, result.contacts_reused) == (0, 0)
+    assert _counts() == (0, 1, 1, 1, 0, 0)

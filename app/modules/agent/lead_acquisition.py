@@ -244,6 +244,11 @@ class CompanyPlanOutcome:
     selected_candidate_id: int | None
     discovery_call_count: int
     decision_call_count: int
+    decision_request_fingerprint: str | None = None
+    decision_suppressed: bool = False
+    existing_company_id: int | None = None
+    candidate_ids: tuple[int, ...] = ()
+    candidate_domains: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +316,10 @@ class LeadAcquisitionDependencies:
     company_complete: Callable[[int, int, str], CompanyCompletionOutcome]
     draft_generate: Callable[[int, int, int | None, int, int, str], DraftOutcome]
     export_crm: Callable[[int, Path, bool], ExportOutcome]
+    company_plan_attempt: (
+        Callable[[int, int, str, int, tuple[str, ...]], CompanyPlanOutcome] | None
+    ) = None
+    company_already_complete: Callable[[int, int], bool] | None = None
 
 
 @dataclass(slots=True)
@@ -347,6 +356,10 @@ class _State:
     completed_lead_ids: list[int] = field(default_factory=list)
     completed_task_ids: list[int] = field(default_factory=list)
     completed_draft_ids: list[int] = field(default_factory=list)
+    query_template_cursor: int = 0
+    seen_candidate_ids: set[int] = field(default_factory=set)
+    seen_candidate_domains: set[str] = field(default_factory=set)
+    seen_request_fingerprints: set[str] = field(default_factory=set)
 
 
 def _usable_email(value: str | None) -> str | None:
@@ -381,9 +394,19 @@ class LeadAcquisitionService:
         while state.completed_count < data.limit and state.attempt_count < attempt_budget:
             state.attempt_count += 1
             try:
-                plan = self._dependencies.company_plan(
-                    data.project_id, data.search_profile_id, data.goal
-                )
+                if self._dependencies.company_plan_attempt is None:
+                    plan = self._dependencies.company_plan(
+                        data.project_id, data.search_profile_id, data.goal
+                    )
+                else:
+                    plan = self._dependencies.company_plan_attempt(
+                        data.project_id,
+                        data.search_profile_id,
+                        data.goal,
+                        state.query_template_cursor,
+                        tuple(sorted(state.seen_request_fingerprints)),
+                    )
+                state.query_template_cursor += 1
             except LeadAcquisitionProviderStopError as error:
                 state.company_discovery_call_count += error.discovery_call_count
                 state.company_decision_call_count += error.decision_call_count
@@ -396,17 +419,38 @@ class LeadAcquisitionService:
             state.company_decision_call_count += plan.decision_call_count
             state.discovery_run_count += 1
             state.candidate_count += plan.candidate_count
+            state.seen_candidate_ids.update(plan.candidate_ids)
+            state.seen_candidate_domains.update(
+                domain.casefold() for domain in plan.candidate_domains if domain
+            )
+            if plan.decision_request_fingerprint is not None:
+                state.seen_request_fingerprints.add(plan.decision_request_fingerprint)
+            if plan.decision_suppressed:
+                state.duplicates_skipped += 1
+                continue
             if plan.selected_candidate_id is None:
                 state.no_selection_count += 1
                 continue
 
-            try:
-                company = self._dependencies.company_apply(
-                    data.project_id, plan.discovery_run_id, plan.selected_candidate_id
-                )
-            except LeadAcquisitionCompanyUnavailableError:
-                state.no_selection_count += 1
-                continue
+            if plan.existing_company_id is not None:
+                company = CompanyApplyOutcome(plan.existing_company_id, False, True)
+                if (
+                    self._dependencies.company_already_complete is not None
+                    and self._dependencies.company_already_complete(
+                        data.project_id, company.company_id
+                    )
+                ):
+                    state.drafts_reused += 1
+                    state.duplicates_skipped += 1
+                    continue
+            else:
+                try:
+                    company = self._dependencies.company_apply(
+                        data.project_id, plan.discovery_run_id, plan.selected_candidate_id
+                    )
+                except LeadAcquisitionCompanyUnavailableError:
+                    state.no_selection_count += 1
+                    continue
             _require_exclusive(company.created, company.reused)
             state.companies_created += int(company.created)
             state.companies_reused += int(company.reused)

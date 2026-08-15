@@ -53,6 +53,10 @@ class CompanyDiscoveryStagingCandidateDraft(BaseModel):
     website: str | None = Field(default=None, max_length=500)
     country_code: str | None = Field(default=None)
     position: PositiveInt | None = None
+    city: str | None = Field(default=None, max_length=100)
+    industry: str | None = Field(default=None, max_length=100)
+    snippet: str | None = Field(default=None, max_length=1000)
+    website_summary: str | None = Field(default=None, max_length=1000)
 
     @field_validator("provider")
     @classmethod
@@ -64,7 +68,7 @@ class CompanyDiscoveryStagingCandidateDraft(BaseModel):
             raise ValueError("Raw markup is not allowed in company discovery text.")
         return normalized
 
-    @field_validator("name")
+    @field_validator("name", "city", "industry", "snippet", "website_summary")
     @classmethod
     def _clean_name(cls, value: str | None) -> str | None:
         if value is None:
@@ -109,8 +113,12 @@ class CompanyDiscoveryStagingCandidatePreview(BaseModel):
     country_code: str | None = None
     best_position: PositiveInt | None = None
     identity_key: str = Field(max_length=700)
+    city: str | None = Field(default=None, max_length=100)
+    industry: str | None = Field(default=None, max_length=100)
+    snippet: str | None = Field(default=None, max_length=1000)
+    website_summary: str | None = Field(default=None, max_length=1000)
 
-    @field_validator("name")
+    @field_validator("name", "city", "industry", "snippet", "website_summary")
     @classmethod
     def _clean_name(cls, value: str | None) -> str | None:
         return normalize_display_name(value)

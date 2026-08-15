@@ -9,6 +9,9 @@ from app.modules.company_discovery.models import (
     CompanyDiscoveryCandidateStatus,
     CompanyDiscoveryRunStatus,
 )
+from app.modules.company_discovery.staging_service_schemas import (
+    CompanyDiscoveryStagingCandidatePreview,
+)
 from app.providers.openai_decision import (
     OpenAIDecisionCandidate,
     OpenAIDecisionKind,
@@ -98,6 +101,12 @@ _MAX_OPENAI_REQUEST_BYTES = 20_000
 class AgentCompanySelectionRepository(Protocol):
     def get_run(self, run_id: int) -> AgentCompanySelectionRunRecord | None: ...
 
+    def get_candidate_for_project(
+        self,
+        project_id: int,
+        candidate_id: int,
+    ) -> AgentCompanySelectionCandidateRecord | None: ...
+
     def list_candidates_for_run(
         self,
         project_id: int,
@@ -119,6 +128,43 @@ class AgentCompanySelectionService:
         goal: str,
         max_candidates: int = 5,
     ) -> AgentCompanySelectionInput:
+        return self._prepare(
+            project_id=project_id,
+            run_id=run_id,
+            goal=goal,
+            max_candidates=max_candidates,
+            include_promoted=False,
+            candidate_evidence=(),
+        )
+
+    def prepare_for_recovery(
+        self,
+        *,
+        project_id: int,
+        run_id: int,
+        goal: str,
+        max_candidates: int = 5,
+        candidate_evidence: tuple[CompanyDiscoveryStagingCandidatePreview, ...] = (),
+    ) -> AgentCompanySelectionInput:
+        return self._prepare(
+            project_id=project_id,
+            run_id=run_id,
+            goal=goal,
+            max_candidates=max_candidates,
+            include_promoted=True,
+            candidate_evidence=candidate_evidence,
+        )
+
+    def _prepare(
+        self,
+        *,
+        project_id: int,
+        run_id: int,
+        goal: str,
+        max_candidates: int,
+        include_promoted: bool,
+        candidate_evidence: tuple[CompanyDiscoveryStagingCandidatePreview, ...],
+    ) -> AgentCompanySelectionInput:
         self._validate_direct_input(project_id, run_id, goal, max_candidates)
 
         run = self.repository.get_run(run_id)
@@ -138,32 +184,43 @@ class AgentCompanySelectionService:
             CompanyDiscoveryCandidateStatus.DISCOVERED,
         )
         candidate_snapshots = self._snapshot_candidate_collection(candidates)
+        if include_promoted:
+            promoted = self.repository.list_candidates_for_run(
+                project_id,
+                run_id,
+                max_candidates,
+                CompanyDiscoveryCandidateStatus.PROMOTED,
+            )
+            candidate_snapshots += self._snapshot_candidate_collection(promoted)
         validated = self._validate_candidates(
             candidate_snapshots,
             project_id,
             run_id,
-            max_candidates,
+            max_candidates * (2 if include_promoted else 1),
+            include_promoted=include_promoted,
         )
         if not validated:
             raise AgentCompanySelectionNoCandidatesError(_NO_CANDIDATES_MESSAGE)
 
         ordered = sorted(validated, key=self._candidate_sort_key)[:max_candidates]
+        evidence_by_identity = {item.identity_key: item for item in candidate_evidence}
         openai_candidates: list[OpenAIDecisionCandidate] = []
         bindings: list[AgentCompanySelectionBinding] = []
         request: OpenAIDecisionRequest | None = None
         construction_failed = False
         try:
             for index, candidate in enumerate(ordered, start=1):
+                evidence = evidence_by_identity.get(cast(str, candidate.identity_key))
                 openai_candidates.append(
                     OpenAIDecisionCandidate(
                         index=index,
                         name=self._normalize_name(cast(str, candidate.name)),
                         website=cast(str | None, candidate.website),
                         country=cast(str | None, candidate.country_code),
-                        city=None,
-                        industry=None,
-                        snippet=None,
-                        website_summary=None,
+                        city=None if evidence is None else evidence.city,
+                        industry=None if evidence is None else evidence.industry,
+                        snippet=None if evidence is None else evidence.snippet,
+                        website_summary=None if evidence is None else evidence.website_summary,
                     )
                 )
                 bindings.append(
@@ -230,6 +287,35 @@ class AgentCompanySelectionService:
         if len(matches) != 1:
             raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
         return matches[0].candidate_id
+
+    def resolve_selected_existing_company_id(
+        self,
+        selection: AgentCompanySelectionInput,
+        decision: OpenAIDecisionResult,
+    ) -> int | None:
+        selected_candidate_id = self.resolve_selected_candidate_id(selection, decision)
+        if selected_candidate_id is None:
+            return None
+        candidate = self.repository.get_candidate_for_project(
+            selection.project_id,
+            selected_candidate_id,
+        )
+        if candidate is None:
+            raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
+        snapshot = self._snapshot_candidate(candidate)
+        self._validate_candidate(
+            snapshot,
+            selection.project_id,
+            selection.run_id,
+            include_promoted=True,
+        )
+        if (
+            self._normalize_candidate_status(snapshot.candidate_status)
+            is not CompanyDiscoveryCandidateStatus.PROMOTED
+            or type(snapshot.promoted_company_id) is not int
+        ):
+            return None
+        return snapshot.promoted_company_id
 
     def revalidate_selection_input(
         self,
@@ -327,6 +413,8 @@ class AgentCompanySelectionService:
         project_id: int,
         run_id: int,
         max_candidates: int,
+        *,
+        include_promoted: bool = False,
     ) -> list[_CandidateSnapshot]:
         if len(candidates) > max_candidates:
             raise AgentCompanySelectionConsistencyError(_CONSISTENCY_MESSAGE)
@@ -335,7 +423,12 @@ class AgentCompanySelectionService:
         candidate_ids: set[int] = set()
         identity_keys: set[str] = set()
         for candidate in candidates:
-            cls._validate_candidate(candidate, project_id, run_id)
+            cls._validate_candidate(
+                candidate,
+                project_id,
+                run_id,
+                include_promoted=include_promoted,
+            )
             candidate_id = cast(int, candidate.id)
             identity_key = cast(str, candidate.identity_key)
             if candidate_id in candidate_ids or identity_key in identity_keys:
@@ -386,6 +479,8 @@ class AgentCompanySelectionService:
         candidate: _CandidateSnapshot,
         project_id: int,
         run_id: int,
+        *,
+        include_promoted: bool = False,
     ) -> None:
         (
             candidate_id,
@@ -420,6 +515,18 @@ class AgentCompanySelectionService:
             and country_code.isalpha()
             and country_code == country_code.upper()
         )
+        normalized_status = cls._normalize_candidate_status(candidate_status)
+        valid_status = normalized_status is CompanyDiscoveryCandidateStatus.DISCOVERED or (
+            include_promoted
+            and normalized_status is CompanyDiscoveryCandidateStatus.PROMOTED
+            and type(promoted_company_id) is int
+            and promoted_company_id > 0
+        )
+        valid_promotion = (
+            promoted_company_id is None
+            if normalized_status is CompanyDiscoveryCandidateStatus.DISCOVERED
+            else valid_status
+        )
         if (
             type(candidate_id) is not int
             or candidate_id <= 0
@@ -429,9 +536,8 @@ class AgentCompanySelectionService:
             or type(last_seen_run_id) is not int
             or last_seen_run_id <= 0
             or last_seen_run_id != run_id
-            or cls._normalize_candidate_status(candidate_status)
-            is not CompanyDiscoveryCandidateStatus.DISCOVERED
-            or promoted_company_id is not None
+            or not valid_status
+            or not valid_promotion
             or type(name) is not str
             or not name.strip()
             or "\x00" in name

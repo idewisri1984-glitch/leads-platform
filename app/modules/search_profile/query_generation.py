@@ -72,6 +72,9 @@ class SearchProfileQueryGenerator:
         seen_queries: set[str] = set()
         remaining_result_budget = effective_total_result_ceiling
         templates = profile.query_templates or DEFAULT_QUERY_TEMPLATES
+        if templates:
+            offset = run_options.query_template_offset % len(templates)
+            templates = [*templates[offset:], *templates[:offset]]
         negative_tokens = self._negative_tokens(profile.negative_keywords)
 
         for template in templates:
