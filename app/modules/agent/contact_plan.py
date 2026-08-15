@@ -100,7 +100,16 @@ class AgentContactPlanWebsiteMissingError(AgentContactPlanError):
 
 
 class AgentContactPlanProviderError(AgentContactPlanError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        discovery_call_count: int = 0,
+        decision_call_count: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.discovery_call_count = discovery_call_count
+        self.decision_call_count = decision_call_count
 
 
 class AgentContactPlanDiscoveryResultError(AgentContactPlanError):
@@ -257,7 +266,10 @@ class AgentContactPlanService:
             if result.status is ContactDiscoveryStatus.FAILED:
                 if "provider_invalid_result" in result.errors:
                     raise AgentContactPlanDiscoveryResultError(_DISCOVERY_INVALID)
-                raise AgentContactPlanProviderError(_PROVIDER_FAILED)
+                raise AgentContactPlanProviderError(
+                    _PROVIDER_FAILED,
+                    discovery_call_count=1,
+                )
             eligible = self._eligible(result.persisted_candidates, company.id)
             return self._result(
                 data, company, provider_name, result, eligible, discovery_checked_at

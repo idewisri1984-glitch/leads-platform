@@ -371,6 +371,7 @@ class CompanyDiscoveryStagingService:
                 candidates_protected += 1 if upsert_result.protected else 0
 
         completed_at = datetime.now(UTC)
+        provider_diagnostic = self._first_provider_diagnostic(execution_result)
         candidate_count = (
             candidate_upserts
             if status in (CompanyDiscoveryRunStatus.SUCCEEDED, CompanyDiscoveryRunStatus.PARTIAL)
@@ -386,6 +387,12 @@ class CompanyDiscoveryStagingService:
                 candidate_count=candidate_count,
                 completed_at=completed_at,
                 error_code=error_code,
+                error_subtype=(
+                    provider_diagnostic.subtype if provider_diagnostic is not None else None
+                ),
+                error_http_status=(
+                    provider_diagnostic.http_status if provider_diagnostic is not None else None
+                ),
             ),
         )
 
@@ -413,7 +420,7 @@ class CompanyDiscoveryStagingService:
             stopped_early=execution_result.stopped_early,
             stop_reason=execution_result.stop_reason,
             error_code=error_code,
-            provider_diagnostic=self._first_provider_diagnostic(execution_result),
+            provider_diagnostic=provider_diagnostic,
             run_id=run.id,
             run_persisted=True,
             completed_at=completed_at,

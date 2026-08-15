@@ -42,6 +42,15 @@ class SerpApiDiscoveryProvider:
     def provider_name(self) -> str:
         return "serpapi"
 
+    def snapshot_call_count(self) -> int | None:
+        snapshot = getattr(self.client, "snapshot_call_count", None)
+        if not callable(snapshot):
+            return None
+        value = snapshot()
+        if type(value) is not int or value < 0:
+            return None
+        return value
+
     def search(self, query: SearchQuery) -> DiscoveryProviderResponse:
         request_failed = False
         request_diagnostic: DiscoveryProviderDiagnostic | None = None

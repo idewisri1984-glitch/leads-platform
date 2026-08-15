@@ -3,7 +3,7 @@ import json
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -23,6 +23,7 @@ from app.modules.company_discovery.staging_normalization import normalize_countr
 
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+CompanyDiscoveryErrorSubtype = Literal["TRANSPORT", "HTTP_CLIENT", "VALIDATION"]
 
 
 class CompanyDiscoverySourceMode(StrEnum):
@@ -110,6 +111,8 @@ class CompanyDiscoveryRunUpdate(BaseModel):
     candidate_count: NonNegativeInt | None = None
     completed_at: datetime | None = None
     error_code: str | None = Field(default=None, max_length=100)
+    error_subtype: CompanyDiscoveryErrorSubtype | None = None
+    error_http_status: Annotated[StrictInt, Field(ge=400, le=499)] | None = None
 
     @field_validator("error_code")
     @classmethod
@@ -121,6 +124,8 @@ class CompanyDiscoveryRunUpdate(BaseModel):
         for field in ("run_status", "query_count", "result_count", "candidate_count"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} must not be null when supplied.")
+        if self.error_http_status is not None and self.error_subtype != "HTTP_CLIENT":
+            raise ValueError("HTTP status requires an HTTP_CLIENT error subtype.")
         return self
 
 
@@ -140,6 +145,8 @@ class CompanyDiscoveryRunRead(BaseModel):
     started_at: datetime
     completed_at: datetime | None
     error_code: str | None
+    error_subtype: CompanyDiscoveryErrorSubtype | None
+    error_http_status: int | None
     created_at: datetime
     updated_at: datetime
 

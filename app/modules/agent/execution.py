@@ -98,15 +98,31 @@ class _CountedDiscoveryProvider:
         return self._provider.provider_name
 
     def search(self, query: SearchQuery) -> DiscoveryProviderResponse:
-        self._call_count += 1
+        before_calls = self._provider_call_count()
         self._last_query = query.text
-        return self._provider.search(query)
+        try:
+            return self._provider.search(query)
+        finally:
+            after_calls = self._provider_call_count()
+            if before_calls is None or after_calls is None:
+                self._call_count += 1
+            elif after_calls >= before_calls:
+                self._call_count += after_calls - before_calls
 
     def snapshot_call_count(self) -> int:
         return self._call_count
 
     def last_query(self) -> str | None:
         return self._last_query
+
+    def _provider_call_count(self) -> int | None:
+        snapshot = getattr(self._provider, "snapshot_call_count", None)
+        if not callable(snapshot):
+            return None
+        value = snapshot()
+        if type(value) is not int or value < 0:
+            return None
+        return value
 
 
 class _LazyDecisionFactory:

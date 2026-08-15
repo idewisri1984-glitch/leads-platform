@@ -68,6 +68,10 @@ class SerpApiClient:
         self._timeout_seconds = timeout_seconds
         self._http_client = http_client or httpx.Client()
         self._max_response_bytes = max_response_bytes
+        self._provider_call_count = 0
+
+    def snapshot_call_count(self) -> int:
+        return self._provider_call_count
 
     def search_companies(
         self,
@@ -108,16 +112,30 @@ class SerpApiClient:
             params["gl"] = request_google_country_code
 
         transport_failed = False
+        status_error_code: int | None = None
+        status_code: int | None = None
+        body = b""
+        self._provider_call_count += 1
         try:
             with self._http_client.stream(
                 "GET", self._base_url, params=params, timeout=self._timeout_seconds
             ) as response:
                 status_code = response.status_code
                 body = self._read_bounded_body(response)
-        except httpx.HTTPError:
+        except httpx.HTTPStatusError as exc:
+            status_error_code = exc.response.status_code
+        except httpx.RequestError:
             transport_failed = True
 
         if transport_failed:
+            raise SerpApiRequestError(
+                "SerpAPI request failed.",
+                subtype=SerpApiRequestFailureSubtype.TRANSPORT,
+            )
+
+        if status_error_code is not None:
+            status_code = status_error_code
+        if status_code is None:
             raise SerpApiRequestError(
                 "SerpAPI request failed.",
                 subtype=SerpApiRequestFailureSubtype.TRANSPORT,

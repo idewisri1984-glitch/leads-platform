@@ -241,7 +241,13 @@ def execute_lead_acquisition(
                     plan_service=AgentContactPlanService,
                 ),
             )
-        except (AgentContactPlanProviderError, AgentContactPlanWebsiteMissingError):
+        except AgentContactPlanProviderError as exc:
+            raise LeadAcquisitionContactUnavailableError(
+                "Contact is unavailable.",
+                discovery_call_count=exc.discovery_call_count,
+                decision_call_count=exc.decision_call_count,
+            ) from None
+        except AgentContactPlanWebsiteMissingError:
             raise LeadAcquisitionContactUnavailableError("Contact is unavailable.") from None
         selected = result.selected_candidate_id
         return ContactPlanOutcome(
