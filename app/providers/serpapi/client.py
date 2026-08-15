@@ -203,15 +203,15 @@ class SerpApiClient:
 
         if transport_failed:
             if retry_available:
+                sleeper_error: SerpApiRequestError | None = None
                 try:
                     self._sleeper(_RETRY_DELAY_SECONDS)
                 except SerpApiError:
                     raise
                 except Exception:
-                    raise SerpApiRequestError(
-                        "SerpAPI request failed.",
-                        subtype=SerpApiRequestFailureSubtype.TRANSPORT,
-                    ) from None
+                    sleeper_error = SerpApiRequestError("SerpAPI request failed.")
+                if sleeper_error is not None:
+                    raise sleeper_error from None
                 if budget.remaining_attempts == 0:
                     raise SerpApiRequestError(
                         "SerpAPI request failed.",

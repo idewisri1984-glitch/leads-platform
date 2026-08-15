@@ -561,6 +561,34 @@ def test_two_transport_failures_stop_at_exact_aggregate_bound() -> None:
     assert captured.value.__cause__ is captured.value.__context__ is None
 
 
+def test_sleeper_failure_is_detached_and_counts_only_first_http_attempt() -> None:
+    transport_secret = "SECRET_TRANSPORT_TOKEN api_key=transport"
+    sleeper_secret = "SECRET_SLEEPER_TOKEN api_key=sleeper"
+    http_calls = 0
+    sleeper_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal http_calls
+        http_calls += 1
+        raise httpx.ConnectError(transport_secret, request=request)
+
+    def failing_sleeper(delay: float) -> None:
+        sleeper_calls.append(delay)
+        raise RuntimeError(sleeper_secret)
+
+    client = make_client(handler, sleeper=failing_sleeper)
+    with pytest.raises(SerpApiRequestError) as captured:
+        client.search_companies(query="companies", country=None, city=None, industry=None, limit=10)
+
+    error = captured.value
+    exposed = f"{error!s} {error!r} {error.args!r} {error.diagnostic!r}"
+    assert error.__cause__ is error.__context__ is None
+    assert transport_secret not in exposed
+    assert sleeper_secret not in exposed
+    assert http_calls == client.snapshot_call_count() == 1
+    assert sleeper_calls == [0.5]
+
+
 @pytest.mark.parametrize(
     "status,error_type,subtype",
     [

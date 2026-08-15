@@ -47,13 +47,17 @@ def _search(
     )
 
 
-def _client(handler: Callable[[httpx.Request], httpx.Response]) -> SerpApiClient:
+def _client(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    sleeper: Callable[[float], None] = lambda _: None,
+) -> SerpApiClient:
     return SerpApiClient(
         api_key="safe-key",
         base_url="https://example.invalid/search",
         timeout_seconds=1.0,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        sleeper=lambda _: None,
+        sleeper=sleeper,
     )
 
 
@@ -100,6 +104,44 @@ def test_transport_error_has_detached_safe_diagnostic() -> None:
     exposed = f"{error!s} {error!r} {error.args!r} {error.diagnostic!r}"
     assert secret not in exposed
     assert "hostile-secret" not in exposed
+
+
+def test_sleeper_failure_is_sanitized_at_counted_provider_boundary() -> None:
+    transport_secret = "SECRET_TRANSPORT_BOUNDARY"
+    sleeper_secret = "SECRET_SLEEPER_BOUNDARY"
+    sleeper_calls: list[float] = []
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError(transport_secret, request=request)
+
+    def failing_sleeper(delay: float) -> None:
+        sleeper_calls.append(delay)
+        raise RuntimeError(sleeper_secret)
+
+    counted = _CountedDiscoveryProvider(
+        SerpApiDiscoveryProvider(_client(fail, sleeper=failing_sleeper))
+    )
+    query = SearchQuery(
+        text="interior design",
+        profile_id=1,
+        profile_name="Profile",
+        country="United States",
+        city=None,
+        source_template="{target_customer_type}",
+        country_code="US",
+        limit=5,
+    )
+
+    with pytest.raises(DiscoveryProviderRequestError) as captured:
+        counted.search(query)
+
+    error = captured.value
+    exposed = f"{error!s} {error!r} {error.args!r} {error.diagnostic!r}"
+    assert error.__cause__ is error.__context__ is None
+    assert transport_secret not in exposed
+    assert sleeper_secret not in exposed
+    assert counted.snapshot_call_count() == 1
+    assert sleeper_calls == [0.5]
 
 
 @pytest.mark.parametrize("status", [400, 404, 422])
