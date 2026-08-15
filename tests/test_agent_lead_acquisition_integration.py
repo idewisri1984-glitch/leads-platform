@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from sqlalchemy import func, select
 
 from app.core.database.session import SessionLocal
+from app.modules.agent.contact_plan_contract import build_contact_plan_proposals
+from app.modules.agent.contact_plan_handoff import build_agent_contact_plan_handoff_token
 from app.modules.agent.lead_acquisition import LeadAcquisitionInput
 from app.modules.company.models import Company
 from app.modules.company_enrichment.models import CompanyEnrichment, EnrichmentStatus
+from app.modules.company_enrichment.schemas import (
+    CompanyEnrichmentProviderResult,
+    CompanyEnrichmentTarget,
+)
 from app.modules.contact.models import Contact
+from app.modules.contact_discovery.models import (
+    CompanyContactDiscoveryState,
+    ContactDiscoveryCandidate,
+    ContactDiscoveryCandidateStatus,
+    ContactDiscoverySourceType,
+    ContactDiscoveryStatus,
+)
 from app.modules.email_delivery.manual_models import ManualEmailSendRecord
 from app.modules.email_delivery.models import EmailDeliveryAttempt
 from app.modules.email_draft.fake_provider import FakeEmailDraftGenerator
@@ -108,11 +122,87 @@ def _seed_additional_company(project_id: int) -> int:
         return company.id
 
 
+class _EnrichmentProvider:
+    provider_name = "stage6a-test"
+
+    def __init__(self, *, email: str | None, source_url: str | None = None) -> None:
+        self.email = email
+        self.source_url = source_url
+        self.calls: list[CompanyEnrichmentTarget] = []
+
+    def enrich(self, target: CompanyEnrichmentTarget) -> CompanyEnrichmentProviderResult:
+        self.calls.append(target)
+        return CompanyEnrichmentProviderResult(
+            provider=self.provider_name,
+            email=self.email,
+            source_url=self.source_url,
+        )
+
+
+def _seed_email_less_candidate(company_id: int, *, goal: str) -> tuple[int, str]:
+    checked_at = datetime(2026, 8, 15, 12, tzinfo=UTC)
+    with SessionLocal() as session:
+        company = session.get(Company, company_id)
+        assert company is not None
+        state = CompanyContactDiscoveryState(
+            company_id=company_id,
+            provider="website",
+            discovery_status=ContactDiscoveryStatus.SUCCEEDED,
+            checked_at=checked_at,
+            last_error=None,
+        )
+        candidate = ContactDiscoveryCandidate(
+            company_id=company_id,
+            name="Ada Meyer",
+            title="Founder",
+            email=None,
+            normalized_email=None,
+            phone=None,
+            source_url="https://studio.example/team",
+            source_type=ContactDiscoverySourceType.TEAM_PAGE,
+            confidence=80,
+            discovery_status=ContactDiscoveryCandidateStatus.DISCOVERED,
+            deduplication_key="profile:ada-meyer-founder",
+        )
+        session.add_all((state, candidate))
+        session.flush()
+        proposals = build_contact_plan_proposals(
+            company_name=company.name,
+            candidate_name=candidate.name,
+            candidate_title=candidate.title,
+            goal=goal,
+        )
+        token = build_agent_contact_plan_handoff_token(
+            project_id=company.project_id,
+            company_id=company.id,
+            company_name=company.name,
+            company_website=company.website,
+            goal=goal,
+            provider_name=state.provider,
+            discovery_checked_at=state.checked_at,
+            candidate_id=candidate.id,
+            candidate_deduplication_key=candidate.deduplication_key,
+            candidate_name=candidate.name,
+            candidate_title=candidate.title,
+            candidate_email=None,
+            candidate_phone=None,
+            candidate_source_url=candidate.source_url,
+            candidate_source_type=ContactDiscoverySourceType.TEAM_PAGE,
+            candidate_confidence=0.8,
+            proposed_lead_title=proposals.lead_title,
+            proposed_task_title=proposals.task_title,
+            proposed_task_description=proposals.task_description,
+        )
+        session.commit()
+        return candidate.id, token
+
+
 def _install_boundaries(
     monkeypatch,
     *,
     company_id: int,
     person: tuple[int, int, int] | None = None,
+    email_less_candidate: tuple[int, str] | None = None,
 ) -> None:
     monkeypatch.setattr(
         "app.modules.agent.execution.execute_company_plan",
@@ -132,7 +222,16 @@ def _install_boundaries(
             company_reused=True,
         ),
     )
-    if person is None:
+    if email_less_candidate is not None:
+        candidate_id, token = email_less_candidate
+        contact_result = SimpleNamespace(
+            selected_candidate_id=candidate_id,
+            selected_contact_email=None,
+            handoff_token=token,
+            provider_call_count=0,
+            decision=SimpleNamespace(value="SELECT"),
+        )
+    elif person is None:
         contact_result = SimpleNamespace(
             selected_candidate_id=None,
             selected_contact_email=None,
@@ -169,7 +268,15 @@ def _install_boundaries(
     )
 
 
-def _run(project_id: int, generator_factory, *, limit: int = 1) -> object:
+def _run(
+    project_id: int,
+    generator_factory,
+    *,
+    limit: int = 1,
+    enrichment_provider: _EnrichmentProvider | None = None,
+    contact_provider_factory=lambda: object(),
+) -> object:
+    provider = enrichment_provider or _EnrichmentProvider(email=None)
     return execute_lead_acquisition(
         LeadAcquisitionInput(
             project_id=project_id,
@@ -180,7 +287,8 @@ def _run(project_id: int, generator_factory, *, limit: int = 1) -> object:
         session_factory=SessionLocal,
         decision_factory_factory=lambda: object(),
         serpapi_client_factory=lambda **kwargs: object(),
-        contact_provider_factory=lambda: object(),
+        contact_provider_factory=contact_provider_factory,
+        company_enrichment_provider_factory=lambda: provider,
         email_generator_factory=generator_factory,
     )
 
@@ -253,11 +361,87 @@ def test_no_email_persists_no_draft_or_delivery_state(monkeypatch) -> None:
     project_id, company_id = _seed_company(company_email=None)
     _install_boundaries(monkeypatch, company_id=company_id)
 
-    result = _run(project_id, FakeEmailDraftGenerator)
+    provider = _EnrichmentProvider(email=None)
+    result = _run(project_id, FakeEmailDraftGenerator, enrichment_provider=provider)
 
     assert result.completed_count == 0
     assert result.no_email_count == result.attempt_budget
     assert _counts() == (0, 0, 0, 0, 0, 0)
+    assert len(provider.calls) == 1
+
+
+def test_missing_enrichment_recovers_official_company_email_once(monkeypatch) -> None:
+    project_id, company_id = _seed_company(company_email=None)
+    _install_boundaries(monkeypatch, company_id=company_id)
+    provider = _EnrichmentProvider(
+        email="hello@studio.example",
+        source_url="https://studio.example/contact",
+    )
+
+    result = _run(project_id, FakeEmailDraftGenerator, enrichment_provider=provider)
+
+    assert result.completed_count == 1
+    assert result.company_scoped_count == 1
+    assert len(provider.calls) == 1
+    with SessionLocal() as session:
+        enrichment = session.scalar(
+            select(CompanyEnrichment).where(CompanyEnrichment.company_id == company_id)
+        )
+        draft = session.get(EmailDraft, result.completed_draft_ids[0])
+        assert enrichment is not None
+        assert enrichment.email == "hello@studio.example"
+        assert enrichment.source_url == "https://studio.example/contact"
+        assert draft is not None and draft.contact_id is None
+        assert draft.recipient_email == "hello@studio.example"
+
+
+def test_email_less_contact_persists_once_and_company_email_remains_company_scoped(
+    monkeypatch,
+) -> None:
+    project_id, company_id = _seed_company(company_email=None)
+    goal = "Find relevant interior design firms"
+    candidate = _seed_email_less_candidate(company_id, goal=goal)
+    _install_boundaries(
+        monkeypatch,
+        company_id=company_id,
+        email_less_candidate=candidate,
+    )
+    provider = _EnrichmentProvider(
+        email="info@studio.example",
+        source_url="https://studio.example/contact",
+    )
+
+    result = _run(project_id, FakeEmailDraftGenerator, enrichment_provider=provider)
+
+    assert result.completed_count == 1
+    assert result.company_scoped_count == 1
+    assert (result.contacts_created, result.contacts_reused) == (1, 0)
+    assert len(provider.calls) == 1
+    with SessionLocal() as session:
+        contacts = list(session.scalars(select(Contact).where(Contact.company_id == company_id)))
+        draft = session.get(EmailDraft, result.completed_draft_ids[0])
+        assert len(contacts) == 1 and contacts[0].email is None
+        assert draft is not None and draft.contact_id is None
+        assert draft.recipient_email == "info@studio.example"
+
+
+def test_email_less_contact_is_idempotent_when_company_email_is_not_found(monkeypatch) -> None:
+    project_id, company_id = _seed_company(company_email=None)
+    goal = "Find relevant interior design firms"
+    candidate = _seed_email_less_candidate(company_id, goal=goal)
+    _install_boundaries(
+        monkeypatch,
+        company_id=company_id,
+        email_less_candidate=candidate,
+    )
+    provider = _EnrichmentProvider(email=None)
+
+    result = _run(project_id, FakeEmailDraftGenerator, enrichment_provider=provider)
+
+    assert result.completed_count == 0
+    assert (result.contacts_created, result.contacts_reused) == (1, result.attempt_budget - 1)
+    assert len(provider.calls) == 1
+    assert _counts() == (1, 1, 1, 0, 0, 0)
 
 
 class _FailingGenerator:

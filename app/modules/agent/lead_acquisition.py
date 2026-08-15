@@ -320,6 +320,7 @@ class LeadAcquisitionDependencies:
         Callable[[int, int, str, int, tuple[str, ...]], CompanyPlanOutcome] | None
     ) = None
     company_already_complete: Callable[[int, int], bool] | None = None
+    company_enrich: Callable[[int], object] | None = None
 
 
 @dataclass(slots=True)
@@ -470,7 +471,6 @@ class LeadAcquisitionService:
             selected_email = _usable_email(contact_plan.selected_email)
             if (
                 contact_plan.selected_candidate_id is not None
-                and selected_email is not None
                 and contact_plan.handoff_token is not None
             ):
                 try:
@@ -484,7 +484,7 @@ class LeadAcquisitionService:
                 except LeadAcquisitionContactUnavailableError:
                     contact = None
 
-            if contact is not None and selected_email is not None:
+            if contact is not None:
                 _require_exclusive(contact.contact_created, contact.contact_reused)
                 _require_exclusive(contact.lead_created, contact.lead_reused)
                 _require_exclusive(contact.task_created, contact.task_reused)
@@ -494,19 +494,24 @@ class LeadAcquisitionService:
                 state.leads_reused += int(contact.lead_reused)
                 state.tasks_created += int(contact.task_created)
                 state.tasks_reused += int(contact.task_reused)
-                self._complete_draft(
-                    data,
-                    state,
-                    company.company_id,
-                    contact.contact_id,
-                    contact.lead_id,
-                    contact.task_id,
-                    selected_email,
-                )
-                continue
+                if selected_email is not None:
+                    self._complete_draft(
+                        data,
+                        state,
+                        company.company_id,
+                        contact.contact_id,
+                        contact.lead_id,
+                        contact.task_id,
+                        selected_email,
+                    )
+                    continue
+            else:
+                state.no_contact_count += 1
 
-            state.no_contact_count += 1
             company_email = _usable_email(self._dependencies.company_email(company.company_id))
+            if company_email is None and self._dependencies.company_enrich is not None:
+                self._dependencies.company_enrich(company.company_id)
+                company_email = _usable_email(self._dependencies.company_email(company.company_id))
             if company_email is None:
                 state.no_email_count += 1
                 continue

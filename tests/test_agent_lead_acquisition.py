@@ -35,6 +35,7 @@ class Scenario:
     completed: dict[int, DraftOutcome] = field(default_factory=dict)
     draft_failures: set[int] = field(default_factory=set)
     company_emails: dict[int, str | None] = field(default_factory=dict)
+    recoverable_company_emails: dict[int, str] = field(default_factory=dict)
     index: int = 0
 
     def dependencies(self) -> LeadAcquisitionDependencies:
@@ -47,6 +48,7 @@ class Scenario:
             company_complete=self.company_complete,
             draft_generate=self.draft_generate,
             export_crm=self.export_crm,
+            company_enrich=self.company_enrich,
         )
 
     @property
@@ -79,6 +81,7 @@ class Scenario:
             "company_conflict",
             "no_email",
             "contact_no_email",
+            "recover_company_email",
             "draft_failure",
         }:
             email = "broken" if self.mode == "contact_no_email" else None
@@ -106,7 +109,17 @@ class Scenario:
         self.calls.append(("company_email", company))
         if company in self.company_emails:
             return self.company_emails[company]
-        return None if self.mode == "no_email" else f"office{company}@studio.test"
+        return (
+            None
+            if self.mode in {"no_email", "recover_company_email"}
+            else f"office{company}@studio.test"
+        )
+
+    def company_enrich(self, company: int) -> None:
+        self.calls.append(("company_enrich", company))
+        recovered = self.recoverable_company_emails.get(company)
+        if recovered is not None:
+            self.company_emails[company] = recovered
 
     def company_complete(
         self, _project: int, company: int, _email: str
@@ -136,7 +149,11 @@ class Scenario:
         self.calls.append(("draft_generate", company))
         if self.mode == "draft_failure" or company in self.draft_failures:
             raise LeadAcquisitionDraftFailure("failed")
-        email = f"person{company}@studio.test" if contact else f"office{company}@studio.test"
+        email = (
+            f"person{company}@studio.test"
+            if contact
+            else self.company_emails.get(company, f"office{company}@studio.test")
+        )
         created = self.mode not in {"duplicate", "person_reused", "company_reused"}
         created = created and company not in self.completed
         outcome = DraftOutcome(
@@ -214,7 +231,7 @@ def test_mixed_batch_has_exact_counters_and_recipient_paths() -> None:
     assert (result.person_scoped_count, result.company_scoped_count) == (2, 2)
     assert result.duplicates_skipped == 1
     assert result.no_selection_count == 1
-    assert result.no_contact_count == 4
+    assert result.no_contact_count == 0
     assert result.no_email_count == 1
     assert result.draft_failure_count == 1
     assert result.attempt_count == 8
@@ -232,12 +249,13 @@ def test_contact_email_wins_and_contact_apply_runs_once() -> None:
 
 
 @pytest.mark.parametrize("mode", ["company", "contact_no_email"])
-def test_company_fallback_never_applies_contact(mode: str) -> None:
+def test_company_fallback_persists_selected_contact_without_email(mode: str) -> None:
     scenario = Scenario([mode])
     result = acquire(scenario, 1)
     assert result.company_scoped_count == 1
     assert result.completed_contact_ids == ()
-    assert "contact_apply" not in [name for name, _ in scenario.calls]
+    assert [name for name, _ in scenario.calls].count("contact_apply") == 1
+    assert result.contacts_created == 1
     assert [name for name, _ in scenario.calls].count("company_complete") == 1
 
 
@@ -247,6 +265,30 @@ def test_no_email_never_generates_draft() -> None:
     assert result.completed_count == 0
     assert result.no_email_count == result.attempt_budget
     assert "draft_generate" not in [name for name, _ in scenario.calls]
+    assert result.contacts_created == result.attempt_budget
+    assert result.no_contact_count == 0
+
+
+def test_company_enrichment_runs_once_before_final_no_email() -> None:
+    scenario = Scenario(["no_email"])
+
+    result = acquire(scenario, 1)
+
+    assert result.completed_count == 0
+    enrich_calls = [value for name, value in scenario.calls if name == "company_enrich"]
+    assert enrich_calls == list(range(1, result.attempt_budget + 1))
+
+
+def test_company_enrichment_recovers_trusted_email_before_company_completion() -> None:
+    scenario = Scenario(["recover_company_email"])
+    scenario.recoverable_company_emails[1] = "hello@studio.test"
+
+    result = acquire(scenario, 1)
+
+    assert result.completed_count == 1
+    assert result.company_scoped_count == 1
+    assert [name for name, _ in scenario.calls].count("company_enrich") == 1
+    assert [name for name, _ in scenario.calls].count("company_complete") == 1
 
 
 def test_restart_skips_complete_target_and_continues_to_new_target() -> None:
@@ -405,9 +447,9 @@ def test_mixed_created_and_reused_entity_counters_are_exact() -> None:
     result = acquire(scenario, 2)
 
     assert (result.companies_created, result.companies_reused) == (2, 1)
-    assert (result.contacts_created, result.contacts_reused) == (1, 1)
-    assert (result.leads_created, result.leads_reused) == (2, 1)
-    assert (result.tasks_created, result.tasks_reused) == (2, 1)
+    assert (result.contacts_created, result.contacts_reused) == (2, 1)
+    assert (result.leads_created, result.leads_reused) == (3, 1)
+    assert (result.tasks_created, result.tasks_reused) == (3, 1)
     assert (result.drafts_created, result.drafts_reused) == (2, 1)
     assert len(result.completed_task_ids) == 2
 
