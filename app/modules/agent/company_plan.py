@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, cast
@@ -19,6 +21,7 @@ from app.modules.company_discovery.staging_orchestration import (
 )
 from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
 from app.modules.company_discovery.staging_service_schemas import (
+    CompanyDiscoveryStagingCandidatePreview,
     CompanyDiscoveryStagingRunResult,
 )
 from app.modules.search_profile.schemas import SearchProfileRead, SearchProfileRunOptions
@@ -183,12 +186,28 @@ class SelectionBoundary(Protocol):
         max_candidates: int = 5,
     ) -> AgentCompanySelectionInput: ...
 
+    def prepare_for_recovery(
+        self,
+        *,
+        project_id: int,
+        run_id: int,
+        goal: str,
+        max_candidates: int = 5,
+        candidate_evidence: tuple[CompanyDiscoveryStagingCandidatePreview, ...] = (),
+    ) -> AgentCompanySelectionInput: ...
+
     def revalidate_selection_input(
         self,
         selection: AgentCompanySelectionInput,
     ) -> AgentCompanySelectionInput: ...
 
     def resolve_selected_candidate_id(
+        self,
+        selection: AgentCompanySelectionInput,
+        decision: OpenAIDecisionResult,
+    ) -> int | None: ...
+
+    def resolve_selected_existing_company_id(
         self,
         selection: AgentCompanySelectionInput,
         decision: OpenAIDecisionResult,
@@ -263,6 +282,7 @@ class AgentCompanyPlanService:
             max_queries=1,
             result_limit_per_query=5,
             total_result_ceiling=5,
+            query_template_offset=data.query_template_offset,
         )
         before_calls = self._telemetry_count()
         bounded_staging = self._run_staging(profile, options)
@@ -314,12 +334,21 @@ class AgentCompanyPlanService:
 
         selection_error: AgentCompanyPlanSelectionError | None = None
         try:
-            raw_selection = self.selection.prepare(
-                project_id=data.project_id,
-                run_id=staging.run_id,
-                goal=data.goal,
-                max_candidates=5,
-            )
+            if data.include_promoted_candidates:
+                raw_selection = self.selection.prepare_for_recovery(
+                    project_id=data.project_id,
+                    run_id=staging.run_id,
+                    goal=data.goal,
+                    max_candidates=5,
+                    candidate_evidence=tuple(staging.candidates),
+                )
+            else:
+                raw_selection = self.selection.prepare(
+                    project_id=data.project_id,
+                    run_id=staging.run_id,
+                    goal=data.goal,
+                    max_candidates=5,
+                )
         except AgentCompanySelectionNoCandidatesError:
             return self._no_decision(data, staging, query, provider_call_count)
         except AgentCompanySelectionError:
@@ -341,6 +370,31 @@ class AgentCompanyPlanService:
         if not 1 <= eligible_count <= 5:
             raise AgentCompanyPlanSelectionError(_SELECTION_FAILED)
 
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                validated_selection.request.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        candidate_ids = tuple(binding.candidate_id for binding in validated_selection.bindings)
+        candidate_domains = tuple(
+            candidate.website or "" for candidate in validated_selection.request.candidates
+        )
+        if request_fingerprint in data.excluded_decision_fingerprints:
+            return self._no_decision(
+                data,
+                staging,
+                query,
+                provider_call_count,
+                eligible_count=eligible_count,
+                request_fingerprint=request_fingerprint,
+                decision_suppressed=True,
+                candidate_ids=candidate_ids,
+                candidate_domains=candidate_domains,
+            )
+
         decision_boundary = _translated_call(
             self.decision_factory,
             AgentCompanyPlanDecisionError,
@@ -361,6 +415,11 @@ class AgentCompanyPlanService:
             selected_id = self.selection.resolve_selected_candidate_id(
                 validated_selection, decision
             )
+            selected_existing_company_id = (
+                self.selection.resolve_selected_existing_company_id(validated_selection, decision)
+                if data.include_promoted_candidates
+                else None
+            )
         except (AgentCompanySelectionConsistencyError, AgentCompanySelectionError):
             binding_error = AgentCompanyPlanBindingError(_BINDING_FAILED)
         if binding_error is not None:
@@ -374,6 +433,10 @@ class AgentCompanyPlanService:
                 eligible_count,
                 decision,
                 selected_id,
+                selected_existing_company_id,
+                request_fingerprint,
+                candidate_ids,
+                candidate_domains,
             ),
             AgentCompanyPlanBindingError,
             _BINDING_FAILED,
@@ -476,15 +539,21 @@ class AgentCompanyPlanService:
         staging: CompanyDiscoveryStagingRunResult,
         query: str,
         provider_call_count: int,
+        *,
+        eligible_count: int = 0,
+        request_fingerprint: str | None = None,
+        decision_suppressed: bool = False,
+        candidate_ids: tuple[int, ...] = (),
+        candidate_domains: tuple[str, ...] = (),
     ) -> AgentCompanyPlanResult:
-        return AgentCompanyPlanResult(
+        result = AgentCompanyPlanResult(
             project_id=data.project_id,
             search_profile_id=data.search_profile_id,
             discovery_run_id=cast(int, staging.run_id),
             query=query,
             discovery_run_status=staging.status,
             staged_candidate_count=staging.candidate_upserts,
-            eligible_candidate_count=0,
+            eligible_candidate_count=eligible_count,
             decision=None,
             selected_candidate_id=None,
             selected_candidate_index=None,
@@ -499,6 +568,14 @@ class AgentCompanyPlanService:
             crm_mutated=False,
             candidate_promoted=False,
         )
+        return AgentCompanyPlanService._with_acquisition_metadata(
+            result,
+            request_fingerprint=request_fingerprint,
+            decision_suppressed=decision_suppressed,
+            selected_existing_company_id=None,
+            candidate_ids=candidate_ids,
+            candidate_domains=candidate_domains,
+        )
 
     @staticmethod
     def _decision_result(
@@ -509,8 +586,12 @@ class AgentCompanyPlanService:
         eligible_count: int,
         decision: OpenAIDecisionResult,
         selected_id: int | None,
+        selected_existing_company_id: int | None,
+        request_fingerprint: str,
+        candidate_ids: tuple[int, ...],
+        candidate_domains: tuple[str, ...],
     ) -> AgentCompanyPlanResult:
-        return AgentCompanyPlanResult(
+        result = AgentCompanyPlanResult(
             project_id=data.project_id,
             search_profile_id=data.search_profile_id,
             discovery_run_id=cast(int, staging.run_id),
@@ -532,6 +613,39 @@ class AgentCompanyPlanService:
             crm_mutated=False,
             candidate_promoted=False,
         )
+        return AgentCompanyPlanService._with_acquisition_metadata(
+            result,
+            request_fingerprint=request_fingerprint,
+            decision_suppressed=False,
+            selected_existing_company_id=selected_existing_company_id,
+            candidate_ids=candidate_ids,
+            candidate_domains=candidate_domains,
+        )
+
+    @staticmethod
+    def _with_acquisition_metadata(
+        result: AgentCompanyPlanResult,
+        *,
+        request_fingerprint: str | None,
+        decision_suppressed: bool,
+        selected_existing_company_id: int | None,
+        candidate_ids: tuple[int, ...],
+        candidate_domains: tuple[str, ...],
+    ) -> AgentCompanyPlanResult:
+        object.__setattr__(
+            result,
+            "_decision_request_fingerprint",
+            request_fingerprint,
+        )
+        object.__setattr__(result, "_decision_suppressed", decision_suppressed)
+        object.__setattr__(
+            result,
+            "_selected_existing_company_id",
+            selected_existing_company_id,
+        )
+        object.__setattr__(result, "_eligible_candidate_ids", candidate_ids)
+        object.__setattr__(result, "_eligible_candidate_domains", candidate_domains)
+        return result
 
 
 __all__ = [

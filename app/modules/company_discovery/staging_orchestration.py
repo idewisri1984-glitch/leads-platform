@@ -805,6 +805,10 @@ class CompanyDiscoveryStagingService:
             country_code=row.normalized.country_code,
             best_position=row.best_position,
             identity_key=row.normalized.identity_key,
+            city=row.draft.city,
+            industry=row.draft.industry,
+            snippet=row.draft.snippet,
+            website_summary=row.draft.website_summary,
         )
 
     def _build_result(

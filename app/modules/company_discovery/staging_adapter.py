@@ -47,6 +47,9 @@ def adapt_item_to_candidate_draft(
             website=item.website,
             country_code=query.country_code,
             position=_safe_position(item.source_row_number),
+            city=item.city,
+            industry=item.industry,
+            snippet=item.notes,
         )
     except ValidationError:
         raise CompanyDiscoveryStagingAdapterError(_SAFE_ADAPTER_ERROR_MESSAGE) from None
