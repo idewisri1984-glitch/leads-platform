@@ -188,9 +188,18 @@ def test_real_cli_export_is_read_only_and_preserves_hillary_semantics(tmp_path: 
     assert row[headers["Outreach Status"] - 1].value == "MANUALLY_SENT"
     assert row[headers["Company Email"] - 1].value == "info@simonwallacedesign.com"
     assert row[headers["Decision Maker Email"] - 1].value == "hillary@example.com"
-    assert row[headers["Recommended Recipient Type"] - 1].value == "DECISION_MAKER"
+    assert row[headers["Recipient Type"] - 1].value == "PERSON"
+    assert row[headers["Recipient Email"] - 1].value == "hillary@example.com"
+    assert row[headers["Outreach Readiness"] - 1].value == "SENT"
+    assert row[headers["Email Source"] - 1].value == "MANUAL_VERIFIED"
+    assert row[headers["Due At"] - 1].value is None
     assert row[headers["Email Subject"] - 1].value == "Persisted subject"
     assert row[headers["Email Text"] - 1].value == "Persisted approved body"
+    outreach_headers = {cell.value: cell.column for cell in workbook["Outreach"][1]}
+    outreach_row = workbook["Outreach"][2]
+    assert outreach_row[outreach_headers["Recipient Type"] - 1].value == "PERSON"
+    assert outreach_row[outreach_headers["Recipient Email"] - 1].value == "hillary@example.com"
+    assert outreach_row[outreach_headers["Contact"] - 1].value == "Hillary Wallace"
     assert workbook["Tasks"].max_row == 3
 
 

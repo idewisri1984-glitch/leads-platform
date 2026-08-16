@@ -98,7 +98,7 @@ class ExcelOutreach:
     draft_id: int
     project_id: int
     company: str
-    contact: str
+    contact: str | None
     recipient_email: str
     subject: str
     draft_status: str
@@ -112,6 +112,7 @@ class ExcelOutreach:
     approved_at: datetime | None
     reviewed_at: datetime | None
     email_body: str
+    recipient_type: str = "PERSON"
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,7 +357,7 @@ class CRMExcelExportService:
                     draft.id,
                     draft.project_id,
                     company_by_id[draft.company_id].name,
-                    draft.recipient_name,
+                    draft.recipient_name if draft.contact_id is not None else None,
                     draft.recipient_email,
                     draft.subject,
                     draft.status,
@@ -370,6 +371,7 @@ class CRMExcelExportService:
                     draft.approved_at,
                     draft.reviewed_at,
                     draft.text_body,
+                    "PERSON" if draft.contact_id is not None else "COMPANY",
                 )
             )
 
@@ -525,83 +527,91 @@ class CRMExcelExportService:
             _SheetData(
                 "Sales Leads",
                 (
-                    "Project ID",
-                    "Company ID",
                     "Company Name",
+                    "Website",
+                    "Recipient Email",
+                    "Recipient Type",
+                    "Decision Maker Name",
+                    "Decision Maker Role",
+                    "Decision Maker Email",
+                    "Lead Status",
+                    "Outreach Readiness",
+                    "Current Task",
+                    "Task Status",
+                    "Due At",
+                    "Draft Status",
+                    "Outreach Status",
+                    "Email Subject",
+                    "Last Sent At",
+                    "Email Source",
+                    "Company Phone",
+                    "Company LinkedIn",
+                    "Instagram",
+                    "Company Email",
+                    "Decision Maker Phone",
+                    "Decision Maker LinkedIn",
+                    "Decision Maker Source",
                     "Industry",
                     "Country",
                     "City",
-                    "Website",
-                    "Company Email",
-                    "Company Phone",
-                    "Instagram",
                     "Facebook",
-                    "Company LinkedIn",
                     "Contact Page",
                     "About Page",
                     "Enrichment Status",
                     "Enrichment Source",
-                    "Decision Maker Contact ID",
-                    "Decision Maker Name",
-                    "Decision Maker Role",
-                    "Decision Maker Email",
-                    "Decision Maker Phone",
-                    "Decision Maker LinkedIn",
-                    "Decision Maker Source",
-                    "Lead ID",
-                    "Lead Status",
-                    "Current Task ID",
-                    "Current Task",
-                    "Task Status",
-                    "Draft ID",
-                    "Draft Status",
-                    "Outreach Status",
-                    "Last Sent At",
-                    "Recommended Recipient Type",
-                    "Recommended Recipient",
-                    "Email Subject",
-                    "Email Text",
                     "Notes",
+                    "Project ID",
+                    "Company ID",
+                    "Decision Maker Contact ID",
+                    "Lead ID",
+                    "Current Task ID",
+                    "Draft ID",
+                    "Email Text",
                 ),
                 tuple(
                     (
-                        item.project_id,
-                        item.company_id,
                         item.company_name,
+                        item.website,
+                        item.recommended_recipient,
+                        self._recipient_type(item),
+                        item.decision_maker_name,
+                        item.decision_maker_role,
+                        item.decision_maker_email,
+                        item.lead_status,
+                        self._outreach_readiness(item),
+                        item.current_task,
+                        item.task_status,
+                        dataset.task_due_dates.get(item.current_task_id)
+                        if item.current_task_id is not None
+                        else None,
+                        item.draft_status,
+                        item.outreach_status,
+                        item.email_subject,
+                        item.last_sent_at,
+                        self._email_source(item),
+                        item.company_phone,
+                        item.company_linkedin_url,
+                        item.instagram_url,
+                        item.company_email,
+                        item.decision_maker_phone,
+                        item.decision_maker_linkedin_url,
+                        item.decision_maker_source,
                         item.industry,
                         item.country,
                         item.city,
-                        item.website,
-                        item.company_email,
-                        item.company_phone,
-                        item.instagram_url,
                         item.facebook_url,
-                        item.company_linkedin_url,
                         item.contact_page_url,
                         item.about_page_url,
                         item.enrichment_status,
                         item.enrichment_source,
-                        item.decision_maker_contact_id,
-                        item.decision_maker_name,
-                        item.decision_maker_role,
-                        item.decision_maker_email,
-                        item.decision_maker_phone,
-                        item.decision_maker_linkedin_url,
-                        item.decision_maker_source,
-                        item.lead_id,
-                        item.lead_status,
-                        item.current_task_id,
-                        item.current_task,
-                        item.task_status,
-                        item.draft_id,
-                        item.draft_status,
-                        item.outreach_status,
-                        item.last_sent_at,
-                        item.recommended_recipient_type,
-                        item.recommended_recipient,
-                        item.email_subject,
-                        item.email_text,
                         item.notes,
+                        item.project_id,
+                        item.company_id,
+                        item.decision_maker_contact_id,
+                        item.lead_id,
+                        item.current_task_id,
+                        item.draft_id,
+                        item.email_text,
                     )
                     for item in dataset.sales_leads
                 ),
@@ -729,18 +739,19 @@ class CRMExcelExportService:
             _SheetData(
                 "Outreach",
                 (
-                    "Draft ID",
-                    "Project ID",
                     "Company",
-                    "Contact",
+                    "Recipient Type",
                     "Recipient Email",
+                    "Contact",
                     "Subject",
                     "Email Body",
                     "Draft Status",
-                    "Draft Task ID",
-                    "Delivery Mode",
                     "Outreach Status",
                     "Manual Sent At",
+                    "Draft ID",
+                    "Project ID",
+                    "Draft Task ID",
+                    "Delivery Mode",
                     "Automatic Outcome",
                     "Automatic Accepted At",
                     "Generated At",
@@ -749,18 +760,19 @@ class CRMExcelExportService:
                 ),
                 tuple(
                     (
-                        item.draft_id,
-                        item.project_id,
                         item.company,
-                        item.contact,
+                        item.recipient_type,
                         item.recipient_email,
+                        item.contact if item.recipient_type == "PERSON" else None,
                         item.subject,
                         item.email_body,
                         item.draft_status,
-                        item.draft_task_id,
-                        item.delivery_mode,
                         item.outreach_status,
                         item.manual_sent_at,
+                        item.draft_id,
+                        item.project_id,
+                        item.draft_task_id,
+                        item.delivery_mode,
                         item.automatic_outcome,
                         item.automatic_accepted_at,
                         item.generated_at,
@@ -772,6 +784,34 @@ class CRMExcelExportService:
                 "OutreachTable",
             ),
         )
+
+    @staticmethod
+    def _recipient_type(item: ExcelSalesLead) -> str | None:
+        if item.recommended_recipient_type == "DECISION_MAKER":
+            return "PERSON"
+        if item.recommended_recipient_type == "COMPANY":
+            return "COMPANY"
+        return None
+
+    @staticmethod
+    def _outreach_readiness(item: ExcelSalesLead) -> str:
+        if item.outreach_status in {"MANUALLY_SENT", "AUTOMATIC_ACCEPTED"}:
+            return "SENT"
+        if item.recommended_recipient is None:
+            return "MISSING_RECIPIENT"
+        if item.draft_id is None:
+            return "MISSING_DRAFT"
+        if item.draft_status == "DRAFT":
+            return "READY_FOR_REVIEW"
+        return "INCOMPLETE"
+
+    @staticmethod
+    def _email_source(item: ExcelSalesLead) -> str | None:
+        if item.recommended_recipient_type == "DECISION_MAKER":
+            return item.decision_maker_source
+        if item.recommended_recipient_type == "COMPANY":
+            return "Company enrichment"
+        return None
 
     @staticmethod
     def _contact_name(contact: ExcelContact | None) -> str | None:
