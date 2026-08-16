@@ -130,6 +130,8 @@ if TYPE_CHECKING:
     )
     from app.modules.agent.lead_acquisition import (
         LeadAcquisitionError,
+        LeadAcquisitionExecutionError,
+        LeadAcquisitionFailureStage,
         LeadAcquisitionInput,
         LeadAcquisitionResult,
     )
@@ -164,6 +166,8 @@ def _load_lead_acquisition_dependencies() -> None:
     namespace = globals()
     for name in (
         "LeadAcquisitionError",
+        "LeadAcquisitionExecutionError",
+        "LeadAcquisitionFailureStage",
         "LeadAcquisitionInput",
         "LeadAcquisitionResult",
     ):
@@ -276,16 +280,40 @@ def acquire_leads(
             export_file=None if export_excel is None else Path(export_excel),
             overwrite_export=overwrite_export,
         )
-        rendered = render_agent_lead_acquisition(execute_agent_lead_acquisition(data), output)
-    except (ValidationError, ValueError) as error:
-        if isinstance(error, LeadAcquisitionError):
-            typer.echo(str(error), err=True)
-            raise typer.Exit(1) from None
+    except (ValidationError, ValueError):
         typer.echo(_ACQUIRE_INVALID, err=True)
         raise typer.Exit(2) from None
+
+    runtime_error: LeadAcquisitionExecutionError | None = None
+    try:
+        result = execute_agent_lead_acquisition(data)
+    except LeadAcquisitionExecutionError as error:
+        runtime_error = error
+    except LeadAcquisitionError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(1) from None
+    except ValueError:
+        runtime_error = LeadAcquisitionExecutionError(LeadAcquisitionFailureStage.UNKNOWN_RUNTIME)
     except Exception:
         typer.echo(_ACQUIRE_INTERNAL, err=True)
         raise typer.Exit(1) from None
+    if runtime_error is not None:
+        typer.echo(str(runtime_error), err=True)
+        raise typer.Exit(1)
+
+    runtime_error = None
+    try:
+        rendered = render_agent_lead_acquisition(result, output)
+    except (ValidationError, ValueError):
+        runtime_error = LeadAcquisitionExecutionError(
+            LeadAcquisitionFailureStage.RESULT_SERIALIZATION
+        )
+    except Exception:
+        typer.echo(_ACQUIRE_INTERNAL, err=True)
+        raise typer.Exit(1) from None
+    if runtime_error is not None:
+        typer.echo(str(runtime_error), err=True)
+        raise typer.Exit(1)
     typer.echo(rendered)
 
 

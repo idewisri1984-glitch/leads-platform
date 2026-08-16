@@ -21,6 +21,8 @@ from app.modules.agent.lead_acquisition import (
     LeadAcquisitionContactUnavailableError,
     LeadAcquisitionDependencies,
     LeadAcquisitionDraftFailure,
+    LeadAcquisitionExecutionError,
+    LeadAcquisitionFailureStage,
     LeadAcquisitionInput,
     LeadAcquisitionProviderStopError,
     LeadAcquisitionService,
@@ -289,6 +291,50 @@ def test_company_enrichment_recovers_trusted_email_before_company_completion() -
     assert result.company_scoped_count == 1
     assert [name for name, _ in scenario.calls].count("company_enrich") == 1
     assert [name for name, _ in scenario.calls].count("company_complete") == 1
+
+
+@pytest.mark.parametrize(
+    ("dependency", "mode", "stage"),
+    [
+        ("company_plan", "person", LeadAcquisitionFailureStage.COMPANY_DISCOVERY),
+        ("company_apply", "person", LeadAcquisitionFailureStage.COMPANY_APPLY),
+        ("contact_plan", "person", LeadAcquisitionFailureStage.CONTACT_DISCOVERY),
+        ("contact_apply", "person", LeadAcquisitionFailureStage.CONTACT_APPLY),
+        ("company_enrich", "no_email", LeadAcquisitionFailureStage.COMPANY_ENRICHMENT),
+        ("company_complete", "company", LeadAcquisitionFailureStage.OUTREACH_COMPLETION),
+        ("draft_generate", "person", LeadAcquisitionFailureStage.DRAFT_GENERATION),
+    ],
+)
+def test_nested_value_error_is_detached_and_classified_by_stage(
+    dependency: str,
+    mode: str,
+    stage: LeadAcquisitionFailureStage,
+) -> None:
+    sentinel = "SECRET_RUNTIME_VALUE api_key=abc"
+    scenario = Scenario([mode])
+
+    def fail(*_args, **_kwargs):
+        raise ValueError(sentinel)
+
+    dependencies = replace(scenario.dependencies(), **{dependency: fail})
+    with pytest.raises(LeadAcquisitionExecutionError) as captured:
+        LeadAcquisitionService(dependencies).acquire(
+            LeadAcquisitionInput(
+                project_id=1,
+                search_profile_id=1,
+                limit=1,
+                goal="Find design firms",
+            )
+        )
+
+    error = captured.value
+    assert error.category == "execution_error"
+    assert error.failure_stage is stage
+    assert sentinel not in str(error)
+    assert sentinel not in repr(error)
+    assert sentinel not in repr(error.args)
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_restart_skips_complete_target_and_continues_to_new_target() -> None:
