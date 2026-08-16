@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
 from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
 
@@ -66,6 +66,47 @@ class LeadAcquisitionContactUnavailableError(LeadAcquisitionError):
 
 class LeadAcquisitionDraftFailure(LeadAcquisitionError):
     pass
+
+
+class LeadAcquisitionFailureStage(StrEnum):
+    COMPANY_DISCOVERY = "COMPANY_DISCOVERY"
+    COMPANY_APPLY = "COMPANY_APPLY"
+    CONTACT_DISCOVERY = "CONTACT_DISCOVERY"
+    CONTACT_APPLY = "CONTACT_APPLY"
+    COMPANY_ENRICHMENT = "COMPANY_ENRICHMENT"
+    OUTREACH_COMPLETION = "OUTREACH_COMPLETION"
+    DRAFT_GENERATION = "DRAFT_GENERATION"
+    RESULT_SERIALIZATION = "RESULT_SERIALIZATION"
+    INTERNAL_INVARIANT = "INTERNAL_INVARIANT"
+    UNKNOWN_RUNTIME = "UNKNOWN_RUNTIME"
+
+
+_FAILURE_STAGE_LABELS = {
+    LeadAcquisitionFailureStage.COMPANY_DISCOVERY: "company discovery",
+    LeadAcquisitionFailureStage.COMPANY_APPLY: "company apply",
+    LeadAcquisitionFailureStage.CONTACT_DISCOVERY: "contact discovery",
+    LeadAcquisitionFailureStage.CONTACT_APPLY: "contact apply",
+    LeadAcquisitionFailureStage.COMPANY_ENRICHMENT: "company enrichment",
+    LeadAcquisitionFailureStage.OUTREACH_COMPLETION: "outreach completion",
+    LeadAcquisitionFailureStage.DRAFT_GENERATION: "draft generation",
+    LeadAcquisitionFailureStage.RESULT_SERIALIZATION: "result serialization",
+    LeadAcquisitionFailureStage.INTERNAL_INVARIANT: "an internal invariant check",
+    LeadAcquisitionFailureStage.UNKNOWN_RUNTIME: "execution",
+}
+
+
+class LeadAcquisitionExecutionError(LeadAcquisitionError):
+    category = "execution_error"
+
+    def __init__(self, failure_stage: LeadAcquisitionFailureStage) -> None:
+        self.failure_stage = failure_stage
+        super().__init__(
+            f"Agent lead acquisition failed during {_FAILURE_STAGE_LABELS[failure_stage]}."
+        )
+
+
+def _execution_error(stage: LeadAcquisitionFailureStage) -> LeadAcquisitionExecutionError:
+    return LeadAcquisitionExecutionError(stage)
 
 
 class LeadAcquisitionInput(BaseModel):
@@ -394,6 +435,7 @@ class LeadAcquisitionService:
 
         while state.completed_count < data.limit and state.attempt_count < attempt_budget:
             state.attempt_count += 1
+            runtime_error: LeadAcquisitionExecutionError | None = None
             try:
                 if self._dependencies.company_plan_attempt is None:
                     plan = self._dependencies.company_plan(
@@ -416,6 +458,10 @@ class LeadAcquisitionService:
                 state.provider_diagnostic = error.diagnostic
                 provider_stopped = True
                 break
+            except ValueError:
+                runtime_error = _execution_error(LeadAcquisitionFailureStage.COMPANY_DISCOVERY)
+            if runtime_error is not None:
+                raise runtime_error
             state.company_discovery_call_count += plan.discovery_call_count
             state.company_decision_call_count += plan.decision_call_count
             state.discovery_run_count += 1
@@ -445,6 +491,7 @@ class LeadAcquisitionService:
                     state.duplicates_skipped += 1
                     continue
             else:
+                runtime_error = None
                 try:
                     company = self._dependencies.company_apply(
                         data.project_id, plan.discovery_run_id, plan.selected_candidate_id
@@ -452,11 +499,16 @@ class LeadAcquisitionService:
                 except LeadAcquisitionCompanyUnavailableError:
                     state.no_selection_count += 1
                     continue
+                except ValueError:
+                    runtime_error = _execution_error(LeadAcquisitionFailureStage.COMPANY_APPLY)
+                if runtime_error is not None:
+                    raise runtime_error
             _require_exclusive(company.created, company.reused)
             state.companies_created += int(company.created)
             state.companies_reused += int(company.reused)
 
             contact: ContactApplyOutcome | None = None
+            runtime_error = None
             try:
                 contact_plan = self._dependencies.contact_plan(
                     data.project_id, company.company_id, data.goal
@@ -467,12 +519,17 @@ class LeadAcquisitionService:
                 state.contact_discovery_call_count += error.discovery_call_count
                 state.contact_decision_call_count += error.decision_call_count
                 contact_plan = ContactPlanOutcome(None, None, None, 0, 0)
+            except ValueError:
+                runtime_error = _execution_error(LeadAcquisitionFailureStage.CONTACT_DISCOVERY)
+            if runtime_error is not None:
+                raise runtime_error
 
             selected_email = _usable_email(contact_plan.selected_email)
             if (
                 contact_plan.selected_candidate_id is not None
                 and contact_plan.handoff_token is not None
             ):
+                runtime_error = None
                 try:
                     contact = self._dependencies.contact_apply(
                         data.project_id,
@@ -483,6 +540,10 @@ class LeadAcquisitionService:
                     )
                 except LeadAcquisitionContactUnavailableError:
                     contact = None
+                except ValueError:
+                    runtime_error = _execution_error(LeadAcquisitionFailureStage.CONTACT_APPLY)
+                if runtime_error is not None:
+                    raise runtime_error
 
             if contact is not None:
                 _require_exclusive(contact.contact_created, contact.contact_reused)
@@ -508,16 +569,30 @@ class LeadAcquisitionService:
             else:
                 state.no_contact_count += 1
 
-            company_email = _usable_email(self._dependencies.company_email(company.company_id))
-            if company_email is None and self._dependencies.company_enrich is not None:
-                self._dependencies.company_enrich(company.company_id)
+            runtime_error = None
+            try:
                 company_email = _usable_email(self._dependencies.company_email(company.company_id))
+                if company_email is None and self._dependencies.company_enrich is not None:
+                    self._dependencies.company_enrich(company.company_id)
+                    company_email = _usable_email(
+                        self._dependencies.company_email(company.company_id)
+                    )
+            except ValueError:
+                runtime_error = _execution_error(LeadAcquisitionFailureStage.COMPANY_ENRICHMENT)
+            if runtime_error is not None:
+                raise runtime_error
             if company_email is None:
                 state.no_email_count += 1
                 continue
-            completion = self._dependencies.company_complete(
-                data.project_id, company.company_id, company_email
-            )
+            runtime_error = None
+            try:
+                completion = self._dependencies.company_complete(
+                    data.project_id, company.company_id, company_email
+                )
+            except ValueError:
+                runtime_error = _execution_error(LeadAcquisitionFailureStage.OUTREACH_COMPLETION)
+            if runtime_error is not None:
+                raise runtime_error
             _require_exclusive(completion.lead_created, completion.lead_reused)
             _require_exclusive(completion.task_created, completion.task_reused)
             state.leads_created += int(completion.lead_created)
@@ -557,48 +632,55 @@ class LeadAcquisitionService:
             except Exception:
                 export_status = LeadAcquisitionExportStatus.FAILED
 
-        return LeadAcquisitionResult(
-            project_id=data.project_id,
-            search_profile_id=data.search_profile_id,
-            requested_limit=data.limit,
-            completed_count=state.completed_count,
-            person_scoped_count=state.person_scoped_count,
-            company_scoped_count=state.company_scoped_count,
-            companies_created=state.companies_created,
-            companies_reused=state.companies_reused,
-            contacts_created=state.contacts_created,
-            contacts_reused=state.contacts_reused,
-            leads_created=state.leads_created,
-            leads_reused=state.leads_reused,
-            tasks_created=state.tasks_created,
-            tasks_reused=state.tasks_reused,
-            drafts_created=state.drafts_created,
-            drafts_reused=state.drafts_reused,
-            duplicates_skipped=state.duplicates_skipped,
-            no_selection_count=state.no_selection_count,
-            no_contact_count=state.no_contact_count,
-            no_email_count=state.no_email_count,
-            draft_failure_count=state.draft_failure_count,
-            attempt_count=state.attempt_count,
-            attempt_budget=attempt_budget,
-            budget_exhausted=budget_exhausted,
-            discovery_run_count=state.discovery_run_count,
-            candidate_count=state.candidate_count,
-            completed_company_ids=tuple(state.completed_company_ids),
-            completed_contact_ids=tuple(state.completed_contact_ids),
-            completed_lead_ids=tuple(state.completed_lead_ids),
-            completed_task_ids=tuple(state.completed_task_ids),
-            completed_draft_ids=tuple(state.completed_draft_ids),
-            company_discovery_call_count=state.company_discovery_call_count,
-            company_decision_call_count=state.company_decision_call_count,
-            provider_diagnostic=state.provider_diagnostic,
-            contact_discovery_call_count=state.contact_discovery_call_count,
-            contact_decision_call_count=state.contact_decision_call_count,
-            draft_generation_call_count=state.draft_generation_call_count,
-            export_file=export_file,
-            export_status=export_status,
-            status=status,
-        )
+        runtime_error = None
+        try:
+            result = LeadAcquisitionResult(
+                project_id=data.project_id,
+                search_profile_id=data.search_profile_id,
+                requested_limit=data.limit,
+                completed_count=state.completed_count,
+                person_scoped_count=state.person_scoped_count,
+                company_scoped_count=state.company_scoped_count,
+                companies_created=state.companies_created,
+                companies_reused=state.companies_reused,
+                contacts_created=state.contacts_created,
+                contacts_reused=state.contacts_reused,
+                leads_created=state.leads_created,
+                leads_reused=state.leads_reused,
+                tasks_created=state.tasks_created,
+                tasks_reused=state.tasks_reused,
+                drafts_created=state.drafts_created,
+                drafts_reused=state.drafts_reused,
+                duplicates_skipped=state.duplicates_skipped,
+                no_selection_count=state.no_selection_count,
+                no_contact_count=state.no_contact_count,
+                no_email_count=state.no_email_count,
+                draft_failure_count=state.draft_failure_count,
+                attempt_count=state.attempt_count,
+                attempt_budget=attempt_budget,
+                budget_exhausted=budget_exhausted,
+                discovery_run_count=state.discovery_run_count,
+                candidate_count=state.candidate_count,
+                completed_company_ids=tuple(state.completed_company_ids),
+                completed_contact_ids=tuple(state.completed_contact_ids),
+                completed_lead_ids=tuple(state.completed_lead_ids),
+                completed_task_ids=tuple(state.completed_task_ids),
+                completed_draft_ids=tuple(state.completed_draft_ids),
+                company_discovery_call_count=state.company_discovery_call_count,
+                company_decision_call_count=state.company_decision_call_count,
+                provider_diagnostic=state.provider_diagnostic,
+                contact_discovery_call_count=state.contact_discovery_call_count,
+                contact_decision_call_count=state.contact_decision_call_count,
+                draft_generation_call_count=state.draft_generation_call_count,
+                export_file=export_file,
+                export_status=export_status,
+                status=status,
+            )
+        except (ValidationError, ValueError):
+            runtime_error = _execution_error(LeadAcquisitionFailureStage.RESULT_SERIALIZATION)
+        if runtime_error is not None:
+            raise runtime_error
+        return result
 
     def _complete_draft(
         self,
@@ -611,6 +693,7 @@ class LeadAcquisitionService:
         expected_email: str,
     ) -> None:
         state.draft_generation_call_count += 1
+        runtime_error: LeadAcquisitionExecutionError | None = None
         try:
             draft = self._dependencies.draft_generate(
                 data.project_id, company_id, contact_id, lead_id, task_id, data.goal
@@ -618,6 +701,10 @@ class LeadAcquisitionService:
         except LeadAcquisitionDraftFailure:
             state.draft_failure_count += 1
             return
+        except ValueError:
+            runtime_error = _execution_error(LeadAcquisitionFailureStage.DRAFT_GENERATION)
+        if runtime_error is not None:
+            raise runtime_error
         if (
             draft.status != "DRAFT"
             or draft.contact_id != contact_id
@@ -661,6 +748,8 @@ __all__ = [
     "LeadAcquisitionContactUnavailableError",
     "LeadAcquisitionDependencies",
     "LeadAcquisitionDraftFailure",
+    "LeadAcquisitionExecutionError",
+    "LeadAcquisitionFailureStage",
     "LeadAcquisitionError",
     "LeadAcquisitionExportStatus",
     "LeadAcquisitionInput",

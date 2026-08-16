@@ -7,7 +7,9 @@ from typer.testing import CliRunner
 
 from app.cli.agent import app
 from app.modules.agent.lead_acquisition import (
+    LeadAcquisitionExecutionError,
     LeadAcquisitionExportStatus,
+    LeadAcquisitionFailureStage,
     LeadAcquisitionResult,
     LeadAcquisitionStatus,
 )
@@ -144,6 +146,78 @@ def test_limit_outside_one_to_fifty_is_rejected() -> None:
         assert completed.exit_code == 2
         assert completed.stdout == ""
         assert completed.stderr == "Agent lead acquisition data is invalid.\n"
+
+
+def test_nested_executor_value_error_is_safely_classified_without_sentinel(monkeypatch) -> None:
+    sentinel = "SECRET_RUNTIME_VALUE api_key=abc"
+
+    def fail(_data) -> None:
+        raise ValueError(sentinel)
+
+    monkeypatch.setattr("app.cli.agent.execute_agent_lead_acquisition", fail)
+    completed = runner.invoke(
+        app,
+        [
+            "acquire-leads",
+            "--project-id",
+            "1",
+            "--search-profile-id",
+            "3",
+            "--limit",
+            "1",
+            "--goal",
+            "Find design firms",
+        ],
+        color=False,
+    )
+
+    assert completed.exit_code == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "Agent lead acquisition failed during execution.\n"
+    assert "data is invalid" not in completed.stderr
+    assert sentinel not in completed.output
+
+
+def test_result_serialization_value_error_is_safely_classified(monkeypatch) -> None:
+    sentinel = "SECRET_RESULT_VALUE api_key=abc"
+    monkeypatch.setattr("app.cli.agent.execute_agent_lead_acquisition", lambda _data: result())
+
+    def fail(_result, _output) -> str:
+        raise ValueError(sentinel)
+
+    monkeypatch.setattr("app.cli.agent.render_agent_lead_acquisition", fail)
+    completed = runner.invoke(
+        app,
+        [
+            "acquire-leads",
+            "--project-id",
+            "1",
+            "--search-profile-id",
+            "3",
+            "--limit",
+            "1",
+            "--goal",
+            "Find design firms",
+        ],
+        color=False,
+    )
+
+    assert completed.exit_code == 1
+    assert completed.stdout == ""
+    assert completed.stderr == "Agent lead acquisition failed during result serialization.\n"
+    assert sentinel not in completed.output
+
+
+def test_safe_runtime_error_contains_only_allowlisted_diagnostic() -> None:
+    error = LeadAcquisitionExecutionError(LeadAcquisitionFailureStage.COMPANY_ENRICHMENT)
+
+    assert error.category == "execution_error"
+    assert error.failure_stage is LeadAcquisitionFailureStage.COMPANY_ENRICHMENT
+    assert error.args == ("Agent lead acquisition failed during company enrichment.",)
+    assert "SECRET" not in str(error)
+    assert "SECRET" not in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_explicit_export_overwrite_flag_is_delegated(monkeypatch, tmp_path) -> None:
