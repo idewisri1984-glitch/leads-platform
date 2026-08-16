@@ -193,7 +193,7 @@ def test_workbook_structure_semantics_and_literal_cells(tmp_path: Path) -> None:
     assert workbook.sheetnames == ["Sales Leads", "Companies", "Contacts", "Tasks", "Outreach"]
     leads = workbook["Sales Leads"]
     assert leads.freeze_panes == "A2"
-    assert leads.auto_filter.ref == "A1:AK2"
+    assert leads.auto_filter.ref == "A1:AN2"
     assert "SalesLeadsTable" in leads.tables
     values = {
         leads.cell(1, column).value: leads.cell(2, column)
@@ -201,8 +201,28 @@ def test_workbook_structure_semantics_and_literal_cells(tmp_path: Path) -> None:
     }
     assert values["Current Task ID"].value == 3
     assert values["Draft ID"].value == 1
-    assert values["Recommended Recipient Type"].value == "DECISION_MAKER"
-    assert values["Recommended Recipient"].value == "hillary@example.com"
+    assert [cell.value for cell in leads[1]][:15] == [
+        "Company Name",
+        "Website",
+        "Recipient Email",
+        "Recipient Type",
+        "Decision Maker Name",
+        "Decision Maker Role",
+        "Decision Maker Email",
+        "Lead Status",
+        "Outreach Readiness",
+        "Current Task",
+        "Task Status",
+        "Due At",
+        "Draft Status",
+        "Outreach Status",
+        "Email Subject",
+    ]
+    assert values["Recipient Type"].value == "PERSON"
+    assert values["Recipient Email"].value == "hillary@example.com"
+    assert values["Outreach Readiness"].value == "SENT"
+    assert values["Email Source"].value == "MANUAL_VERIFIED"
+    assert values["Due At"].value.replace(tzinfo=UTC) == NOW
     assert values["Email Subject"].value == "=Subject"
     assert values["Email Subject"].data_type == "s"
     assert values["Last Sent At"].number_format == "yyyy-mm-dd hh:mm:ss"
@@ -214,9 +234,25 @@ def test_workbook_structure_semantics_and_literal_cells(tmp_path: Path) -> None:
     assert workbook["Companies"]["D2"].value == "@SUM(A1:A2)"
     assert workbook["Contacts"]["D2"].data_type == "s"
     assert workbook["Tasks"]["F3"].data_type == "s"
-    assert workbook["Outreach"]["F2"].data_type == "s"
-    assert workbook["Outreach"]["G2"].value == "[link=https://example.com]Company[/link]"
-    assert workbook["Outreach"].column_dimensions["G"].width <= 80
+    assert workbook["Outreach"]["E2"].data_type == "s"
+    assert workbook["Outreach"]["F2"].value == "[link=https://example.com]Company[/link]"
+    assert workbook["Outreach"].column_dimensions["F"].width <= 80
+    assert workbook["Outreach"]["B2"].value == "PERSON"
+    assert workbook["Outreach"]["D2"].value == "+1+1"
+    assert [cell.value for cell in leads[1]][-6:] == [
+        "Company ID",
+        "Decision Maker Contact ID",
+        "Lead ID",
+        "Current Task ID",
+        "Draft ID",
+        "Email Text",
+    ]
+    assert all(
+        cell.data_type != "f"
+        for sheet in workbook.worksheets
+        for row in sheet.iter_rows()
+        for cell in row
+    )
 
 
 def test_empty_workbook_has_headers_without_invalid_tables(tmp_path: Path) -> None:
@@ -270,6 +306,8 @@ def test_company_only_and_recipient_priority_rules() -> None:
     assert company_only.recommended_recipient == "hello@example.com"
     assert company_only.decision_maker_name is None
     assert company_only.email_subject is None and company_only.email_text is None
+    assert service._outreach_readiness(company_only) == "MISSING_DRAFT"
+    assert service._email_source(company_only) == "Company enrichment"
 
     project_manager = ExcelContact(
         1,
@@ -379,6 +417,7 @@ def test_person_without_email_falls_back_to_company_and_no_email_remains_visible
     no_email = service._build_sales_leads((no_email_company,), (), (), ())[0]
     assert no_email.recommended_recipient_type == "NO_EMAIL"
     assert no_email.recommended_recipient is None
+    assert service._outreach_readiness(no_email) == "MISSING_RECIPIENT"
 
 
 def test_principal_ranks_ahead_of_managing_principal() -> None:
@@ -631,6 +670,7 @@ def test_company_scoped_draft_preserves_its_recipient_in_sales_leads(
     outreach = replace(
         base.outreach[0],
         contact="Example Design team",
+        recipient_type="COMPANY",
         recipient_email="info@example.com",
         subject="Company introduction",
         email_body="Hello Example Design team, ...",
@@ -644,7 +684,12 @@ def test_company_scoped_draft_preserves_its_recipient_in_sales_leads(
     output = (
         CRMExcelExportService()
         ._export_dataset(
-            replace(base, sales_leads=sales_leads, leads=(person_without_lead, company_draft)),
+            replace(
+                base,
+                sales_leads=sales_leads,
+                leads=(person_without_lead, company_draft),
+                outreach=(outreach,),
+            ),
             tmp_path / "company-draft.xlsx",
         )
         .output_file
@@ -654,10 +699,17 @@ def test_company_scoped_draft_preserves_its_recipient_in_sales_leads(
     values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
     assert values["Decision Maker Name"] == "+1+1"
     assert values["Decision Maker Email"] == "hillary@example.com"
-    assert values["Recommended Recipient Type"] == "COMPANY"
-    assert values["Recommended Recipient"] == "info@example.com"
+    assert values["Recipient Type"] == "COMPANY"
+    assert values["Recipient Email"] == "info@example.com"
     assert values["Email Subject"] == "Company introduction"
     assert values["Email Text"] == "Hello Example Design team, ..."
+    outreach_sheet = load_workbook(output)["Outreach"]
+    outreach_values = {
+        cell.value: outreach_sheet.cell(2, cell.column).value for cell in outreach_sheet[1]
+    }
+    assert outreach_values["Recipient Type"] == "COMPANY"
+    assert outreach_values["Recipient Email"] == "info@example.com"
+    assert outreach_values["Contact"] is None
 
 
 @pytest.mark.parametrize("invalid_recipient", ("invalid", "   "))
@@ -682,6 +734,7 @@ def test_company_scoped_draft_with_invalid_recipient_preserves_identity(
     outreach = replace(
         base.outreach[0],
         contact="Example Design team",
+        recipient_type="COMPANY",
         recipient_email=invalid_recipient,
         subject="Company introduction",
         email_body="Hello Example Design team, ...",
@@ -711,11 +764,11 @@ def test_company_scoped_draft_with_invalid_recipient_preserves_identity(
     values = {cell.value: sheet.cell(2, cell.column).value for cell in sheet[1]}
     assert values["Decision Maker Name"] == "Hillary Example"
     assert values["Decision Maker Email"] == "hillary@example.com"
-    assert values["Recommended Recipient Type"] == "NO_EMAIL"
-    assert values["Recommended Recipient"] is None
+    assert values["Recipient Type"] is None
+    assert values["Recipient Email"] is None
     assert values["Email Subject"] == "Company introduction"
     assert values["Email Text"] == "Hello Example Design team, ..."
-    assert values["Recommended Recipient"] != "hillary@example.com"
+    assert values["Recipient Email"] != "hillary@example.com"
 
 
 def test_company_fallback_does_not_borrow_stronger_other_person_outreach(
@@ -764,6 +817,7 @@ def test_company_fallback_does_not_borrow_stronger_other_person_outreach(
         base.outreach[0],
         draft_id=3,
         contact="Example Design team",
+        recipient_type="COMPANY",
         recipient_email="info@example.com",
         subject="Company fallback subject",
         email_body="Company fallback body",
@@ -801,13 +855,13 @@ def test_company_fallback_does_not_borrow_stronger_other_person_outreach(
     assert values["Lead ID"] == 30
     assert values["Draft ID"] == 3
     assert values["Outreach Status"] == "APPROVED"
-    assert values["Recommended Recipient Type"] == "COMPANY"
-    assert values["Recommended Recipient"] == "info@example.com"
+    assert values["Recipient Type"] == "COMPANY"
+    assert values["Recipient Email"] == "info@example.com"
     assert values["Email Subject"] == "Company fallback subject"
     assert values["Email Text"] == "Company fallback body"
     assert values["Lead ID"] != 20
     assert values["Draft ID"] != 2
-    assert values["Recommended Recipient"] != "contact-b@example.com"
+    assert values["Recipient Email"] != "contact-b@example.com"
     assert values["Email Subject"] != "Other person subject"
     assert values["Email Text"] != "Other person body"
 
@@ -838,6 +892,35 @@ def test_company_scoped_lead_without_draft_keeps_person_recommendation() -> None
     assert selected.recommended_recipient == "hillary@example.com"
     assert selected.email_subject is None
     assert selected.email_text is None
+
+
+def test_ready_for_review_is_derived_without_changing_persisted_state() -> None:
+    base = dataset()
+    row = _crm_row(
+        lead_id=2,
+        task_id=3,
+        task_status="TODO",
+        draft_id=1,
+        draft_status="DRAFT",
+        outreach_status="DRAFT",
+    )
+    outreach = replace(
+        base.outreach[0],
+        draft_status="DRAFT",
+        outreach_status="DRAFT",
+        manual_sent_at=None,
+    )
+
+    selected = CRMExcelExportService()._build_sales_leads(
+        base.companies,
+        base.contacts,
+        (row,),
+        (outreach,),
+    )[0]
+
+    assert selected.draft_status == "DRAFT"
+    assert selected.outreach_status == "DRAFT"
+    assert CRMExcelExportService._outreach_readiness(selected) == "READY_FOR_REVIEW"
 
 
 @pytest.mark.parametrize(
