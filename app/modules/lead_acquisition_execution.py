@@ -49,6 +49,7 @@ def execute_lead_acquisition(
     decision_factory_factory: Callable[[], Any] = _DecisionFactory,
     serpapi_client_factory: Callable[..., Any] | None = None,
     contact_provider_factory: Callable[[], Any] | None = None,
+    company_enrichment_provider_factory: Callable[[], Any] | None = None,
     email_generator_factory: Callable[[], Any] | None = None,
 ) -> LeadAcquisitionResult:
     from sqlalchemy import select
@@ -119,6 +120,7 @@ def execute_lead_acquisition(
     from app.modules.company_discovery.staging_orchestration import CompanyDiscoveryStagingService
     from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
     from app.modules.company_enrichment.repository import CompanyEnrichmentRepository
+    from app.modules.company_enrichment.service import CompanyEnrichmentService
     from app.modules.contact.repository import ContactRepository
     from app.modules.contact_discovery.candidate_promotion import (
         ContactDiscoveryCandidatePromotionService,
@@ -156,9 +158,13 @@ def execute_lead_acquisition(
     if serpapi_client_factory is None:
         serpapi_client_factory = SerpApiClient
     if contact_provider_factory is None:
-        from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProvider
+        from app.cli.contact_discovery_runtime import build_website_contact_discovery_provider
 
-        contact_provider_factory = WebsiteContactDiscoveryProvider
+        contact_provider_factory = build_website_contact_discovery_provider
+    if company_enrichment_provider_factory is None:
+        from app.modules.company_enrichment.website_provider import WebsiteEnrichmentProvider
+
+        company_enrichment_provider_factory = WebsiteEnrichmentProvider
 
     def company_plan(
         project_id: int,
@@ -339,6 +345,21 @@ def execute_lead_acquisition(
             enrichment = CompanyEnrichmentRepository(session).get_by_company_id(company_id)
             return None if enrichment is None else enrichment.email
 
+    def company_enrich(company_id: int) -> None:
+        with session_factory() as session:
+            repository = CompanyEnrichmentRepository(session)
+            if repository.get_by_company_id(company_id) is not None:
+                return
+            company = CompanyRepository(session).get(company_id)
+            if company is None:
+                return
+            CompanyEnrichmentService(repository).enrich_company(
+                company,
+                company_enrichment_provider_factory(),
+                dry_run=False,
+            )
+            session.commit()
+
     def company_complete(project_id: int, company_id: int, email: str) -> CompanyCompletionOutcome:
         result = CompanyScopedOutreachCompletionService(session_factory=session_factory).complete(
             CompanyScopedOutreachCompletionInput(
@@ -449,6 +470,7 @@ def execute_lead_acquisition(
         export_crm=export_crm,
         company_plan_attempt=company_plan_attempt,
         company_already_complete=company_already_complete,
+        company_enrich=company_enrich,
     )
     return LeadAcquisitionService(dependencies).acquire(data)
 
