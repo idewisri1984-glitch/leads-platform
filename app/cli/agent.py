@@ -253,7 +253,7 @@ def render_agent_lead_acquisition(result: LeadAcquisitionResult, output: str) ->
 def _lead_acquisition_error_payload(
     error: LeadAcquisitionExecutionError,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "status": "ERROR",
         "error_category": error.category,
         "failure_stage": error.failure_stage.value,
@@ -262,6 +262,9 @@ def _lead_acquisition_error_payload(
         ),
         "message": str(error),
     }
+    if error.failure_reason is not None:
+        payload["failure_reason"] = error.failure_reason.value
+    return payload
 
 
 def _raise_lead_acquisition_execution_error(

@@ -20,10 +20,12 @@ from app.modules.agent import (
     AgentCompanySelectionNoCandidatesError,
 )
 from app.modules.agent.company_plan import (
+    MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY,
     AgentCompanyPlanBindingError,
     AgentCompanyPlanDecisionError,
     AgentCompanyPlanFailureSubstage,
     AgentCompanyPlanInternalError,
+    AgentCompanyPlanProviderResultValidationReason,
     AgentCompanyPlanSearchProviderError,
     AgentCompanyPlanSubstageError,
     DecisionBoundary,
@@ -631,28 +633,76 @@ def test_foreign_or_malformed_staging_is_rejected_before_commit(
     assert decision.calls == 0
 
 
+@pytest.mark.parametrize("provider_calls", [1, 2])
+def test_retry_aware_provider_telemetry_reaches_commit_and_decision(
+    provider_calls: int,
+) -> None:
+    service, staging, decision, events = make_service()
+    staging.provider_calls = provider_calls
+
+    result = service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert result.serpapi_call_count == provider_calls
+    assert events == ["commit", "prepare", "revalidate", "factory", "decide", "resolve"]
+    assert decision.calls == 1
+
+
+def test_retry_aware_provider_bound_matches_serpapi_contract() -> None:
+    from app.providers.serpapi.client import MAX_HTTP_ATTEMPTS
+
+    assert MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY == MAX_HTTP_ATTEMPTS == 2
+
+
 @pytest.mark.parametrize(
-    ("provider_calls", "bounded_query", "telemetry_query"),
+    ("provider_calls", "bounded_query", "telemetry_query", "expected_reason"),
     [
-        (0, query().text, query().text),
-        (2, query().text, query().text),
-        (1, "different query", query().text),
-        (1, query().text, "different query"),
+        (
+            0,
+            query().text,
+            query().text,
+            AgentCompanyPlanProviderResultValidationReason.PROVIDER_CALL_COUNT_OUT_OF_RANGE,
+        ),
+        (
+            3,
+            query().text,
+            query().text,
+            AgentCompanyPlanProviderResultValidationReason.PROVIDER_CALL_COUNT_OUT_OF_RANGE,
+        ),
+        (
+            4,
+            query().text,
+            query().text,
+            AgentCompanyPlanProviderResultValidationReason.PROVIDER_CALL_COUNT_OUT_OF_RANGE,
+        ),
+        (
+            1,
+            "different query",
+            query().text,
+            AgentCompanyPlanProviderResultValidationReason.QUERY_MISMATCH,
+        ),
+        (
+            1,
+            query().text,
+            "different query",
+            AgentCompanyPlanProviderResultValidationReason.QUERY_MISMATCH,
+        ),
     ],
 )
 def test_provider_telemetry_mismatch_is_rejected_before_commit(
     provider_calls: int,
     bounded_query: str,
     telemetry_query: str,
+    expected_reason: AgentCompanyPlanProviderResultValidationReason,
 ) -> None:
     service, staging, decision, events = make_service()
     staging.provider_calls = provider_calls
     staging.bounded_query = bounded_query
     staging.telemetry_query = telemetry_query
 
-    with pytest.raises(AgentCompanyPlanDiscoveryDataError):
+    with pytest.raises(AgentCompanyPlanDiscoveryDataError) as captured:
         service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
 
+    assert captured.value.reason is expected_reason
     assert events == []
     assert decision.calls == 0
 

@@ -10,6 +10,7 @@ from app.providers.openai_decision import (
 )
 
 _CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
+MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY = 2
 
 
 def _require_utf8(value: str) -> str:
@@ -169,7 +170,10 @@ class AgentCompanyPlanResult(BaseModel):
     @field_validator("serpapi_call_count", mode="before")
     @classmethod
     def validate_serpapi_calls(cls, value: object) -> object:
-        if type(value) is not int or value != 1:
+        if (
+            type(value) is not int
+            or not 1 <= value <= MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY
+        ):
             raise ValueError("SerpAPI call count is invalid.")
         return value
 

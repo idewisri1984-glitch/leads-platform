@@ -12,6 +12,7 @@ from app.modules.agent.lead_acquisition import (
     LeadAcquisitionExportStatus,
     LeadAcquisitionFailureStage,
     LeadAcquisitionFailureSubstage,
+    LeadAcquisitionProviderResultValidationReason,
     LeadAcquisitionResult,
     LeadAcquisitionStatus,
 )
@@ -180,6 +181,27 @@ def test_json_execution_error_serializes_null_substage(monkeypatch) -> None:
     payload = json.loads(completed.stdout)
     assert payload["failure_stage"] == "COMPANY_ENRICHMENT"
     assert payload["failure_substage"] is None
+
+
+def test_json_execution_error_includes_only_typed_failure_reason(monkeypatch) -> None:
+    error = LeadAcquisitionExecutionError(
+        LeadAcquisitionFailureStage.COMPANY_DISCOVERY,
+        LeadAcquisitionFailureSubstage.PROVIDER_RESULT_VALIDATION,
+        LeadAcquisitionProviderResultValidationReason.PROVIDER_CALL_COUNT_OUT_OF_RANGE,
+    )
+
+    completed = invoke_execution_error(monkeypatch, error)
+
+    assert completed.exit_code == 1
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "status": "ERROR",
+        "error_category": "execution_error",
+        "failure_stage": "COMPANY_DISCOVERY",
+        "failure_substage": "PROVIDER_RESULT_VALIDATION",
+        "failure_reason": "PROVIDER_CALL_COUNT_OUT_OF_RANGE",
+        "message": "Agent lead acquisition failed during company discovery.",
+    }
 
 
 @pytest.mark.parametrize("substage", list(LeadAcquisitionFailureSubstage))

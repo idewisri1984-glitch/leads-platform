@@ -32,7 +32,11 @@ from app.modules.search_profile.schemas import SearchProfileRead, SearchProfileR
 if TYPE_CHECKING:
     from app.providers.openai_decision import OpenAIDecisionRequest, OpenAIDecisionResult
 
-from .company_plan_schemas import AgentCompanyPlanInput, AgentCompanyPlanResult
+from .company_plan_schemas import (
+    MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY,
+    AgentCompanyPlanInput,
+    AgentCompanyPlanResult,
+)
 from .company_selection import (
     AgentCompanySelectionConsistencyError,
     AgentCompanySelectionError,
@@ -76,14 +80,26 @@ class AgentCompanyPlanFailureSubstage(StrEnum):
     UNKNOWN_COMPANY_PLAN = "UNKNOWN_COMPANY_PLAN"
 
 
+class AgentCompanyPlanProviderResultValidationReason(StrEnum):
+    PROVIDER_CALL_COUNT_OUT_OF_RANGE = "PROVIDER_CALL_COUNT_OUT_OF_RANGE"
+    QUERY_MISMATCH = "QUERY_MISMATCH"
+    PROJECT_ID_MISMATCH = "PROJECT_ID_MISMATCH"
+    SEARCH_PROFILE_ID_MISMATCH = "SEARCH_PROFILE_ID_MISMATCH"
+    QUERY_COUNT_MISMATCH = "QUERY_COUNT_MISMATCH"
+    EXECUTED_QUERY_COUNT_MISMATCH = "EXECUTED_QUERY_COUNT_MISMATCH"
+    DISCOVERY_SNAPSHOT_INVALID = "DISCOVERY_SNAPSHOT_INVALID"
+
+
 class AgentCompanyPlanSubstageError(AgentCompanyPlanError):
     def __init__(
         self,
         message: str,
         *,
         substage: AgentCompanyPlanFailureSubstage,
+        reason: AgentCompanyPlanProviderResultValidationReason | None = None,
     ) -> None:
         self.substage = substage
+        self.reason = reason
         super().__init__(message)
 
 
@@ -132,8 +148,9 @@ class AgentCompanyPlanDiscoveryDataError(AgentCompanyPlanSubstageError):
         substage: AgentCompanyPlanFailureSubstage = (
             AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION
         ),
+        reason: AgentCompanyPlanProviderResultValidationReason | None = None,
     ) -> None:
-        super().__init__(message, substage=substage)
+        super().__init__(message, substage=substage, reason=reason)
 
 
 class AgentCompanyPlanPersistenceError(AgentCompanyPlanSubstageError):
@@ -390,28 +407,49 @@ class AgentCompanyPlanService:
         bounded_staging = self._run_staging(profile, options)
         after_calls = self._telemetry_count()
         provider_call_count = after_calls - before_calls
-        try:
-            query = _strict_utf8(self.provider_telemetry.last_query())
-        except (TypeError, ValueError, UnicodeEncodeError):
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID) from None
-
         staging = self._snapshot_staging(bounded_staging)
-        try:
-            authoritative_query = _strict_utf8(bounded_staging.query)
-        except (TypeError, ValueError, UnicodeEncodeError):
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID) from None
-        if staging.status is not CompanyDiscoveryRunStatus.FAILED and (
-            provider_call_count != 1
-            or authoritative_query != query
-            or staging.project_id != data.project_id
-            or staging.search_profile_id != data.search_profile_id
-            or staging.query_count != 1
-            or staging.executed_queries != 1
-        ):
-            raise AgentCompanyPlanDiscoveryDataError(
-                _DISCOVERY_INVALID,
-                substage=AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
-            )
+        if staging.status is not CompanyDiscoveryRunStatus.FAILED:
+            invariant_reason: AgentCompanyPlanProviderResultValidationReason | None = None
+            if not 1 <= provider_call_count <= MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY:
+                invariant_reason = (
+                    AgentCompanyPlanProviderResultValidationReason.PROVIDER_CALL_COUNT_OUT_OF_RANGE
+                )
+            if invariant_reason is not None:
+                raise AgentCompanyPlanDiscoveryDataError(
+                    _DISCOVERY_INVALID,
+                    reason=invariant_reason,
+                )
+            try:
+                query = _strict_utf8(self.provider_telemetry.last_query())
+                authoritative_query = _strict_utf8(bounded_staging.query)
+            except (TypeError, ValueError, UnicodeEncodeError):
+                raise AgentCompanyPlanDiscoveryDataError(
+                    _DISCOVERY_INVALID,
+                    reason=AgentCompanyPlanProviderResultValidationReason.QUERY_MISMATCH,
+                ) from None
+            if authoritative_query != query:
+                invariant_reason = AgentCompanyPlanProviderResultValidationReason.QUERY_MISMATCH
+            elif staging.project_id != data.project_id:
+                invariant_reason = (
+                    AgentCompanyPlanProviderResultValidationReason.PROJECT_ID_MISMATCH
+                )
+            elif staging.search_profile_id != data.search_profile_id:
+                invariant_reason = (
+                    AgentCompanyPlanProviderResultValidationReason.SEARCH_PROFILE_ID_MISMATCH
+                )
+            elif staging.query_count != 1:
+                invariant_reason = (
+                    AgentCompanyPlanProviderResultValidationReason.QUERY_COUNT_MISMATCH
+                )
+            elif staging.executed_queries != 1:
+                invariant_reason = (
+                    AgentCompanyPlanProviderResultValidationReason.EXECUTED_QUERY_COUNT_MISMATCH
+                )
+            if invariant_reason is not None:
+                raise AgentCompanyPlanDiscoveryDataError(
+                    _DISCOVERY_INVALID,
+                    reason=invariant_reason,
+                )
         if not staging.run_persisted or staging.run_id is None:
             raise AgentCompanyPlanPersistenceError(_PERSISTENCE_FAILED)
 
@@ -432,6 +470,9 @@ class AgentCompanyPlanService:
                 raise AgentCompanyPlanDiscoveryDataError(
                     _DISCOVERY_INVALID,
                     substage=AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
+                    reason=(
+                        AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID
+                    ),
                 )
             if staging.error_code == "candidate_invalid":
                 raise AgentCompanyPlanDiscoveryDataError(
@@ -454,7 +495,15 @@ class AgentCompanyPlanService:
                 if staging.error_code == "candidate_invalid"
                 else AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION
             )
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID, substage=substage)
+            raise AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                substage=substage,
+                reason=(
+                    AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID
+                    if substage is AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION
+                    else None
+                ),
+            )
 
         selection_error: AgentCompanyPlanSelectionError | None = None
         try:
@@ -643,16 +692,28 @@ class AgentCompanyPlanService:
         bounded: CompanyDiscoveryBoundedPlanRunResult,
     ) -> CompanyDiscoveryStagingRunResult:
         if type(bounded) is not CompanyDiscoveryBoundedPlanRunResult:
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
+            raise AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                reason=AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID,
+            )
         raw = bounded.staging_result
         if type(raw) is not CompanyDiscoveryStagingRunResult:
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
+            raise AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                reason=AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID,
+            )
         try:
             raw_run_id = raw.run_id
         except AttributeError:
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID) from None
+            raise AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                reason=AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID,
+            ) from None
         if raw_run_id is not None and (type(raw_run_id) is not int or raw_run_id <= 0):
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
+            raise AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                reason=AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID,
+            )
         snapshot: CompanyDiscoveryStagingRunResult | None = None
         with suppress(Exception):
             snapshot = CompanyDiscoveryStagingRunResult.model_validate(raw.model_dump())
@@ -669,10 +730,16 @@ class AgentCompanyPlanService:
             raise AgentCompanyPlanDiscoveryDataError(
                 _DISCOVERY_INVALID,
                 substage=substage,
+                reason=(
+                    AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID
+                    if substage is AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION
+                    else None
+                ),
             )
         raise AgentCompanyPlanDiscoveryDataError(
             _DISCOVERY_INVALID,
             substage=AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
+            reason=AgentCompanyPlanProviderResultValidationReason.DISCOVERY_SNAPSHOT_INVALID,
         )
 
     @staticmethod
@@ -808,10 +875,12 @@ __all__ = [
     "AgentCompanyPlanInternalError",
     "AgentCompanyPlanInvalidDataError",
     "AgentCompanyPlanPersistenceError",
+    "AgentCompanyPlanProviderResultValidationReason",
     "AgentCompanyPlanProjectNotFoundError",
     "AgentCompanyPlanSearchProfileNotFoundError",
     "AgentCompanyPlanSearchProfileNotReadyError",
     "AgentCompanyPlanSearchProviderError",
     "AgentCompanyPlanSelectionError",
     "AgentCompanyPlanService",
+    "MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY",
 ]
