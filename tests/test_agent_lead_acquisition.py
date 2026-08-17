@@ -26,6 +26,7 @@ from app.modules.agent.lead_acquisition import (
     LeadAcquisitionFailureStage,
     LeadAcquisitionFailureSubstage,
     LeadAcquisitionInput,
+    LeadAcquisitionProviderResultValidationReason,
     LeadAcquisitionProviderStopError,
     LeadAcquisitionService,
     LeadAcquisitionStatus,
@@ -379,6 +380,55 @@ def test_company_plan_substage_is_allowlisted_and_detached(
     assert sentinel not in repr(error.failure_substage)
     assert error.__cause__ is None
     assert error.__context__ is None
+
+
+def test_provider_validation_reason_is_preserved_without_consuming_stage_attempt() -> None:
+    scenario = Scenario(["person"])
+    dependencies = scenario.dependencies()
+    original_company_plan = dependencies.company_plan
+
+    def retry_success(project_id: int, profile_id: int, goal: str) -> CompanyPlanOutcome:
+        outcome = original_company_plan(project_id, profile_id, goal)
+        return replace(outcome, discovery_call_count=2)
+
+    result = LeadAcquisitionService(replace(dependencies, company_plan=retry_success)).acquire(
+        LeadAcquisitionInput(
+            project_id=1,
+            search_profile_id=1,
+            limit=1,
+            goal="Find design firms",
+        )
+    )
+
+    assert result.completed_count == 1
+    assert result.attempt_count == 1
+    assert result.company_discovery_call_count == 2
+
+
+def test_provider_validation_failure_reason_is_typed_and_detached() -> None:
+    scenario = Scenario(["person"])
+    reason = LeadAcquisitionProviderResultValidationReason.PROVIDER_CALL_COUNT_OUT_OF_RANGE
+
+    def fail(*_args, **_kwargs):
+        raise LeadAcquisitionCompanyPlanSubstageError(
+            LeadAcquisitionFailureSubstage.PROVIDER_RESULT_VALIDATION,
+            reason,
+        )
+
+    with pytest.raises(LeadAcquisitionExecutionError) as captured:
+        LeadAcquisitionService(replace(scenario.dependencies(), company_plan=fail)).acquire(
+            LeadAcquisitionInput(
+                project_id=1,
+                search_profile_id=1,
+                limit=1,
+                goal="Find design firms",
+            )
+        )
+
+    assert captured.value.failure_reason is reason
+    assert (
+        captured.value.failure_substage is LeadAcquisitionFailureSubstage.PROVIDER_RESULT_VALIDATION
+    )
 
 
 def test_restart_skips_complete_target_and_continues_to_new_target() -> None:

@@ -106,6 +106,7 @@ def execute_lead_acquisition(
         LeadAcquisitionDependencies,
         LeadAcquisitionDraftFailure,
         LeadAcquisitionFailureSubstage,
+        LeadAcquisitionProviderResultValidationReason,
         LeadAcquisitionProviderStopError,
         LeadAcquisitionService,
     )
@@ -179,6 +180,7 @@ def execute_lead_acquisition(
         include_promoted_candidates: bool = False,
     ) -> CompanyPlanOutcome:
         failure_substage: LeadAcquisitionFailureSubstage | None = None
+        failure_reason: LeadAcquisitionProviderResultValidationReason | None = None
         try:
             result = execute_company_plan(
                 AgentCompanyPlanInput(
@@ -206,6 +208,8 @@ def execute_lead_acquisition(
             )
         except AgentCompanyPlanSubstageError as error:
             failure_substage = LeadAcquisitionFailureSubstage(error.substage.value)
+            if error.reason is not None:
+                failure_reason = LeadAcquisitionProviderResultValidationReason(error.reason.value)
         except AgentCompanyPlanSearchProviderError as exc:
             if exc.substage is not None:
                 failure_substage = LeadAcquisitionFailureSubstage(exc.substage.value)
@@ -223,7 +227,7 @@ def execute_lead_acquisition(
         except AgentCompanyPlanError:
             failure_substage = LeadAcquisitionFailureSubstage.UNKNOWN_COMPANY_PLAN
         if failure_substage is not None:
-            raise LeadAcquisitionCompanyPlanSubstageError(failure_substage)
+            raise LeadAcquisitionCompanyPlanSubstageError(failure_substage, failure_reason)
         return CompanyPlanOutcome(
             discovery_run_id=result.discovery_run_id,
             candidate_count=result.staged_candidate_count,

@@ -97,9 +97,24 @@ class LeadAcquisitionFailureSubstage(StrEnum):
     UNKNOWN_COMPANY_PLAN = "UNKNOWN_COMPANY_PLAN"
 
 
+class LeadAcquisitionProviderResultValidationReason(StrEnum):
+    PROVIDER_CALL_COUNT_OUT_OF_RANGE = "PROVIDER_CALL_COUNT_OUT_OF_RANGE"
+    QUERY_MISMATCH = "QUERY_MISMATCH"
+    PROJECT_ID_MISMATCH = "PROJECT_ID_MISMATCH"
+    SEARCH_PROFILE_ID_MISMATCH = "SEARCH_PROFILE_ID_MISMATCH"
+    QUERY_COUNT_MISMATCH = "QUERY_COUNT_MISMATCH"
+    EXECUTED_QUERY_COUNT_MISMATCH = "EXECUTED_QUERY_COUNT_MISMATCH"
+    DISCOVERY_SNAPSHOT_INVALID = "DISCOVERY_SNAPSHOT_INVALID"
+
+
 class LeadAcquisitionCompanyPlanSubstageError(LeadAcquisitionError):
-    def __init__(self, substage: LeadAcquisitionFailureSubstage) -> None:
+    def __init__(
+        self,
+        substage: LeadAcquisitionFailureSubstage,
+        reason: LeadAcquisitionProviderResultValidationReason | None = None,
+    ) -> None:
         self.substage = substage
+        self.reason = reason
         super().__init__("Agent company plan failed.")
 
 
@@ -124,9 +139,11 @@ class LeadAcquisitionExecutionError(LeadAcquisitionError):
         self,
         failure_stage: LeadAcquisitionFailureStage,
         failure_substage: LeadAcquisitionFailureSubstage | None = None,
+        failure_reason: LeadAcquisitionProviderResultValidationReason | None = None,
     ) -> None:
         self.failure_stage = failure_stage
         self.failure_substage = failure_substage
+        self.failure_reason = failure_reason
         super().__init__(
             f"Agent lead acquisition failed during {_FAILURE_STAGE_LABELS[failure_stage]}."
         )
@@ -135,8 +152,9 @@ class LeadAcquisitionExecutionError(LeadAcquisitionError):
 def _execution_error(
     stage: LeadAcquisitionFailureStage,
     substage: LeadAcquisitionFailureSubstage | None = None,
+    reason: LeadAcquisitionProviderResultValidationReason | None = None,
 ) -> LeadAcquisitionExecutionError:
-    return LeadAcquisitionExecutionError(stage, substage)
+    return LeadAcquisitionExecutionError(stage, substage, reason)
 
 
 class LeadAcquisitionInput(BaseModel):
@@ -492,6 +510,7 @@ class LeadAcquisitionService:
                 runtime_error = _execution_error(
                     LeadAcquisitionFailureStage.COMPANY_DISCOVERY,
                     error.substage,
+                    error.reason,
                 )
             except ValueError:
                 runtime_error = _execution_error(
@@ -792,6 +811,7 @@ __all__ = [
     "LeadAcquisitionExportStatus",
     "LeadAcquisitionInput",
     "LeadAcquisitionProviderStopError",
+    "LeadAcquisitionProviderResultValidationReason",
     "LeadAcquisitionResult",
     "LeadAcquisitionService",
     "LeadAcquisitionStatus",
