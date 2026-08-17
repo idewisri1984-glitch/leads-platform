@@ -250,6 +250,38 @@ def render_agent_lead_acquisition(result: LeadAcquisitionResult, output: str) ->
     return "\n".join(lines)
 
 
+def _lead_acquisition_error_payload(
+    error: LeadAcquisitionExecutionError,
+) -> dict[str, object]:
+    return {
+        "status": "ERROR",
+        "error_category": error.category,
+        "failure_stage": error.failure_stage.value,
+        "failure_substage": (
+            error.failure_substage.value if error.failure_substage is not None else None
+        ),
+        "message": str(error),
+    }
+
+
+def _raise_lead_acquisition_execution_error(
+    error: LeadAcquisitionExecutionError,
+    output: str,
+) -> Never:
+    if output == "json":
+        typer.echo(
+            json.dumps(
+                _lead_acquisition_error_payload(error),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(str(error), err=True)
+    raise typer.Exit(1)
+
+
 @app.command("acquire-leads", cls=_AcquireLeadsCommand)
 def acquire_leads(
     project_id: Annotated[str, typer.Option("--project-id", metavar="INTEGER")],
@@ -298,8 +330,7 @@ def acquire_leads(
         typer.echo(_ACQUIRE_INTERNAL, err=True)
         raise typer.Exit(1) from None
     if runtime_error is not None:
-        typer.echo(str(runtime_error), err=True)
-        raise typer.Exit(1)
+        _raise_lead_acquisition_execution_error(runtime_error, output)
 
     runtime_error = None
     try:
@@ -312,8 +343,7 @@ def acquire_leads(
         typer.echo(_ACQUIRE_INTERNAL, err=True)
         raise typer.Exit(1) from None
     if runtime_error is not None:
-        typer.echo(str(runtime_error), err=True)
-        raise typer.Exit(1)
+        _raise_lead_acquisition_execution_error(runtime_error, output)
     typer.echo(rendered)
 
 
