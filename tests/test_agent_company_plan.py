@@ -20,6 +20,12 @@ from app.modules.agent import (
     AgentCompanySelectionNoCandidatesError,
 )
 from app.modules.agent.company_plan import (
+    AgentCompanyPlanBindingError,
+    AgentCompanyPlanDecisionError,
+    AgentCompanyPlanFailureSubstage,
+    AgentCompanyPlanInternalError,
+    AgentCompanyPlanSearchProviderError,
+    AgentCompanyPlanSubstageError,
     DecisionBoundary,
     DiscoveryCommitter,
     ProjectLookup,
@@ -29,10 +35,15 @@ from app.modules.agent.company_plan import (
     StagingOrchestrator,
 )
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
+from app.modules.company_discovery.profile_execution import (
+    SearchProfileDiscoveryExecutionError,
+)
 from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
 from app.modules.company_discovery.staging_orchestration import (
     CompanyDiscoveryBoundedPlanRunResult,
+    CompanyDiscoveryStagingFailureSubstage,
     CompanyDiscoveryStagingServiceError,
+    CompanyDiscoveryStagingSubstageError,
 )
 from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
 from app.modules.company_discovery.staging_service_schemas import (
@@ -458,6 +469,93 @@ def test_non_single_query_is_rejected_before_staging(query_count: int) -> None:
     assert staging.telemetry.calls == 0
 
 
+@pytest.mark.parametrize(
+    ("staging_substage", "expected"),
+    [
+        (
+            CompanyDiscoveryStagingFailureSubstage.QUERY_GENERATION,
+            AgentCompanyPlanFailureSubstage.QUERY_GENERATION,
+        ),
+        (
+            CompanyDiscoveryStagingFailureSubstage.DISCOVERY_REQUEST_BUILD,
+            AgentCompanyPlanFailureSubstage.DISCOVERY_REQUEST_BUILD,
+        ),
+        (
+            CompanyDiscoveryStagingFailureSubstage.RESULT_NORMALIZATION,
+            AgentCompanyPlanFailureSubstage.RESULT_NORMALIZATION,
+        ),
+        (
+            CompanyDiscoveryStagingFailureSubstage.DISCOVERY_PERSISTENCE,
+            AgentCompanyPlanFailureSubstage.DISCOVERY_PERSISTENCE,
+        ),
+    ],
+)
+def test_staging_substage_is_preserved_without_raw_error(
+    staging_substage: CompanyDiscoveryStagingFailureSubstage,
+    expected: AgentCompanyPlanFailureSubstage,
+) -> None:
+    service, staging, decision, _ = make_service()
+
+    def fail(**_kwargs):
+        raise CompanyDiscoveryStagingSubstageError(staging_substage)
+
+    staging.run_bounded_plan = fail
+    with pytest.raises(AgentCompanyPlanSubstageError) as captured:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert captured.value.substage is expected
+    assert "SECRET" not in repr(captured.value.args)
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert decision.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected"),
+    [
+        ("execution_failed", AgentCompanyPlanFailureSubstage.PROVIDER_EXECUTION),
+        (
+            "execution_invalid",
+            AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
+        ),
+        ("candidate_invalid", AgentCompanyPlanFailureSubstage.RESULT_NORMALIZATION),
+    ],
+)
+def test_failed_staging_result_has_exact_substage(
+    error_code: str,
+    expected: AgentCompanyPlanFailureSubstage,
+) -> None:
+    service, staging, decision, _ = make_service()
+    original = staging_result()
+    values = {
+        field: getattr(original, field) for field in CompanyDiscoveryStagingRunResult.model_fields
+    }
+    values.update(status=CompanyDiscoveryRunStatus.FAILED, error_code=error_code)
+    staging.value = CompanyDiscoveryStagingRunResult.model_construct(**values)
+
+    with pytest.raises(AgentCompanyPlanSubstageError) as captured:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert captured.value.substage is expected
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert decision.calls == 0
+
+
+def test_typed_discovery_execution_error_remains_provider_error() -> None:
+    service, staging, decision, _ = make_service()
+
+    def fail(**_kwargs):
+        raise SearchProfileDiscoveryExecutionError("SECRET_PROVIDER_VALUE")
+
+    staging.run_bounded_plan = fail
+    with pytest.raises(AgentCompanyPlanSearchProviderError) as captured:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert captured.value.substage is None
+    assert "SECRET_PROVIDER_VALUE" not in repr(captured.value)
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert decision.calls == 0
+
+
 def test_select_orders_commit_prepare_decide_resolve_and_binds_id() -> None:
     service, staging, decision, events = make_service()
     result = service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
@@ -707,3 +805,86 @@ def test_identical_acquisition_request_is_suppressed_before_second_decision_call
     assert repeated.decision_suppressed is True
     assert repeated.openai_call_count == 0
     assert repeated.decision is None
+
+
+def _raise_secret_value_error(*_args, **_kwargs):
+    raise ValueError("SECRET_COMPANY_PLAN_VALUE api_key=abc123")
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected", "error_type"),
+    [
+        (
+            "decision",
+            AgentCompanyPlanFailureSubstage.COMPANY_DECISION,
+            AgentCompanyPlanSubstageError,
+        ),
+        (
+            "decision_result",
+            AgentCompanyPlanFailureSubstage.DECISION_RESULT_VALIDATION,
+            AgentCompanyPlanSubstageError,
+        ),
+        (
+            "candidate_binding",
+            AgentCompanyPlanFailureSubstage.CANDIDATE_BINDING,
+            AgentCompanyPlanBindingError,
+        ),
+        (
+            "plan_result",
+            AgentCompanyPlanFailureSubstage.COMPANY_PLAN_RESULT_BUILD,
+            AgentCompanyPlanBindingError,
+        ),
+    ],
+)
+def test_runtime_value_error_has_exact_safe_plan_substage(
+    boundary: str,
+    expected: AgentCompanyPlanFailureSubstage,
+    error_type: type[AgentCompanyPlanSubstageError],
+) -> None:
+    service, _, decision, _ = make_service()
+    if boundary == "decision":
+        decision.decide = _raise_secret_value_error
+    elif boundary == "decision_result":
+        decision.value = SimpleNamespace(model_dump=_raise_secret_value_error)
+    elif boundary == "candidate_binding":
+        service.selection.resolve_selected_candidate_id = _raise_secret_value_error
+    else:
+        service._decision_result = _raise_secret_value_error
+
+    with pytest.raises(error_type) as captured:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    error = captured.value
+    assert error.substage is expected
+    assert "SECRET_COMPANY_PLAN_VALUE" not in str(error)
+    assert "SECRET_COMPANY_PLAN_VALUE" not in repr(error)
+    assert "SECRET_COMPANY_PLAN_VALUE" not in repr(error.args)
+    assert error.__cause__ is error.__context__ is None
+
+
+def test_typed_decision_error_remains_distinct_from_generic_substage() -> None:
+    service, _, decision, _ = make_service()
+
+    def fail(*_args, **_kwargs):
+        raise AgentCompanyPlanDecisionError("Company decision provider failed.")
+
+    decision.decide = fail
+    with pytest.raises(AgentCompanyPlanDecisionError) as captured:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert not isinstance(captured.value, AgentCompanyPlanSubstageError)
+    assert captured.value.args == ("Company decision provider failed.",)
+    assert captured.value.__cause__ is captured.value.__context__ is None
+
+
+def test_unknown_company_plan_value_error_uses_finite_fallback() -> None:
+    service, staging, decision, _ = make_service()
+    staging.run_bounded_plan = _raise_secret_value_error
+
+    with pytest.raises(AgentCompanyPlanInternalError) as captured:
+        service.plan(AgentCompanyPlanInput(project_id=3, search_profile_id=7, goal="goal"))
+
+    assert captured.value.substage is AgentCompanyPlanFailureSubstage.UNKNOWN_COMPANY_PLAN
+    assert "SECRET_COMPANY_PLAN_VALUE" not in repr(captured.value)
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert decision.calls == 0

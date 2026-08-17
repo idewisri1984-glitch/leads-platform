@@ -63,8 +63,10 @@ def execute_lead_acquisition(
     from app.modules.agent.company_apply_schemas import AgentCompanyApplyInput
     from app.modules.agent.company_plan import (
         AgentCompanyPlanDecisionError,
+        AgentCompanyPlanError,
         AgentCompanyPlanSearchProviderError,
         AgentCompanyPlanService,
+        AgentCompanyPlanSubstageError,
     )
     from app.modules.agent.company_plan_schemas import AgentCompanyPlanInput
     from app.modules.agent.company_selection import AgentCompanySelectionService
@@ -98,10 +100,12 @@ def execute_lead_acquisition(
         ContactApplyOutcome,
         ContactPlanOutcome,
         ExportOutcome,
+        LeadAcquisitionCompanyPlanSubstageError,
         LeadAcquisitionCompanyUnavailableError,
         LeadAcquisitionContactUnavailableError,
         LeadAcquisitionDependencies,
         LeadAcquisitionDraftFailure,
+        LeadAcquisitionFailureSubstage,
         LeadAcquisitionProviderStopError,
         LeadAcquisitionService,
     )
@@ -174,6 +178,7 @@ def execute_lead_acquisition(
         excluded_decision_fingerprints: tuple[str, ...] = (),
         include_promoted_candidates: bool = False,
     ) -> CompanyPlanOutcome:
+        failure_substage: LeadAcquisitionFailureSubstage | None = None
         try:
             result = execute_company_plan(
                 AgentCompanyPlanInput(
@@ -199,17 +204,26 @@ def execute_lead_acquisition(
                     discovery_provider=SerpApiDiscoveryProvider,
                 ),
             )
+        except AgentCompanyPlanSubstageError as error:
+            failure_substage = LeadAcquisitionFailureSubstage(error.substage.value)
         except AgentCompanyPlanSearchProviderError as exc:
-            raise LeadAcquisitionProviderStopError(
-                "Lead acquisition provider stopped.",
-                discovery_call_count=exc.discovery_call_count,
-                decision_call_count=exc.decision_call_count,
-                discovery_run_count=exc.discovery_run_count,
-                candidate_count=exc.candidate_count,
-                diagnostic=exc.diagnostic,
-            ) from None
+            if exc.substage is not None:
+                failure_substage = LeadAcquisitionFailureSubstage(exc.substage.value)
+            else:
+                raise LeadAcquisitionProviderStopError(
+                    "Lead acquisition provider stopped.",
+                    discovery_call_count=exc.discovery_call_count,
+                    decision_call_count=exc.decision_call_count,
+                    discovery_run_count=exc.discovery_run_count,
+                    candidate_count=exc.candidate_count,
+                    diagnostic=exc.diagnostic,
+                ) from None
         except AgentCompanyPlanDecisionError:
             raise LeadAcquisitionProviderStopError("Lead acquisition provider stopped.") from None
+        except AgentCompanyPlanError:
+            failure_substage = LeadAcquisitionFailureSubstage.UNKNOWN_COMPANY_PLAN
+        if failure_substage is not None:
+            raise LeadAcquisitionCompanyPlanSubstageError(failure_substage)
         return CompanyPlanOutcome(
             discovery_run_id=result.discovery_run_id,
             candidate_count=result.staged_candidate_count,

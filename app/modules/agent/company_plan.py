@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, cast
 
 from pydantic import ConfigDict
@@ -18,6 +20,7 @@ from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
 from app.modules.company_discovery.staging_orchestration import (
     CompanyDiscoveryBoundedPlanRunResult,
     CompanyDiscoveryStagingServiceError,
+    CompanyDiscoveryStagingSubstageError,
 )
 from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
 from app.modules.company_discovery.staging_service_schemas import (
@@ -57,6 +60,33 @@ class AgentCompanyPlanError(ValueError):
     pass
 
 
+class AgentCompanyPlanFailureSubstage(StrEnum):
+    QUERY_GENERATION = "QUERY_GENERATION"
+    DISCOVERY_REQUEST_BUILD = "DISCOVERY_REQUEST_BUILD"
+    PROVIDER_CONSTRUCTION = "PROVIDER_CONSTRUCTION"
+    PROVIDER_EXECUTION = "PROVIDER_EXECUTION"
+    PROVIDER_RESULT_VALIDATION = "PROVIDER_RESULT_VALIDATION"
+    RESULT_NORMALIZATION = "RESULT_NORMALIZATION"
+    DISCOVERY_PERSISTENCE = "DISCOVERY_PERSISTENCE"
+    CANDIDATE_BINDING = "CANDIDATE_BINDING"
+    COMPANY_DECISION = "COMPANY_DECISION"
+    DECISION_RESULT_VALIDATION = "DECISION_RESULT_VALIDATION"
+    SELECTION_BINDING = "SELECTION_BINDING"
+    COMPANY_PLAN_RESULT_BUILD = "COMPANY_PLAN_RESULT_BUILD"
+    UNKNOWN_COMPANY_PLAN = "UNKNOWN_COMPANY_PLAN"
+
+
+class AgentCompanyPlanSubstageError(AgentCompanyPlanError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        substage: AgentCompanyPlanFailureSubstage,
+    ) -> None:
+        self.substage = substage
+        super().__init__(message)
+
+
 class AgentCompanyPlanInvalidDataError(AgentCompanyPlanError):
     pass
 
@@ -83,6 +113,7 @@ class AgentCompanyPlanSearchProviderError(AgentCompanyPlanError):
         discovery_run_count: int = 0,
         candidate_count: int = 0,
         diagnostic: DiscoveryProviderDiagnostic | None = None,
+        substage: AgentCompanyPlanFailureSubstage | None = None,
     ) -> None:
         super().__init__(message)
         self.discovery_call_count = discovery_call_count
@@ -90,30 +121,53 @@ class AgentCompanyPlanSearchProviderError(AgentCompanyPlanError):
         self.discovery_run_count = discovery_run_count
         self.candidate_count = candidate_count
         self.diagnostic = diagnostic
+        self.substage = substage
 
 
-class AgentCompanyPlanDiscoveryDataError(AgentCompanyPlanError):
-    pass
+class AgentCompanyPlanDiscoveryDataError(AgentCompanyPlanSubstageError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        substage: AgentCompanyPlanFailureSubstage = (
+            AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION
+        ),
+    ) -> None:
+        super().__init__(message, substage=substage)
 
 
-class AgentCompanyPlanPersistenceError(AgentCompanyPlanError):
-    pass
+class AgentCompanyPlanPersistenceError(AgentCompanyPlanSubstageError):
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            substage=AgentCompanyPlanFailureSubstage.DISCOVERY_PERSISTENCE,
+        )
 
 
-class AgentCompanyPlanSelectionError(AgentCompanyPlanError):
-    pass
+class AgentCompanyPlanSelectionError(AgentCompanyPlanSubstageError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, substage=AgentCompanyPlanFailureSubstage.SELECTION_BINDING)
 
 
 class AgentCompanyPlanDecisionError(AgentCompanyPlanError):
     pass
 
 
-class AgentCompanyPlanBindingError(AgentCompanyPlanError):
-    pass
+class AgentCompanyPlanBindingError(AgentCompanyPlanSubstageError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        substage: AgentCompanyPlanFailureSubstage = (
+            AgentCompanyPlanFailureSubstage.CANDIDATE_BINDING
+        ),
+    ) -> None:
+        super().__init__(message, substage=substage)
 
 
-class AgentCompanyPlanInternalError(AgentCompanyPlanError):
-    pass
+class AgentCompanyPlanInternalError(AgentCompanyPlanSubstageError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, substage=AgentCompanyPlanFailureSubstage.UNKNOWN_COMPANY_PLAN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +190,54 @@ def _translated_call[T](
         value = operation()
     except Exception:
         translated = error_type(message)
+    if translated is not None:
+        raise translated
+    return cast(T, value)
+
+
+def _substage_call[T](
+    operation: Callable[[], T],
+    substage: AgentCompanyPlanFailureSubstage,
+    error_type: type[AgentCompanyPlanSubstageError] = AgentCompanyPlanSubstageError,
+    message: str = _INTERNAL_FAILED,
+) -> T:
+    failed = False
+    value: T | None = None
+    try:
+        value = operation()
+    except Exception:
+        failed = True
+    if failed:
+        if error_type is AgentCompanyPlanSubstageError:
+            raise AgentCompanyPlanSubstageError(message, substage=substage)
+        if error_type is AgentCompanyPlanDiscoveryDataError:
+            raise AgentCompanyPlanDiscoveryDataError(message, substage=substage)
+        if error_type is AgentCompanyPlanBindingError:
+            raise AgentCompanyPlanBindingError(message, substage=substage)
+        if error_type is AgentCompanyPlanPersistenceError:
+            raise AgentCompanyPlanPersistenceError(message)
+        if error_type is AgentCompanyPlanSelectionError:
+            raise AgentCompanyPlanSelectionError(message)
+        if error_type is AgentCompanyPlanInternalError:
+            raise AgentCompanyPlanInternalError(message)
+        raise AgentCompanyPlanSubstageError(message, substage=substage)
+    return cast(T, value)
+
+
+def _decision_call[T](
+    operation: Callable[[], T],
+    substage: AgentCompanyPlanFailureSubstage,
+) -> T:
+    translated: AgentCompanyPlanError | None = None
+    value: T | None = None
+    try:
+        value = operation()
+    except AgentCompanyPlanDecisionError:
+        translated = AgentCompanyPlanDecisionError(_DECISION_FAILED)
+    except ValueError:
+        translated = AgentCompanyPlanSubstageError(_DECISION_FAILED, substage=substage)
+    except Exception:
+        translated = AgentCompanyPlanDecisionError(_DECISION_FAILED)
     if translated is not None:
         raise translated
     return cast(T, value)
@@ -298,7 +400,7 @@ class AgentCompanyPlanService:
             authoritative_query = _strict_utf8(bounded_staging.query)
         except (TypeError, ValueError, UnicodeEncodeError):
             raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID) from None
-        if (
+        if staging.status is not CompanyDiscoveryRunStatus.FAILED and (
             provider_call_count != 1
             or authoritative_query != query
             or staging.project_id != data.project_id
@@ -306,19 +408,36 @@ class AgentCompanyPlanService:
             or staging.query_count != 1
             or staging.executed_queries != 1
         ):
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
+            raise AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                substage=AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
+            )
         if not staging.run_persisted or staging.run_id is None:
             raise AgentCompanyPlanPersistenceError(_PERSISTENCE_FAILED)
 
-        _translated_call(
+        _substage_call(
             self.committer.commit_discovery,
+            AgentCompanyPlanFailureSubstage.DISCOVERY_PERSISTENCE,
             AgentCompanyPlanPersistenceError,
             _PERSISTENCE_FAILED,
         )
 
         if staging.status is CompanyDiscoveryRunStatus.FAILED:
-            if staging.error_code in _DISCOVERY_DATA_ERROR_CODES:
-                raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
+            if staging.error_code == "execution_failed":
+                raise AgentCompanyPlanDiscoveryDataError(
+                    _DISCOVERY_INVALID,
+                    substage=AgentCompanyPlanFailureSubstage.PROVIDER_EXECUTION,
+                )
+            if staging.error_code == "execution_invalid":
+                raise AgentCompanyPlanDiscoveryDataError(
+                    _DISCOVERY_INVALID,
+                    substage=AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
+                )
+            if staging.error_code == "candidate_invalid":
+                raise AgentCompanyPlanDiscoveryDataError(
+                    _DISCOVERY_INVALID,
+                    substage=AgentCompanyPlanFailureSubstage.RESULT_NORMALIZATION,
+                )
             raise AgentCompanyPlanSearchProviderError(
                 _PROVIDER_FAILED,
                 discovery_call_count=provider_call_count,
@@ -330,7 +449,12 @@ class AgentCompanyPlanService:
             staging.status is CompanyDiscoveryRunStatus.PARTIAL
             and staging.error_code in _DISCOVERY_DATA_ERROR_CODES
         ):
-            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
+            substage = (
+                AgentCompanyPlanFailureSubstage.RESULT_NORMALIZATION
+                if staging.error_code == "candidate_invalid"
+                else AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION
+            )
+            raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID, substage=substage)
 
         selection_error: AgentCompanyPlanSelectionError | None = None
         try:
@@ -351,13 +475,14 @@ class AgentCompanyPlanService:
                 )
         except AgentCompanySelectionNoCandidatesError:
             return self._no_decision(data, staging, query, provider_call_count)
-        except AgentCompanySelectionError:
+        except (AgentCompanySelectionError, ValueError):
             selection_error = AgentCompanyPlanSelectionError(_SELECTION_FAILED)
         if selection_error is not None:
             raise selection_error
 
-        validated_selection = _translated_call(
+        validated_selection = _substage_call(
             lambda: self.selection.revalidate_selection_input(raw_selection),
+            AgentCompanyPlanFailureSubstage.SELECTION_BINDING,
             AgentCompanyPlanSelectionError,
             _SELECTION_FAILED,
         )
@@ -395,20 +520,17 @@ class AgentCompanyPlanService:
                 candidate_domains=candidate_domains,
             )
 
-        decision_boundary = _translated_call(
+        decision_boundary = _decision_call(
             self.decision_factory,
-            AgentCompanyPlanDecisionError,
-            _DECISION_FAILED,
+            AgentCompanyPlanFailureSubstage.COMPANY_DECISION,
         )
-        raw_decision = _translated_call(
+        raw_decision = _decision_call(
             lambda: decision_boundary.decide(validated_selection.request),
-            AgentCompanyPlanDecisionError,
-            _DECISION_FAILED,
+            AgentCompanyPlanFailureSubstage.COMPANY_DECISION,
         )
-        decision = _translated_call(
+        decision = _decision_call(
             lambda: OpenAIDecisionResult.model_validate(raw_decision.model_dump()),
-            AgentCompanyPlanDecisionError,
-            _DECISION_FAILED,
+            AgentCompanyPlanFailureSubstage.DECISION_RESULT_VALIDATION,
         )
         binding_error: AgentCompanyPlanBindingError | None = None
         try:
@@ -420,11 +542,11 @@ class AgentCompanyPlanService:
                 if data.include_promoted_candidates
                 else None
             )
-        except (AgentCompanySelectionConsistencyError, AgentCompanySelectionError):
+        except (AgentCompanySelectionConsistencyError, AgentCompanySelectionError, ValueError):
             binding_error = AgentCompanyPlanBindingError(_BINDING_FAILED)
         if binding_error is not None:
             raise binding_error
-        return _translated_call(
+        return _substage_call(
             lambda: self._decision_result(
                 data,
                 staging,
@@ -438,6 +560,7 @@ class AgentCompanyPlanService:
                 candidate_ids,
                 candidate_domains,
             ),
+            AgentCompanyPlanFailureSubstage.COMPANY_PLAN_RESULT_BUILD,
             AgentCompanyPlanBindingError,
             _BINDING_FAILED,
         )
@@ -457,14 +580,27 @@ class AgentCompanyPlanService:
                 dry_run=False,
                 repository=self.staging_repository,
             )
+        except CompanyDiscoveryStagingSubstageError as error:
+            substage = AgentCompanyPlanFailureSubstage(error.substage.value)
+            translated = (
+                AgentCompanyPlanPersistenceError(_PERSISTENCE_FAILED)
+                if substage is AgentCompanyPlanFailureSubstage.DISCOVERY_PERSISTENCE
+                else AgentCompanyPlanDiscoveryDataError(
+                    _DISCOVERY_INVALID,
+                    substage=substage,
+                )
+            )
         except SQLAlchemyError:
             translated = AgentCompanyPlanPersistenceError(_PERSISTENCE_FAILED)
         except CompanyDiscoveryStagingServiceError:
-            translated = AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
+            translated = AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                substage=AgentCompanyPlanFailureSubstage.DISCOVERY_REQUEST_BUILD,
+            )
         except SearchProfileDiscoveryExecutionError:
             translated = AgentCompanyPlanSearchProviderError(_PROVIDER_FAILED)
         except Exception:
-            translated = AgentCompanyPlanSearchProviderError(_PROVIDER_FAILED)
+            translated = AgentCompanyPlanInternalError(_INTERNAL_FAILED)
         if translated is not None:
             raise translated
         return cast(CompanyDiscoveryBoundedPlanRunResult, result)
@@ -517,10 +653,26 @@ class AgentCompanyPlanService:
             raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID) from None
         if raw_run_id is not None and (type(raw_run_id) is not int or raw_run_id <= 0):
             raise AgentCompanyPlanDiscoveryDataError(_DISCOVERY_INVALID)
-        return _translated_call(
-            lambda: CompanyDiscoveryStagingRunResult.model_validate(raw.model_dump()),
-            AgentCompanyPlanDiscoveryDataError,
+        snapshot: CompanyDiscoveryStagingRunResult | None = None
+        with suppress(Exception):
+            snapshot = CompanyDiscoveryStagingRunResult.model_validate(raw.model_dump())
+        if snapshot is not None:
+            return snapshot
+        failed_substages = {
+            "execution_failed": AgentCompanyPlanFailureSubstage.PROVIDER_EXECUTION,
+            "execution_invalid": AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
+            "candidate_invalid": AgentCompanyPlanFailureSubstage.RESULT_NORMALIZATION,
+        }
+        raw_error_code = raw.error_code
+        substage = failed_substages.get(raw_error_code) if raw_error_code is not None else None
+        if raw.status is CompanyDiscoveryRunStatus.FAILED and substage is not None:
+            raise AgentCompanyPlanDiscoveryDataError(
+                _DISCOVERY_INVALID,
+                substage=substage,
+            )
+        raise AgentCompanyPlanDiscoveryDataError(
             _DISCOVERY_INVALID,
+            substage=AgentCompanyPlanFailureSubstage.PROVIDER_RESULT_VALIDATION,
         )
 
     @staticmethod
