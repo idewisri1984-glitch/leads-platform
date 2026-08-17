@@ -81,6 +81,28 @@ class LeadAcquisitionFailureStage(StrEnum):
     UNKNOWN_RUNTIME = "UNKNOWN_RUNTIME"
 
 
+class LeadAcquisitionFailureSubstage(StrEnum):
+    QUERY_GENERATION = "QUERY_GENERATION"
+    DISCOVERY_REQUEST_BUILD = "DISCOVERY_REQUEST_BUILD"
+    PROVIDER_CONSTRUCTION = "PROVIDER_CONSTRUCTION"
+    PROVIDER_EXECUTION = "PROVIDER_EXECUTION"
+    PROVIDER_RESULT_VALIDATION = "PROVIDER_RESULT_VALIDATION"
+    RESULT_NORMALIZATION = "RESULT_NORMALIZATION"
+    DISCOVERY_PERSISTENCE = "DISCOVERY_PERSISTENCE"
+    CANDIDATE_BINDING = "CANDIDATE_BINDING"
+    COMPANY_DECISION = "COMPANY_DECISION"
+    DECISION_RESULT_VALIDATION = "DECISION_RESULT_VALIDATION"
+    SELECTION_BINDING = "SELECTION_BINDING"
+    COMPANY_PLAN_RESULT_BUILD = "COMPANY_PLAN_RESULT_BUILD"
+    UNKNOWN_COMPANY_PLAN = "UNKNOWN_COMPANY_PLAN"
+
+
+class LeadAcquisitionCompanyPlanSubstageError(LeadAcquisitionError):
+    def __init__(self, substage: LeadAcquisitionFailureSubstage) -> None:
+        self.substage = substage
+        super().__init__("Agent company plan failed.")
+
+
 _FAILURE_STAGE_LABELS = {
     LeadAcquisitionFailureStage.COMPANY_DISCOVERY: "company discovery",
     LeadAcquisitionFailureStage.COMPANY_APPLY: "company apply",
@@ -98,15 +120,23 @@ _FAILURE_STAGE_LABELS = {
 class LeadAcquisitionExecutionError(LeadAcquisitionError):
     category = "execution_error"
 
-    def __init__(self, failure_stage: LeadAcquisitionFailureStage) -> None:
+    def __init__(
+        self,
+        failure_stage: LeadAcquisitionFailureStage,
+        failure_substage: LeadAcquisitionFailureSubstage | None = None,
+    ) -> None:
         self.failure_stage = failure_stage
+        self.failure_substage = failure_substage
         super().__init__(
             f"Agent lead acquisition failed during {_FAILURE_STAGE_LABELS[failure_stage]}."
         )
 
 
-def _execution_error(stage: LeadAcquisitionFailureStage) -> LeadAcquisitionExecutionError:
-    return LeadAcquisitionExecutionError(stage)
+def _execution_error(
+    stage: LeadAcquisitionFailureStage,
+    substage: LeadAcquisitionFailureSubstage | None = None,
+) -> LeadAcquisitionExecutionError:
+    return LeadAcquisitionExecutionError(stage, substage)
 
 
 class LeadAcquisitionInput(BaseModel):
@@ -458,8 +488,16 @@ class LeadAcquisitionService:
                 state.provider_diagnostic = error.diagnostic
                 provider_stopped = True
                 break
+            except LeadAcquisitionCompanyPlanSubstageError as error:
+                runtime_error = _execution_error(
+                    LeadAcquisitionFailureStage.COMPANY_DISCOVERY,
+                    error.substage,
+                )
             except ValueError:
-                runtime_error = _execution_error(LeadAcquisitionFailureStage.COMPANY_DISCOVERY)
+                runtime_error = _execution_error(
+                    LeadAcquisitionFailureStage.COMPANY_DISCOVERY,
+                    LeadAcquisitionFailureSubstage.UNKNOWN_COMPANY_PLAN,
+                )
             if runtime_error is not None:
                 raise runtime_error
             state.company_discovery_call_count += plan.discovery_call_count

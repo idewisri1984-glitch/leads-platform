@@ -153,14 +153,20 @@ class _LazyDecisionFactory:
 
 
 def _provider_construction[T](operation: Callable[[], T]) -> T:
-    from app.modules.agent.company_plan import AgentCompanyPlanSearchProviderError
+    from app.modules.agent.company_plan import (
+        AgentCompanyPlanFailureSubstage,
+        AgentCompanyPlanSearchProviderError,
+    )
 
     error: AgentCompanyPlanSearchProviderError | None = None
     value: T | None = None
     try:
         value = operation()
     except Exception:
-        error = AgentCompanyPlanSearchProviderError("Company search provider failed.")
+        error = AgentCompanyPlanSearchProviderError(
+            "Company search provider failed.",
+            substage=AgentCompanyPlanFailureSubstage.PROVIDER_CONSTRUCTION,
+        )
     if error is not None:
         raise error
     return cast(T, value)

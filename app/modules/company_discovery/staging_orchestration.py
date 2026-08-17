@@ -1,7 +1,10 @@
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
+from functools import partial
+from typing import cast
 
 from app.modules.company_discovery.models import CompanyDiscoveryRun, CompanyDiscoveryRunStatus
 from app.modules.company_discovery.profile_execution import (
@@ -42,6 +45,34 @@ from app.modules.search_profile.schemas import (
 
 class CompanyDiscoveryStagingServiceError(ValueError):
     """Raised for malformed local orchestration configuration."""
+
+
+class CompanyDiscoveryStagingFailureSubstage(StrEnum):
+    QUERY_GENERATION = "QUERY_GENERATION"
+    DISCOVERY_REQUEST_BUILD = "DISCOVERY_REQUEST_BUILD"
+    RESULT_NORMALIZATION = "RESULT_NORMALIZATION"
+    DISCOVERY_PERSISTENCE = "DISCOVERY_PERSISTENCE"
+
+
+class CompanyDiscoveryStagingSubstageError(CompanyDiscoveryStagingServiceError):
+    def __init__(self, substage: CompanyDiscoveryStagingFailureSubstage) -> None:
+        self.substage = substage
+        super().__init__("Company discovery staging failed.")
+
+
+def _substage_call[T](
+    operation: Callable[[], T],
+    substage: CompanyDiscoveryStagingFailureSubstage,
+) -> T:
+    failed = False
+    value: T | None = None
+    try:
+        value = operation()
+    except ValueError:
+        failed = True
+    if failed:
+        raise CompanyDiscoveryStagingSubstageError(substage)
+    return cast(T, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,8 +144,16 @@ class CompanyDiscoveryStagingService:
         dry_run: bool,
         repository: CompanyDiscoveryStagingRepository | None = None,
     ) -> CompanyDiscoveryBoundedPlanRunResult:
-        generated_preview = self.query_generator.generate_preview(profile, options)
-        preview = SearchProfileDiscoveryService.revalidate_query_preview(profile, generated_preview)
+        generated_preview = _substage_call(
+            lambda: self.query_generator.generate_preview(profile, options),
+            CompanyDiscoveryStagingFailureSubstage.QUERY_GENERATION,
+        )
+        preview = _substage_call(
+            lambda: SearchProfileDiscoveryService.revalidate_query_preview(
+                profile, generated_preview
+            ),
+            CompanyDiscoveryStagingFailureSubstage.DISCOVERY_REQUEST_BUILD,
+        )
         if (
             preview.query_count != 1
             or preview.estimated_provider_requests != 1
@@ -156,9 +195,15 @@ class CompanyDiscoveryStagingService:
             )
 
         if precomputed_preview is None:
-            generated_preview = self.query_generator.generate_preview(profile, options)
-            preview = SearchProfileDiscoveryService.revalidate_query_preview(
-                profile, generated_preview
+            generated_preview = _substage_call(
+                lambda: self.query_generator.generate_preview(profile, options),
+                CompanyDiscoveryStagingFailureSubstage.QUERY_GENERATION,
+            )
+            preview = _substage_call(
+                lambda: SearchProfileDiscoveryService.revalidate_query_preview(
+                    profile, generated_preview
+                ),
+                CompanyDiscoveryStagingFailureSubstage.DISCOVERY_REQUEST_BUILD,
             )
         else:
             preview = precomputed_preview
@@ -356,14 +401,23 @@ class CompanyDiscoveryStagingService:
                 row_best_position = row.best_position
                 if row_best_position is not None:
                     row.draft = row.draft.model_copy(update={"position": row_best_position})
-                upsert_result = effective_repository.upsert_candidate(
-                    project_id=profile.project_id,
-                    run_id=run.id,
-                    data=candidate_create_from_adapter_payload(
+                candidate_data = _substage_call(
+                    partial(
+                        candidate_create_from_adapter_payload,
                         draft=row.draft,
                         run_id=run.id,
                         normalized=row.normalized,
                     ),
+                    CompanyDiscoveryStagingFailureSubstage.RESULT_NORMALIZATION,
+                )
+                upsert_result = _substage_call(
+                    partial(
+                        effective_repository.upsert_candidate,
+                        project_id=profile.project_id,
+                        run_id=run.id,
+                        data=candidate_data,
+                    ),
+                    CompanyDiscoveryStagingFailureSubstage.DISCOVERY_PERSISTENCE,
                 )
                 candidate_upserts += 1
                 candidates_created += 1 if upsert_result.created else 0
@@ -378,22 +432,25 @@ class CompanyDiscoveryStagingService:
             else 0
         )
 
-        effective_repository.update_run(
-            run.id,
-            CompanyDiscoveryRunUpdate(
-                run_status=status,
-                query_count=execution_result.query_count,
-                result_count=execution_result.total_provider_results,
-                candidate_count=candidate_count,
-                completed_at=completed_at,
-                error_code=error_code,
-                error_subtype=(
-                    provider_diagnostic.subtype if provider_diagnostic is not None else None
-                ),
-                error_http_status=(
-                    provider_diagnostic.http_status if provider_diagnostic is not None else None
+        _substage_call(
+            lambda: effective_repository.update_run(
+                run.id,
+                CompanyDiscoveryRunUpdate(
+                    run_status=status,
+                    query_count=execution_result.query_count,
+                    result_count=execution_result.total_provider_results,
+                    candidate_count=candidate_count,
+                    completed_at=completed_at,
+                    error_code=error_code,
+                    error_subtype=(
+                        provider_diagnostic.subtype if provider_diagnostic is not None else None
+                    ),
+                    error_http_status=(
+                        provider_diagnostic.http_status if provider_diagnostic is not None else None
+                    ),
                 ),
             ),
+            CompanyDiscoveryStagingFailureSubstage.DISCOVERY_PERSISTENCE,
         )
 
         return self._build_result(
@@ -780,18 +837,21 @@ class CompanyDiscoveryStagingService:
         ):
             raise CompanyDiscoveryStagingServiceError("Invalid orchestration error code.")
 
-        return repository.create_run(
-            CompanyDiscoveryRunCreate(
-                project_id=profile.project_id,
-                search_profile_id=profile.id,
-                provider=provider_name,
-                request_snapshot=snapshot,
-                run_status=CompanyDiscoveryRunStatus.PENDING,
-                query_count=query_count,
-                result_count=result_count,
-                candidate_count=0,
-                error_code=initial_error_code,
-            )
+        return _substage_call(
+            lambda: repository.create_run(
+                CompanyDiscoveryRunCreate(
+                    project_id=profile.project_id,
+                    search_profile_id=profile.id,
+                    provider=provider_name,
+                    request_snapshot=snapshot,
+                    run_status=CompanyDiscoveryRunStatus.PENDING,
+                    query_count=query_count,
+                    result_count=result_count,
+                    candidate_count=0,
+                    error_code=initial_error_code,
+                )
+            ),
+            CompanyDiscoveryStagingFailureSubstage.DISCOVERY_PERSISTENCE,
         )
 
     def _candidate_preview(

@@ -17,12 +17,14 @@ from app.modules.agent.lead_acquisition import (
     ContactPlanOutcome,
     DraftOutcome,
     ExportOutcome,
+    LeadAcquisitionCompanyPlanSubstageError,
     LeadAcquisitionCompanyUnavailableError,
     LeadAcquisitionContactUnavailableError,
     LeadAcquisitionDependencies,
     LeadAcquisitionDraftFailure,
     LeadAcquisitionExecutionError,
     LeadAcquisitionFailureStage,
+    LeadAcquisitionFailureSubstage,
     LeadAcquisitionInput,
     LeadAcquisitionProviderStopError,
     LeadAcquisitionService,
@@ -330,9 +332,51 @@ def test_nested_value_error_is_detached_and_classified_by_stage(
     error = captured.value
     assert error.category == "execution_error"
     assert error.failure_stage is stage
+    assert error.failure_substage is (
+        LeadAcquisitionFailureSubstage.UNKNOWN_COMPANY_PLAN
+        if dependency == "company_plan"
+        else None
+    )
     assert sentinel not in str(error)
     assert sentinel not in repr(error)
     assert sentinel not in repr(error.args)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize("substage", list(LeadAcquisitionFailureSubstage))
+def test_company_plan_substage_is_allowlisted_and_detached(
+    substage: LeadAcquisitionFailureSubstage,
+) -> None:
+    sentinel = "SECRET_COMPANY_PLAN_VALUE api_key=abc123"
+    scenario = Scenario(["person"])
+
+    def fail(*_args, **_kwargs):
+        try:
+            raise ValueError(sentinel)
+        except ValueError:
+            failure = LeadAcquisitionCompanyPlanSubstageError(substage)
+        raise failure
+
+    dependencies = replace(scenario.dependencies(), company_plan=fail)
+    with pytest.raises(LeadAcquisitionExecutionError) as captured:
+        LeadAcquisitionService(dependencies).acquire(
+            LeadAcquisitionInput(
+                project_id=1,
+                search_profile_id=1,
+                limit=1,
+                goal="Find design firms",
+            )
+        )
+
+    error = captured.value
+    assert error.failure_stage is LeadAcquisitionFailureStage.COMPANY_DISCOVERY
+    assert error.failure_substage is substage
+    assert error.args == ("Agent lead acquisition failed during company discovery.",)
+    assert sentinel not in str(error)
+    assert sentinel not in repr(error)
+    assert sentinel not in repr(error.args)
+    assert sentinel not in repr(error.failure_substage)
     assert error.__cause__ is None
     assert error.__context__ is None
 

@@ -10,6 +10,7 @@ from app.modules.agent.lead_acquisition import (
     LeadAcquisitionExecutionError,
     LeadAcquisitionExportStatus,
     LeadAcquisitionFailureStage,
+    LeadAcquisitionFailureSubstage,
     LeadAcquisitionResult,
     LeadAcquisitionStatus,
 )
@@ -209,11 +210,15 @@ def test_result_serialization_value_error_is_safely_classified(monkeypatch) -> N
 
 
 def test_safe_runtime_error_contains_only_allowlisted_diagnostic() -> None:
-    error = LeadAcquisitionExecutionError(LeadAcquisitionFailureStage.COMPANY_ENRICHMENT)
+    error = LeadAcquisitionExecutionError(
+        LeadAcquisitionFailureStage.COMPANY_DISCOVERY,
+        LeadAcquisitionFailureSubstage.PROVIDER_RESULT_VALIDATION,
+    )
 
     assert error.category == "execution_error"
-    assert error.failure_stage is LeadAcquisitionFailureStage.COMPANY_ENRICHMENT
-    assert error.args == ("Agent lead acquisition failed during company enrichment.",)
+    assert error.failure_stage is LeadAcquisitionFailureStage.COMPANY_DISCOVERY
+    assert error.failure_substage is LeadAcquisitionFailureSubstage.PROVIDER_RESULT_VALIDATION
+    assert error.args == ("Agent lead acquisition failed during company discovery.",)
     assert "SECRET" not in str(error)
     assert "SECRET" not in repr(error)
     assert error.__cause__ is None

@@ -4,6 +4,7 @@ from typing import cast
 
 import pytest
 
+import app.modules.company_discovery.staging_orchestration as staging_orchestration
 from app.modules.company_discovery.models import CompanyDiscoveryRunStatus
 from app.modules.company_discovery.profile_execution import SearchProfileDiscoveryService
 from app.modules.company_discovery.provider_interfaces import DiscoveryProvider
@@ -14,8 +15,10 @@ from app.modules.company_discovery.schemas import (
     SearchProfileDiscoveryQueryResult,
 )
 from app.modules.company_discovery.staging_orchestration import (
+    CompanyDiscoveryStagingFailureSubstage,
     CompanyDiscoveryStagingService,
     CompanyDiscoveryStagingServiceError,
+    CompanyDiscoveryStagingSubstageError,
 )
 from app.modules.company_discovery.staging_repository import CompanyDiscoveryStagingRepository
 from app.modules.company_discovery.staging_schemas import (
@@ -324,6 +327,113 @@ def test_persist_mode_keeps_valid_candidate_and_rejects_markup_sibling() -> None
     assert result.candidate_upserts == 1
     upsert_calls = [call for call in repository.calls if call[0] == "upsert_candidate"]
     assert len(upsert_calls) == 1
+
+
+def test_candidate_normalization_value_error_is_detached_before_upsert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    repository = RecordingRepository()
+    dry_result = make_dry_result(
+        [query],
+        [
+            make_query_result(
+                query,
+                items=[
+                    make_item(
+                        name="Acme",
+                        row=1,
+                        country="Germany",
+                        website="https://example.com",
+                    )
+                ],
+            )
+        ],
+    )
+
+    def fail_normalization(**_kwargs):
+        raise ValueError("SECRET_NORMALIZATION")
+
+    monkeypatch.setattr(
+        staging_orchestration,
+        "candidate_create_from_adapter_payload",
+        fail_normalization,
+    )
+    with pytest.raises(CompanyDiscoveryStagingSubstageError) as captured:
+        make_run(
+            FakeDiscoveryExecutionService(dry_result),
+            FakeQueryGenerator(preview),
+        ).run(
+            profile=make_profile(),
+            provider=FakeProvider(),
+            options=SearchProfileRunOptions(max_queries=1),
+            dry_run=False,
+            repository=cast(CompanyDiscoveryStagingRepository, repository),
+        )
+
+    assert captured.value.substage is CompanyDiscoveryStagingFailureSubstage.RESULT_NORMALIZATION
+    assert "SECRET_NORMALIZATION" not in repr(captured.value)
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert all(call[0] != "upsert_candidate" for call in repository.calls)
+
+
+def test_candidate_persistence_value_error_keeps_persistence_substage() -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    repository = RecordingRepository()
+    dry_result = make_dry_result(
+        [query],
+        [
+            make_query_result(
+                query,
+                items=[
+                    make_item(
+                        name="Acme",
+                        row=1,
+                        country="Germany",
+                        website="https://example.com",
+                    )
+                ],
+            )
+        ],
+    )
+
+    def fail_persistence(**_kwargs):
+        raise ValueError("SECRET_PERSISTENCE")
+
+    repository.upsert_candidate = fail_persistence
+    with pytest.raises(CompanyDiscoveryStagingSubstageError) as captured:
+        make_run(
+            FakeDiscoveryExecutionService(dry_result),
+            FakeQueryGenerator(preview),
+        ).run(
+            profile=make_profile(),
+            provider=FakeProvider(),
+            options=SearchProfileRunOptions(max_queries=1),
+            dry_run=False,
+            repository=cast(CompanyDiscoveryStagingRepository, repository),
+        )
+
+    assert captured.value.substage is CompanyDiscoveryStagingFailureSubstage.DISCOVERY_PERSISTENCE
+    assert "SECRET_PERSISTENCE" not in repr(captured.value)
+    assert captured.value.__cause__ is captured.value.__context__ is None
 
 
 def test_dry_run_partial_when_adapter_rejects_rows() -> None:
@@ -1289,6 +1399,65 @@ def test_bounded_plan_generates_once_and_passes_authoritative_preview() -> None:
     assert execution.precomputed_previews[0] is not preview
     assert execution.precomputed_previews[0].queries[0].text == query.text
     assert bounded.query == query.text
+
+
+def test_bounded_plan_classifies_query_generation_value_error_before_provider() -> None:
+    sentinel = "SECRET_COMPANY_PLAN_VALUE api_key=abc123"
+
+    class RaisingGenerator:
+        def generate_preview(self, *_args, **_kwargs):
+            raise ValueError(sentinel)
+
+    execution = FakeDiscoveryExecutionService(make_dry_result([], []))
+    service = make_run(execution, cast(FakeQueryGenerator, RaisingGenerator()))
+
+    with pytest.raises(CompanyDiscoveryStagingSubstageError) as captured:
+        service.run_bounded_plan(
+            profile=make_profile(),
+            provider=FakeProvider(),
+            dry_run=True,
+        )
+
+    assert captured.value.substage is CompanyDiscoveryStagingFailureSubstage.QUERY_GENERATION
+    assert sentinel not in str(captured.value)
+    assert sentinel not in repr(captured.value)
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert execution.calls == []
+
+
+def test_bounded_plan_classifies_request_revalidation_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    query = make_query(1)
+    preview = SearchQueryPreview(
+        profile_id=7,
+        profile_name="Buyer profile",
+        query_count=1,
+        estimated_provider_requests=1,
+        result_limit_per_query=10,
+        total_result_ceiling=25,
+        queries=[query],
+    )
+    execution = FakeDiscoveryExecutionService(make_dry_result([], []))
+    service = make_run(execution, FakeQueryGenerator(preview))
+    monkeypatch.setattr(
+        SearchProfileDiscoveryService,
+        "revalidate_query_preview",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("SECRET_COMPANY_PLAN_VALUE api_key=abc123")
+        ),
+    )
+
+    with pytest.raises(CompanyDiscoveryStagingSubstageError) as captured:
+        service.run_bounded_plan(
+            profile=make_profile(),
+            provider=FakeProvider(),
+            dry_run=True,
+        )
+
+    assert captured.value.substage is CompanyDiscoveryStagingFailureSubstage.DISCOVERY_REQUEST_BUILD
+    assert captured.value.__cause__ is captured.value.__context__ is None
+    assert execution.calls == []
 
 
 @pytest.mark.parametrize("query_count", [0, 2])
