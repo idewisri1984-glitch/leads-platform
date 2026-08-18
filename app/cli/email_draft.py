@@ -15,6 +15,7 @@ from typer.core import TyperCommand
 from app.cli._lazy_dependencies import SessionLocal
 from app.modules.email_delivery.manual_repository import ManualEmailSendRecordRepository
 from app.modules.email_delivery.manual_schemas import (
+    ConfirmedExternalManualEmailSendCommand,
     ConfirmedManualEmailSendCommand,
     ManualEmailCopyPackage,
     ManualEmailDraftScope,
@@ -564,6 +565,40 @@ def execute_manual_mark_sent(
         _cleanup(session.close) if failed else session.close()
 
 
+def execute_record_external_manual_send(
+    data: ConfirmedExternalManualEmailSendCommand,
+    output: str,
+    *,
+    session_factory: _SessionFactory = SessionLocal,
+) -> str:
+    session = session_factory()
+    committed = False
+    failed = False
+    try:
+        service = ManualOutreachService(
+            session,
+            ManualEmailSendRecordRepository(session),
+        )
+        rendered = render_manual_email_copy_package(
+            service.record_external_manual_send(data), output
+        )
+        try:
+            session.commit()
+            committed = True
+        except Exception:
+            raise ManualOutreachPersistenceError(
+                "Manual sent record could not be persisted."
+            ) from None
+        return rendered
+    except BaseException:
+        failed = True
+        if not committed:
+            _cleanup(session.rollback)
+        raise
+    finally:
+        _cleanup(session.close) if failed else session.close()
+
+
 def _handle_error(error: BaseException) -> Never:
     if isinstance(error, ValidationError):
         typer.echo(_INVALID, err=True)
@@ -841,11 +876,37 @@ def mark_sent(
     typer.echo(rendered)
 
 
+@app.command("record-manual-send", cls=_ManualSendCommand)
+def record_manual_send(
+    project_id: Annotated[str, typer.Option("--project-id")],
+    company_id: Annotated[str, typer.Option("--company-id")],
+    email_draft_id: Annotated[str, typer.Option("--email-draft-id")],
+    confirm: Annotated[bool, typer.Option("--confirm")] = False,
+    output: Annotated[str, typer.Option("--output")] = "text",
+) -> None:
+    if not confirm:
+        _handle_manual_error(ManualOutreachConfirmationRequiredError(_MANUAL_SEND_CONFIRMATION))
+    try:
+        rendered = execute_record_external_manual_send(
+            ConfirmedExternalManualEmailSendCommand(
+                project_id=_positive(project_id),
+                company_id=_positive(company_id),
+                email_draft_id=_positive(email_draft_id),
+                confirmed=True,
+            ),
+            _output(output),
+        )
+    except Exception as error:
+        _handle_manual_error(error)
+    typer.echo(rendered)
+
+
 __all__ = [
     "app",
     "execute_generate",
     "execute_manual_export",
     "execute_manual_mark_sent",
+    "execute_record_external_manual_send",
     "execute_review",
     "execute_send",
     "execute_show",
