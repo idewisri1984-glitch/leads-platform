@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, inspect
 _ROOT = Path(__file__).resolve().parents[1]
 _PREVIOUS_REVISION = "a41bc92d7e60"
 _REVISION = "b52cd03e8f71"
-_HEAD = "d82f4c6a91b3"
+_HEAD = "e41f7a9c2b60"
 
 
 def _alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:

@@ -50,8 +50,8 @@ class ManualEmailSendRecord(Base):
     company_id: Mapped[int] = mapped_column(
         ForeignKey("companies.id", ondelete="RESTRICT"), nullable=False, index=True
     )
-    contact_id: Mapped[int] = mapped_column(
-        ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=False, index=True
+    contact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=True, index=True
     )
     email_draft_id: Mapped[int] = mapped_column(
         ForeignKey("email_drafts.id", ondelete="RESTRICT"), nullable=False

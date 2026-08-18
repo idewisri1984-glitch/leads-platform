@@ -21,7 +21,7 @@ from app.modules.project.models import Project
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PREVIOUS_HEAD = "c71e3a9d4f20"
-_HEAD = "d82f4c6a91b3"
+_HEAD = "e41f7a9c2b60"
 
 
 def _alembic(database: Path, *arguments: str) -> None:

@@ -7,7 +7,7 @@ from pathlib import Path
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _TABLE = "contact_discovery_candidates"
 _REVISION = "8c5d6e7f8091"
-_HEAD = "d82f4c6a91b3"
+_HEAD = "e41f7a9c2b60"
 
 
 def alembic(database: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
