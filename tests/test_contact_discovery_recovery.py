@@ -22,6 +22,7 @@ from app.providers.public_web_fetcher import (
     BoundedPublicWebFetcher,
     FetchResponse,
     PublicWebFetchErrorCode,
+    PublicWebFetchFailureReason,
     PublicWebFetchResult,
     ResponseTooLargeError,
 )
@@ -70,6 +71,17 @@ class FakeSearchProvider:
 
 def failure(url: str, code: PublicWebFetchErrorCode) -> PublicWebFetchResult:
     return PublicWebFetchResult(final_url=url, error_code=code)
+
+
+def safe_failure(
+    url: str,
+    reason: PublicWebFetchFailureReason,
+) -> PublicWebFetchResult:
+    return PublicWebFetchResult(
+        final_url=url,
+        error_code=PublicWebFetchErrorCode.REQUEST_FAILED,
+        failure_reason=reason,
+    )
 
 
 def test_deep_url_failure_retries_canonical_root_once_and_recovers_candidate() -> None:
@@ -122,6 +134,29 @@ def test_fetch_failure_category_is_preserved(code: PublicWebFetchErrorCode, expe
     assert result.diagnostics[0] == expected
 
 
+def test_fetch_failure_reason_is_additive_and_stage_scoped() -> None:
+    deep = "https://example.com/about"
+    root = "https://example.com/"
+    fetcher = FakeFetcher(
+        lambda url: safe_failure(
+            url,
+            PublicWebFetchFailureReason.TLS_ERROR
+            if url == deep
+            else PublicWebFetchFailureReason.HTTP_SERVER_ERROR,
+        )
+    )
+    result = WebsiteContactDiscoveryProvider(fetcher=fetcher).discover(
+        company_id=1, website_url=deep
+    )
+    assert fetcher.calls == [deep, root]
+    assert result.diagnostics[:4] == (
+        "configured_url_request_failed",
+        "configured_url_failure_reason_tls_error",
+        "canonical_root_request_failed",
+        "canonical_root_failure_reason_http_server_error",
+    )
+
+
 def test_contact_specific_large_response_limit_is_bounded_and_larger_than_baseline() -> None:
     body = ("<html><!--" + "x" * 300_000 + "-->" + person_html() + "</html>").encode()
 
@@ -171,6 +206,7 @@ def test_response_beyond_contact_hard_limit_still_fails_without_partial_body() -
     assert result.errors == ("homepage_fetch_failed",)
     assert result.diagnostics == (
         "configured_url_response_too_large",
+        "configured_url_failure_reason_response_too_large",
         "search_fallback_unavailable",
     )
 

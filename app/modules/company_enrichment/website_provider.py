@@ -13,6 +13,7 @@ from app.providers.public_web_fetcher import (
     BoundedPublicWebFetcher,
     FetchResponse,
     PublicWebFetchErrorCode,
+    PublicWebFetchFailureReason,
     ResponseTooLargeError,
     normalize_public_web_request_url,
 )
@@ -48,6 +49,7 @@ class _FetchedPage:
     url: str | None = None
     html: str | None = None
     error: str | None = None
+    failure_reason: PublicWebFetchFailureReason | None = None
 
 
 class WebsiteEnrichmentProvider:
@@ -90,7 +92,11 @@ class WebsiteEnrichmentProvider:
 
         homepage = self._fetch(homepage_url)
         if homepage.error is not None or homepage.html is None or homepage.url is None:
-            return self._error_result(homepage.error or "Website request failed.", homepage.url)
+            return self._error_result(
+                homepage.error or "Website request failed.",
+                homepage.url,
+                homepage.failure_reason,
+            )
 
         parsed_results = [
             extract_company_enrichment_from_html(html=homepage.html, source_url=homepage.url)
@@ -103,6 +109,7 @@ class WebsiteEnrichmentProvider:
         fetched_urls = {homepage_url, homepage.url}
         pages_fetched = 1
         errors: list[str] = []
+        fetch_failure_reasons: list[PublicWebFetchFailureReason] = []
         for page_url in page_candidates:
             if pages_fetched >= self._max_pages or page_url is None:
                 continue
@@ -121,6 +128,11 @@ class WebsiteEnrichmentProvider:
             page = self._fetch(normalized_page, allowed_hostname=homepage_host)
             if page.error is not None:
                 _append_unique(errors, page.error)
+                if (
+                    page.failure_reason is not None
+                    and page.failure_reason not in fetch_failure_reasons
+                ):
+                    fetch_failure_reasons.append(page.failure_reason)
                 continue
             if page.url is None or page.html is None:
                 continue
@@ -131,7 +143,12 @@ class WebsiteEnrichmentProvider:
             parsed_results.append(
                 extract_company_enrichment_from_html(html=page.html, source_url=page.url)
             )
-        return self._merge_results(parsed_results, homepage.url, errors)
+        return self._merge_results(
+            parsed_results,
+            homepage.url,
+            errors,
+            fetch_failure_reasons,
+        )
 
     def _fetch(self, initial_url: str, *, allowed_hostname: str | None = None) -> _FetchedPage:
         result = self._web_fetcher.fetch(initial_url, allowed_hostname=allowed_hostname)
@@ -139,6 +156,7 @@ class WebsiteEnrichmentProvider:
             return _FetchedPage(
                 url=result.final_url,
                 error=_FETCH_ERROR_MESSAGES[result.error_code],
+                failure_reason=result.failure_reason,
             )
         return _FetchedPage(url=result.final_url, html=result.text)
 
@@ -147,6 +165,7 @@ class WebsiteEnrichmentProvider:
         results: list[CompanyEnrichmentProviderResult],
         source_url: str,
         fetch_errors: list[str],
+        fetch_failure_reasons: list[PublicWebFetchFailureReason],
     ) -> CompanyEnrichmentProviderResult:
         values: dict[str, str | None] = {}
         errors = list(fetch_errors)
@@ -164,6 +183,7 @@ class WebsiteEnrichmentProvider:
             source_url=source_url,
             notes=" ".join(notes) or None,
             errors=errors,
+            fetch_failure_reasons=fetch_failure_reasons,
             **values,
         )
 
@@ -171,11 +191,13 @@ class WebsiteEnrichmentProvider:
         self,
         message: str,
         source_url: str | None = None,
+        failure_reason: PublicWebFetchFailureReason | None = None,
     ) -> CompanyEnrichmentProviderResult:
         return CompanyEnrichmentProviderResult(
             provider=self.provider_name,
             source_url=source_url,
             errors=[message],
+            fetch_failure_reasons=[failure_reason] if failure_reason is not None else [],
         )
 
 

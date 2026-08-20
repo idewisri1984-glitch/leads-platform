@@ -16,6 +16,7 @@ from app.modules.contact_discovery.website_contact_parser import (
 from app.providers.public_web_fetcher import (
     BoundedPublicWebFetcher,
     PublicWebFetchErrorCode,
+    PublicWebFetchFailureReason,
     PublicWebFetchResult,
     normalize_public_web_request_url,
     normalize_public_web_url,
@@ -598,6 +599,9 @@ def _append_fetch_diagnostic(
 ) -> None:
     code = result.error_code or PublicWebFetchErrorCode.REQUEST_FAILED
     _append_error(diagnostics, f"{stage}_{code.value}")
+    reason = result.failure_reason
+    if isinstance(reason, PublicWebFetchFailureReason):
+        _append_error(diagnostics, f"{stage}_failure_reason_{reason.value}")
 
 
 def _contact_search_queries(hostname: str) -> tuple[str, str]:
