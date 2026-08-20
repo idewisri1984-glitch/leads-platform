@@ -87,6 +87,7 @@ def provider_result(
     attempted_pages: int = 1,
     successful_pages: int = 1,
     errors: tuple[str, ...] = (),
+    diagnostics: tuple[str, ...] = (),
     selected_urls: int = 0,
     limited_link_scan: bool = False,
 ) -> WebsiteContactDiscoveryProviderResult:
@@ -95,6 +96,7 @@ def provider_result(
         attempted_pages=attempted_pages,
         successful_pages=successful_pages,
         errors=errors,
+        diagnostics=diagnostics,
         selected_urls=selected_urls,
         limited_link_scan=limited_link_scan,
     )
@@ -512,6 +514,93 @@ def test_unknown_errors_are_sanitized_deduplicated_in_first_seen_order(session: 
         "secondary_page_fetch_failed",
     )
     assert raw not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "configured_url_request_failed",
+        "canonical_root_request_failed",
+        "configured_url_failure_reason_dns_failure",
+        "configured_url_failure_reason_tls_error",
+        "canonical_root_failure_reason_http_server_error",
+        "configured_url_failure_reason_response_too_large",
+        "configured_url_failure_reason_request_failed_unknown",
+    ],
+)
+def test_safe_fetch_diagnostics_survive_service_validation(
+    session: Session, diagnostic: str
+) -> None:
+    company = create_company(session)
+    result = run(session, company, provider_result(diagnostics=(diagnostic,)))
+    assert result.diagnostics == (diagnostic,)
+
+
+def test_response_too_large_legacy_and_reason_diagnostics_both_survive(
+    session: Session,
+) -> None:
+    company = create_company(session)
+    result = run(
+        session,
+        company,
+        provider_result(
+            diagnostics=(
+                "configured_url_response_too_large",
+                "configured_url_failure_reason_response_too_large",
+            )
+        ),
+    )
+    assert result.diagnostics == (
+        "configured_url_response_too_large",
+        "configured_url_failure_reason_response_too_large",
+    )
+
+
+def test_offline_fetch_failure_mirror_preserves_both_finite_reasons(
+    session: Session,
+) -> None:
+    company = create_company(session)
+    result = run(
+        session,
+        company,
+        provider_result(
+            diagnostics=(
+                "configured_url_request_failed",
+                "configured_url_failure_reason_tls_error",
+                "canonical_root_request_failed",
+                "canonical_root_failure_reason_http_server_error",
+                "search_fallback_unavailable",
+            )
+        ),
+    )
+    assert result.diagnostics == (
+        "configured_url_request_failed",
+        "configured_url_failure_reason_tls_error",
+        "canonical_root_request_failed",
+        "canonical_root_failure_reason_http_server_error",
+        "search_fallback_unavailable",
+    )
+    assert "provider_failed" not in result.diagnostics
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "evil_stage_failure_reason_dns_failure",
+        "configured_url_failure_reason_totally_new_reason",
+        "configured_url_failure_reason_http_server_error_extra",
+        "configured_url_failure_reason_SECRET_API_KEY_ABC123",
+        "https://example.com/?token=secret",
+        "Authorization: Bearer xyz",
+        "RuntimeError: raw exception message",
+        "Traceback (most recent call last)",
+    ],
+)
+def test_unsafe_fetch_diagnostics_use_canonical_fallback(session: Session, diagnostic: str) -> None:
+    company = create_company(session)
+    result = run(session, company, provider_result(diagnostics=(diagnostic,)))
+    assert result.diagnostics == ("provider_failed",)
+    assert diagnostic not in repr(result)
 
 
 def test_blank_website_does_not_call_provider_and_returns_fixed_failure(session: Session) -> None:
