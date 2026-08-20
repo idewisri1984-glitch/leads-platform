@@ -19,6 +19,7 @@ from app.modules.contact_discovery.schemas import (
     ContactDiscoveryPersistedCandidateRaw,
 )
 from app.modules.contact_discovery.website_provider import WebsiteContactDiscoveryProviderResult
+from app.providers.public_web_fetcher import PublicWebFetchFailureReason
 
 _PROVIDER_INVALID_RESULT = "provider_invalid_result"
 _PROVIDER_FAILED = "provider_failed"
@@ -284,8 +285,15 @@ class ContactDiscoveryService:
             "response_decode_failed",
         }
         prefixes = {"configured_url", "canonical_root", "secondary_page", "search_page"}
-        if value in fixed or any(
-            value == f"{prefix}_{code}" for prefix in prefixes for code in fetch_codes
+        fetch_failure_reasons = {reason.value for reason in PublicWebFetchFailureReason}
+        if (
+            value in fixed
+            or any(value == f"{prefix}_{code}" for prefix in prefixes for code in fetch_codes)
+            or any(
+                value == f"{prefix}_failure_reason_{reason}"
+                for prefix in prefixes
+                for reason in fetch_failure_reasons
+            )
         ):
             return value
         return _PROVIDER_FAILED

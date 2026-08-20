@@ -75,6 +75,7 @@ def result(
     dry_run: bool = True,
     candidates: tuple[ContactDiscoveryCandidateCreate, ...] = (),
     errors: tuple[str, ...] = (),
+    diagnostics: tuple[str, ...] = (),
     candidate_upserts: int = 0,
     state_persisted: bool = False,
 ) -> ContactDiscoveryRunResult:
@@ -86,6 +87,7 @@ def result(
         attempted_pages=3,
         successful_pages=2,
         errors=errors,
+        diagnostics=diagnostics,
         candidate_upserts=candidate_upserts,
         state_persisted=state_persisted,
         selected_urls=2,
@@ -954,6 +956,17 @@ def test_no_errors_and_missing_candidate_values_have_stable_output(
     assert "  Name: -" in lines
     assert "  Title: -" in lines
     assert "  Phone: -" in lines
+
+
+def test_cli_surfaces_safe_finite_fetch_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    run_result = result(
+        1,
+        diagnostics=("configured_url_failure_reason_dns_failure",),
+    )
+    lines: list[str] = []
+    monkeypatch.setattr(typer, "echo", lambda value: lines.append(str(value)))
+    cli._print_result(run_result)
+    assert "Diagnostics: configured_url_failure_reason_dns_failure" in lines
 
 
 def test_cli_source_preserves_stage_boundaries_and_lazy_provider_wiring() -> None:
