@@ -15,6 +15,7 @@ _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _HTML_CONTENT_TYPES = {"text/html", "application/xhtml+xml"}
 _HOSTNAME_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _MAX_ADDRESS_ATTEMPTS = 4
+PUBLIC_WEB_USER_AGENT = "BaliLeadsPlatform/1.0 (+public-web-fetch)"
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class PinnedPublicWebTransport:
                     headers={
                         "Accept": "text/html, application/xhtml+xml",
                         "Host": host_header,
+                        "User-Agent": PUBLIC_WEB_USER_AGENT,
                     },
                 )
             except TimeoutError as error:
