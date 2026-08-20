@@ -14,6 +14,7 @@ from app.modules.company_enrichment.website_provider import (
     _FetchResponse,
     _ResponseTooLarge,
 )
+from app.providers.public_web_fetcher import PublicWebFetchFailureReason
 
 PUBLIC_IP = "93.184.216.34"
 
@@ -143,6 +144,20 @@ def test_unknown_response_charset_returns_sanitized_provider_error() -> None:
     assert "raw-body" not in rendered
     assert "credential" not in rendered
     assert "traceback" not in rendered.casefold()
+
+
+def test_fetch_failure_reason_is_typed_and_raw_error_remains_hidden() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            "SECRET_API_KEY_ABC123 https://example.com/?token=secret Authorization: Bearer xyz"
+        )
+
+    result = provider(handler).enrich(target())
+    rendered = repr(result)
+    assert result.errors == ["Website request failed."]
+    assert result.fetch_failure_reasons == [PublicWebFetchFailureReason.CONNECTION_ERROR]
+    for secret in ("SECRET_API_KEY_ABC123", "token=secret", "Authorization", "Bearer xyz"):
+        assert secret not in rendered
 
 
 def test_contact_and_about_pages_fill_missing_fields() -> None:

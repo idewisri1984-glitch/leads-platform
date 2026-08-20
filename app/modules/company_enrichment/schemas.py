@@ -3,6 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.company_enrichment.models import EnrichmentStatus as EnrichmentStatus
+from app.providers.public_web_fetcher import PublicWebFetchFailureReason
 
 
 class CompanyEnrichmentTarget(BaseModel):
@@ -32,6 +33,7 @@ class CompanyEnrichmentProviderResult(BaseModel):
     source_url: str | None = None
     notes: str | None = None
     errors: list[str] = Field(default_factory=list)
+    fetch_failure_reasons: list[PublicWebFetchFailureReason] = Field(default_factory=list)
 
     @field_validator("provider")
     @classmethod

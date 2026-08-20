@@ -46,15 +46,41 @@ class PublicWebFetchErrorCode(StrEnum):
     RESPONSE_DECODE_FAILED = "response_decode_failed"
 
 
+class PublicWebFetchFailureReason(StrEnum):
+    DNS_FAILURE = "dns_failure"
+    CONNECT_TIMEOUT = "connect_timeout"
+    READ_TIMEOUT = "read_timeout"
+    TIMEOUT = "timeout"
+    TLS_ERROR = "tls_error"
+    HTTP_AUTH_ERROR = "http_auth_error"
+    HTTP_RATE_LIMIT = "http_rate_limit"
+    HTTP_CLIENT_ERROR = "http_client_error"
+    HTTP_SERVER_ERROR = "http_server_error"
+    CONNECTION_ERROR = "connection_error"
+    RESPONSE_TOO_LARGE = "response_too_large"
+    INVALID_URL = "invalid_url"
+    REDIRECT_ERROR = "redirect_error"
+    REQUEST_FAILED_UNKNOWN = "request_failed_unknown"
+
+
 @dataclass(frozen=True)
 class PublicWebFetchResult:
     final_url: str
     text: str | None = None
     content_type: str | None = None
     error_code: PublicWebFetchErrorCode | None = None
+    failure_reason: PublicWebFetchFailureReason | None = None
 
 
 class ResponseTooLargeError(Exception):
+    pass
+
+
+class PublicWebConnectTimeoutError(TimeoutError):
+    pass
+
+
+class PublicWebReadTimeoutError(TimeoutError):
     pass
 
 
@@ -101,16 +127,22 @@ class PinnedPublicWebTransport:
         if parsed.port is not None and parsed.port != (443 if parsed.scheme == "https" else 80):
             host_header = f"{hostname}:{parsed.port}"
         try:
-            connection.request(
-                "GET",
-                path,
-                headers={
-                    "Accept": "text/html, application/xhtml+xml",
-                    "Host": host_header,
-                },
-            )
-            response = connection.getresponse()
-            body = response.read(max_response_bytes + 1)
+            try:
+                connection.request(
+                    "GET",
+                    path,
+                    headers={
+                        "Accept": "text/html, application/xhtml+xml",
+                        "Host": host_header,
+                    },
+                )
+            except TimeoutError as error:
+                raise PublicWebConnectTimeoutError from error
+            try:
+                response = connection.getresponse()
+                body = response.read(max_response_bytes + 1)
+            except TimeoutError as error:
+                raise PublicWebReadTimeoutError from error
             if len(body) > max_response_bytes:
                 raise ResponseTooLargeError
             return FetchResponse(
@@ -146,23 +178,28 @@ class BoundedPublicWebFetcher:
         except ValueError:
             current_url = None
         if current_url is None:
-            return self._error(safe_error_url(url), PublicWebFetchErrorCode.HOST_NOT_PUBLIC)
+            return self._error(
+                safe_error_url(url),
+                PublicWebFetchErrorCode.HOST_NOT_PUBLIC,
+                PublicWebFetchFailureReason.INVALID_URL,
+            )
         redirects = 0
         visited: set[str] = set()
         while True:
             if current_url in visited:
                 return self._error(current_url, PublicWebFetchErrorCode.REDIRECT_LIMIT)
             visited.add(current_url)
-            verified = self._verified_addresses(current_url)
+            verified, verification_reason = self._verified_addresses(current_url)
             if verified is None:
                 code = (
                     PublicWebFetchErrorCode.REDIRECT_UNSAFE
                     if redirects
                     else PublicWebFetchErrorCode.HOST_NOT_PUBLIC
                 )
-                return self._error(safe_error_url(current_url), code)
+                return self._error(safe_error_url(current_url), code, verification_reason)
             hostname, verified_addresses = verified
             response = None
+            failure_reason: PublicWebFetchFailureReason | None = None
             for verified_ip in verified_addresses:
                 try:
                     response = self._transport.fetch(
@@ -173,17 +210,54 @@ class BoundedPublicWebFetcher:
                         max_response_bytes=self._max_response_bytes,
                     )
                 except ResponseTooLargeError:
-                    return self._error(current_url, PublicWebFetchErrorCode.RESPONSE_TOO_LARGE)
-                except (OSError, ssl.SSLError, http.client.HTTPException):
+                    return self._error(
+                        current_url,
+                        PublicWebFetchErrorCode.RESPONSE_TOO_LARGE,
+                        PublicWebFetchFailureReason.RESPONSE_TOO_LARGE,
+                    )
+                except PublicWebConnectTimeoutError:
+                    failure_reason = PublicWebFetchFailureReason.CONNECT_TIMEOUT
                     continue
+                except PublicWebReadTimeoutError:
+                    failure_reason = PublicWebFetchFailureReason.READ_TIMEOUT
+                    continue
+                except TimeoutError:
+                    failure_reason = PublicWebFetchFailureReason.TIMEOUT
+                    continue
+                except ssl.SSLError:
+                    failure_reason = PublicWebFetchFailureReason.TLS_ERROR
+                    continue
+                except ConnectionError:
+                    failure_reason = PublicWebFetchFailureReason.CONNECTION_ERROR
+                    continue
+                except OSError:
+                    failure_reason = PublicWebFetchFailureReason.CONNECTION_ERROR
+                    continue
+                except http.client.HTTPException:
+                    failure_reason = PublicWebFetchFailureReason.REQUEST_FAILED_UNKNOWN
+                    continue
+                except Exception:
+                    return self._error(
+                        current_url,
+                        PublicWebFetchErrorCode.REQUEST_FAILED,
+                        PublicWebFetchFailureReason.REQUEST_FAILED_UNKNOWN,
+                    )
                 break
             if response is None:
-                return self._error(current_url, PublicWebFetchErrorCode.REQUEST_FAILED)
+                return self._error(
+                    current_url,
+                    PublicWebFetchErrorCode.REQUEST_FAILED,
+                    failure_reason or PublicWebFetchFailureReason.REQUEST_FAILED_UNKNOWN,
+                )
 
             if response.status_code in _REDIRECT_STATUSES:
                 location = response.headers.get("location")
                 if not location:
-                    return self._error(current_url, PublicWebFetchErrorCode.REQUEST_FAILED)
+                    return self._error(
+                        current_url,
+                        PublicWebFetchErrorCode.REQUEST_FAILED,
+                        PublicWebFetchFailureReason.REDIRECT_ERROR,
+                    )
                 if redirects >= self._max_redirects:
                     return self._error(current_url, PublicWebFetchErrorCode.REDIRECT_LIMIT)
                 try:
@@ -202,7 +276,11 @@ class BoundedPublicWebFetcher:
                 redirects += 1
                 continue
             if response.status_code < 200 or response.status_code >= 300:
-                return self._error(current_url, PublicWebFetchErrorCode.REQUEST_FAILED)
+                return self._error(
+                    current_url,
+                    PublicWebFetchErrorCode.REQUEST_FAILED,
+                    _http_failure_reason(response.status_code),
+                )
 
             content_type = response.headers.get("content-type", "").split(";", 1)[0]
             content_type = content_type.strip().casefold()
@@ -221,34 +299,55 @@ class BoundedPublicWebFetcher:
                 content_type=content_type or None,
             )
 
-    def _verified_addresses(self, url: str) -> tuple[str, tuple[str, ...]] | None:
+    def _verified_addresses(
+        self, url: str
+    ) -> tuple[
+        tuple[str, tuple[str, ...]] | None,
+        PublicWebFetchFailureReason | None,
+    ]:
         try:
             normalized = normalize_public_web_request_url(url)
         except ValueError:
-            return None
+            return None, PublicWebFetchFailureReason.INVALID_URL
         if normalized is None:
-            return None
+            return None, PublicWebFetchFailureReason.INVALID_URL
         hostname = urlsplit(normalized).hostname
         if hostname is None or hostname.casefold() == "localhost":
-            return None
+            return None, None
         try:
             direct_address = ipaddress.ip_address(hostname)
         except ValueError:
             direct_address = None
         if direct_address is not None:
-            return (hostname, (str(direct_address),)) if is_public_address(direct_address) else None
+            verified = (
+                (hostname, (str(direct_address),)) if is_public_address(direct_address) else None
+            )
+            return verified, None
         try:
             addresses = tuple(ipaddress.ip_address(value) for value in self._resolver(hostname))
         except (OSError, ValueError):
-            return None
-        if not addresses or not all(is_public_address(address) for address in addresses):
-            return None
+            return None, PublicWebFetchFailureReason.DNS_FAILURE
+        if not addresses:
+            return None, PublicWebFetchFailureReason.DNS_FAILURE
+        if not all(is_public_address(address) for address in addresses):
+            return None, None
         ordered = tuple(sorted(set(addresses), key=_address_sort_key))
-        return hostname, tuple(str(address) for address in ordered[:_MAX_ADDRESS_ATTEMPTS])
+        return (
+            (hostname, tuple(str(address) for address in ordered[:_MAX_ADDRESS_ATTEMPTS])),
+            None,
+        )
 
     @staticmethod
-    def _error(url: str, code: PublicWebFetchErrorCode) -> PublicWebFetchResult:
-        return PublicWebFetchResult(final_url=url, error_code=code)
+    def _error(
+        url: str,
+        code: PublicWebFetchErrorCode,
+        failure_reason: PublicWebFetchFailureReason | None = None,
+    ) -> PublicWebFetchResult:
+        return PublicWebFetchResult(
+            final_url=safe_error_url(url),
+            error_code=code,
+            failure_reason=failure_reason,
+        )
 
 
 def resolve_hostname(hostname: str) -> Sequence[str]:
@@ -314,9 +413,27 @@ def normalize_public_web_request_url(value: str | None) -> str | None:
 
 def safe_error_url(value: str) -> str:
     try:
-        return normalize_public_web_url(value) or ""
+        normalized = normalize_public_web_url(value)
     except ValueError:
         return ""
+    if normalized is None:
+        return ""
+    parsed = urlsplit(normalized)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _http_failure_reason(status_code: int) -> PublicWebFetchFailureReason:
+    if status_code in {401, 403}:
+        return PublicWebFetchFailureReason.HTTP_AUTH_ERROR
+    if status_code == 408:
+        return PublicWebFetchFailureReason.READ_TIMEOUT
+    if status_code == 429:
+        return PublicWebFetchFailureReason.HTTP_RATE_LIMIT
+    if 400 <= status_code < 500:
+        return PublicWebFetchFailureReason.HTTP_CLIENT_ERROR
+    if 500 <= status_code < 600:
+        return PublicWebFetchFailureReason.HTTP_SERVER_ERROR
+    return PublicWebFetchFailureReason.REQUEST_FAILED_UNKNOWN
 
 
 def is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:

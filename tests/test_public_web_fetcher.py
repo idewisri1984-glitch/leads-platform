@@ -1,4 +1,5 @@
 import http.client
+import socket
 import ssl
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -9,7 +10,10 @@ from app.providers import public_web_fetcher
 from app.providers.public_web_fetcher import (
     BoundedPublicWebFetcher,
     FetchResponse,
+    PublicWebConnectTimeoutError,
     PublicWebFetchErrorCode,
+    PublicWebFetchFailureReason,
+    PublicWebReadTimeoutError,
     ResponseTooLargeError,
     normalize_public_web_request_url,
     normalize_public_web_url,
@@ -396,6 +400,7 @@ def test_response_limit_returns_no_partial_body() -> None:
     instance, _ = fetcher(handler, max_response_bytes=32)
     result = instance.fetch("https://example.com")
     assert result.error_code == PublicWebFetchErrorCode.RESPONSE_TOO_LARGE
+    assert result.failure_reason == PublicWebFetchFailureReason.RESPONSE_TOO_LARGE
     assert result.text is None
     assert "secret" not in repr(result)
 
@@ -717,3 +722,117 @@ def test_resolve_hostname_returns_sorted_unique_addresses(
         PUBLIC_IP,
         "2606:4700:4700::1111",
     )
+
+
+def test_dns_failure_has_finite_safe_reason() -> None:
+    instance, transport = fetcher(
+        resolver=lambda _hostname: (_ for _ in ()).throw(socket.gaierror("SECRET_API_KEY_ABC123"))
+    )
+    result = instance.fetch("https://example.com/?token=secret")
+    assert result.error_code == PublicWebFetchErrorCode.HOST_NOT_PUBLIC
+    assert result.failure_reason == PublicWebFetchFailureReason.DNS_FAILURE
+    assert transport.calls == []
+    assert "secret" not in repr(result).casefold()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (PublicWebConnectTimeoutError("private"), PublicWebFetchFailureReason.CONNECT_TIMEOUT),
+        (PublicWebReadTimeoutError("private"), PublicWebFetchFailureReason.READ_TIMEOUT),
+        (TimeoutError("private"), PublicWebFetchFailureReason.TIMEOUT),
+        (ConnectionError("private"), PublicWebFetchFailureReason.CONNECTION_ERROR),
+        (ssl.SSLError("private"), PublicWebFetchFailureReason.TLS_ERROR),
+        (
+            http.client.HTTPException("private"),
+            PublicWebFetchFailureReason.REQUEST_FAILED_UNKNOWN,
+        ),
+    ],
+)
+def test_transport_failure_has_finite_safe_reason(
+    error: Exception, expected: PublicWebFetchFailureReason
+) -> None:
+    instance, _ = fetcher(lambda **_kwargs: (_ for _ in ()).throw(error))
+    assert instance.fetch("https://example.com").failure_reason == expected
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, PublicWebFetchFailureReason.HTTP_AUTH_ERROR),
+        (403, PublicWebFetchFailureReason.HTTP_AUTH_ERROR),
+        (408, PublicWebFetchFailureReason.READ_TIMEOUT),
+        (429, PublicWebFetchFailureReason.HTTP_RATE_LIMIT),
+        (400, PublicWebFetchFailureReason.HTTP_CLIENT_ERROR),
+        (404, PublicWebFetchFailureReason.HTTP_CLIENT_ERROR),
+        (500, PublicWebFetchFailureReason.HTTP_SERVER_ERROR),
+        (503, PublicWebFetchFailureReason.HTTP_SERVER_ERROR),
+    ],
+)
+def test_http_status_has_finite_safe_reason(
+    status: int, expected: PublicWebFetchFailureReason
+) -> None:
+    instance, _ = fetcher(lambda **_kwargs: response(status))
+    result = instance.fetch("https://example.com")
+    assert result.error_code == PublicWebFetchErrorCode.REQUEST_FAILED
+    assert result.failure_reason == expected
+
+
+def test_invalid_url_has_finite_safe_reason() -> None:
+    instance, transport = fetcher()
+    result = instance.fetch("https://user:secret@example.com/?token=secret")
+    assert result.failure_reason == PublicWebFetchFailureReason.INVALID_URL
+    assert result.final_url == ""
+    assert transport.calls == []
+
+
+def test_unknown_hostile_failure_is_allowlisted_and_sanitized() -> None:
+    hostile = RuntimeError(
+        "SECRET_API_KEY_ABC123 https://example.com/?token=secret Authorization: Bearer xyz"
+    )
+    instance, transport = fetcher(lambda **_kwargs: (_ for _ in ()).throw(hostile))
+    result = instance.fetch("https://example.com/?token=secret")
+    rendered = repr(result)
+    assert result.failure_reason == PublicWebFetchFailureReason.REQUEST_FAILED_UNKNOWN
+    assert len(transport.calls) == 1
+    for secret in ("SECRET_API_KEY_ABC123", "token=secret", "Authorization", "Bearer xyz"):
+        assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        ("connect", PublicWebConnectTimeoutError),
+        ("read", PublicWebReadTimeoutError),
+    ],
+)
+def test_pinned_transport_types_timeout_by_request_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    expected: type[TimeoutError],
+) -> None:
+    class TimeoutConnection:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            if phase == "connect":
+                raise TimeoutError("SECRET_API_KEY_ABC123")
+
+        def getresponse(self) -> object:
+            if phase == "read":
+                raise TimeoutError("SECRET_API_KEY_ABC123")
+            raise AssertionError("response was not expected")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(public_web_fetcher, "_PinnedHTTPSConnection", TimeoutConnection)
+    with pytest.raises(expected):
+        public_web_fetcher.PinnedPublicWebTransport().fetch(
+            url="https://example.com",
+            hostname="example.com",
+            verified_ip=PUBLIC_IP,
+            timeout=5.0,
+            max_response_bytes=250_000,
+        )
