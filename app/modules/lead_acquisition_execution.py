@@ -9,11 +9,13 @@ from app.modules.agent.lead_acquisition import (
     LeadAcquisitionInput,
     LeadAcquisitionResult,
 )
+from app.modules.agent.provider_diagnostics import OpenAIDecisionProviderDiagnostic
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from app.modules.agent.company_plan import DecisionBoundary
+    from app.providers.openai_decision.exceptions import OpenAIDecisionDiagnostic
 
 
 class SessionFactory(Protocol):
@@ -40,6 +42,23 @@ class _DecisionFactory:
     def close(self) -> None:
         if self._client is not None:
             self._client.close()
+
+
+def _openai_provider_diagnostic(
+    diagnostic: OpenAIDecisionDiagnostic | None,
+) -> OpenAIDecisionProviderDiagnostic | None:
+    if diagnostic is None:
+        return None
+    return OpenAIDecisionProviderDiagnostic(
+        category=diagnostic.category.value,
+        exception_class=diagnostic.exception_class,
+        http_status=diagnostic.http_status,
+        openai_error_code=diagnostic.openai_error_code,
+        parameter=diagnostic.parameter,
+        request_id=diagnostic.request_id,
+        response_status=diagnostic.response_status,
+        incomplete_reason=diagnostic.incomplete_reason,
+    )
 
 
 def execute_lead_acquisition(
@@ -222,8 +241,11 @@ def execute_lead_acquisition(
                     candidate_count=exc.candidate_count,
                     diagnostic=exc.diagnostic,
                 ) from None
-        except AgentCompanyPlanDecisionError:
-            raise LeadAcquisitionProviderStopError("Lead acquisition provider stopped.") from None
+        except AgentCompanyPlanDecisionError as exc:
+            raise LeadAcquisitionProviderStopError(
+                "Lead acquisition provider stopped.",
+                diagnostic=_openai_provider_diagnostic(exc.diagnostic),
+            ) from None
         except AgentCompanyPlanError:
             failure_substage = LeadAcquisitionFailureSubstage.UNKNOWN_COMPANY_PLAN
         if failure_substage is not None:
