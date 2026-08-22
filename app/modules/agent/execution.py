@@ -132,17 +132,25 @@ class _LazyDecisionFactory:
 
     def __call__(self) -> DecisionBoundary:
         from app.modules.agent.company_plan import AgentCompanyPlanDecisionError
+        from app.providers.openai_decision.exceptions import OpenAIDecisionError
 
         boundary: DecisionBoundary | None = None
+        diagnostic = None
         failed = False
         try:
             if self._factory is None:
                 self._factory = self._factory_factory()
             boundary = self._factory()
+        except OpenAIDecisionError as exc:
+            diagnostic = exc.diagnostic
+            failed = True
         except Exception:
             failed = True
         if failed:
-            raise AgentCompanyPlanDecisionError("Company decision provider failed.")
+            raise AgentCompanyPlanDecisionError(
+                "Company decision provider failed.",
+                diagnostic=diagnostic,
+            )
         if boundary is None:
             raise AgentCompanyPlanDecisionError("Company decision provider failed.")
         return boundary

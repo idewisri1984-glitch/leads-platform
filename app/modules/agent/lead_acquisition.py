@@ -9,6 +9,10 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, mo
 
 from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
 
+from .provider_diagnostics import OpenAIDecisionProviderDiagnostic
+
+ProviderDiagnostic = DiscoveryProviderDiagnostic | OpenAIDecisionProviderDiagnostic
+
 _STRICT = ConfigDict(frozen=True, strict=True, extra="forbid")
 
 
@@ -37,7 +41,7 @@ class LeadAcquisitionProviderStopError(LeadAcquisitionError):
         decision_call_count: int = 0,
         discovery_run_count: int = 0,
         candidate_count: int = 0,
-        diagnostic: DiscoveryProviderDiagnostic | None = None,
+        diagnostic: ProviderDiagnostic | None = None,
     ) -> None:
         super().__init__(message)
         self.discovery_call_count = discovery_call_count
@@ -238,7 +242,7 @@ class LeadAcquisitionResult(BaseModel):
     completed_draft_ids: tuple[int, ...]
     company_discovery_call_count: int
     company_decision_call_count: int
-    provider_diagnostic: DiscoveryProviderDiagnostic | None = None
+    provider_diagnostic: ProviderDiagnostic | None = None
     contact_discovery_call_count: int
     contact_decision_call_count: int
     draft_generation_call_count: int
@@ -437,7 +441,7 @@ class _State:
     candidate_count: int = 0
     company_discovery_call_count: int = 0
     company_decision_call_count: int = 0
-    provider_diagnostic: DiscoveryProviderDiagnostic | None = None
+    provider_diagnostic: ProviderDiagnostic | None = None
     contact_discovery_call_count: int = 0
     contact_decision_call_count: int = 0
     draft_generation_call_count: int = 0

@@ -16,6 +16,7 @@ from app.modules.agent.lead_acquisition import (
     LeadAcquisitionResult,
     LeadAcquisitionStatus,
 )
+from app.modules.agent.provider_diagnostics import OpenAIDecisionProviderDiagnostic
 from app.modules.company_discovery.schemas import DiscoveryProviderDiagnostic
 
 runner = CliRunner()
@@ -289,6 +290,44 @@ def test_provider_stop_result_remains_normal_json(monkeypatch) -> None:
     assert completed.stderr == ""
     assert json.loads(completed.stdout) == expected.model_dump(mode="json")
     assert json.loads(completed.stdout)["status"] == "PARTIAL_PROVIDER_STOP"
+
+
+def test_openai_provider_stop_diagnostic_is_safe_normal_json(monkeypatch) -> None:
+    values = provider_stop_result().model_dump()
+    values["provider_diagnostic"] = OpenAIDecisionProviderDiagnostic(
+        category="CONNECTION",
+        exception_class="APIConnectionError",
+        request_id="req_safe123",
+    )
+    expected = LeadAcquisitionResult(**values)
+    monkeypatch.setattr("app.cli.agent.execute_agent_lead_acquisition", lambda _data: expected)
+
+    completed = runner.invoke(
+        app,
+        [
+            "acquire-leads",
+            "--project-id",
+            "1",
+            "--search-profile-id",
+            "3",
+            "--limit",
+            "1",
+            "--goal",
+            "Find design firms",
+            "--output",
+            "json",
+        ],
+        color=False,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert completed.exit_code == 0
+    assert completed.stderr == ""
+    assert payload == expected.model_dump(mode="json")
+    assert payload["status"] == "PARTIAL_PROVIDER_STOP"
+    assert payload["provider_diagnostic"]["category"] == "CONNECTION"
+    assert payload["provider_diagnostic"]["request_id"] == "req_safe123"
+    assert "API_KEY" not in completed.stdout
 
 
 def test_text_output_contains_operator_fields(monkeypatch) -> None:

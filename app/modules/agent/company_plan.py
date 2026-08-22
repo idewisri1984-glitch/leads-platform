@@ -31,6 +31,7 @@ from app.modules.search_profile.schemas import SearchProfileRead, SearchProfileR
 
 if TYPE_CHECKING:
     from app.providers.openai_decision import OpenAIDecisionRequest, OpenAIDecisionResult
+    from app.providers.openai_decision.exceptions import OpenAIDecisionDiagnostic
 
 from .company_plan_schemas import (
     MAX_PROVIDER_HTTP_ATTEMPTS_PER_LOGICAL_DISCOVERY,
@@ -167,7 +168,14 @@ class AgentCompanyPlanSelectionError(AgentCompanyPlanSubstageError):
 
 
 class AgentCompanyPlanDecisionError(AgentCompanyPlanError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: OpenAIDecisionDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class AgentCompanyPlanBindingError(AgentCompanyPlanSubstageError):
@@ -249,8 +257,11 @@ def _decision_call[T](
     value: T | None = None
     try:
         value = operation()
-    except AgentCompanyPlanDecisionError:
-        translated = AgentCompanyPlanDecisionError(_DECISION_FAILED)
+    except AgentCompanyPlanDecisionError as exc:
+        translated = AgentCompanyPlanDecisionError(
+            _DECISION_FAILED,
+            diagnostic=exc.diagnostic,
+        )
     except ValueError:
         translated = AgentCompanyPlanSubstageError(_DECISION_FAILED, substage=substage)
     except Exception:
