@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 
 import httpx
@@ -208,6 +209,118 @@ def test_unknown_decision_exception_remains_sanitized() -> None:
     assert captured.value.diagnostic is None
     assert secret not in str(captured.value)
     assert secret not in repr(captured.value)
+
+
+def _stage6a_result_from_decision_error(error_factory: Callable[[], Exception]) -> object:
+    from app.core.database.session import SessionLocal
+    from app.modules.agent.lead_acquisition import LeadAcquisitionInput
+    from app.modules.lead_acquisition_execution import execute_lead_acquisition
+    from app.modules.project.models import Project
+    from app.modules.search_profile.models import SearchProfile
+
+    with SessionLocal() as session:
+        project = Project(name="Stage 6A provider diagnostic mapping")
+        session.add(project)
+        session.flush()
+        profile = SearchProfile(
+            project_id=project.id,
+            name="Provider diagnostic profile",
+            product_or_service="Custom interior products",
+            target_customer_types=["interior design studios"],
+            countries=["United States"],
+            cities=[],
+            query_templates=["{target_customer_type} {country}"],
+            result_limit=5,
+            max_queries_per_run=1,
+            total_result_ceiling=5,
+            enabled=True,
+        )
+        session.add(profile)
+        session.commit()
+        project_id = project.id
+        profile_id = profile.id
+
+    class DecisionBoundary:
+        def decide(self, request: object) -> object:
+            raise error_factory()
+
+    class DecisionFactory:
+        def __call__(self) -> DecisionBoundary:
+            return DecisionBoundary()
+
+        def close(self) -> None:
+            return None
+
+    def search(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "organic_results": [
+                    {
+                        "title": "Atelier Example",
+                        "link": "https://atelier.example",
+                        "snippet": "Luxury residential and hospitality interior design studio.",
+                        "position": 1,
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    return execute_lead_acquisition(
+        LeadAcquisitionInput(
+            project_id=project_id,
+            search_profile_id=profile_id,
+            limit=1,
+            goal="Find a relevant interior design firm",
+        ),
+        session_factory=SessionLocal,
+        decision_factory_factory=DecisionFactory,
+        serpapi_client_factory=lambda **kwargs: _client(search),
+        contact_provider_factory=lambda: (_ for _ in ()).throw(AssertionError),
+        company_enrichment_provider_factory=lambda: (_ for _ in ()).throw(AssertionError),
+        email_generator_factory=lambda: (_ for _ in ()).throw(AssertionError),
+    )
+
+
+def test_openai_decision_diagnostic_survives_stage6a_execution_mapping() -> None:
+    from app.providers.openai_decision.exceptions import (
+        OpenAIDecisionDiagnostic,
+        OpenAIDecisionDiagnosticCategory,
+        OpenAIDecisionRequestError,
+    )
+
+    source_diagnostic = OpenAIDecisionDiagnostic(
+        category=OpenAIDecisionDiagnosticCategory.CONNECTION,
+        exception_class="APIConnectionError",
+        request_id="req_safe123",
+    )
+    result = _stage6a_result_from_decision_error(
+        lambda: OpenAIDecisionRequestError(diagnostic=source_diagnostic)
+    )
+    dumped = result.model_dump(mode="json")
+    serialized = json.dumps(dumped)
+
+    assert result.status is LeadAcquisitionStatus.PARTIAL_PROVIDER_STOP
+    assert isinstance(result.provider_diagnostic, OpenAIDecisionProviderDiagnostic)
+    assert dumped["provider_diagnostic"]["category"] == "CONNECTION"
+    assert dumped["provider_diagnostic"]["exception_class"] == "APIConnectionError"
+    assert dumped["provider_diagnostic"]["request_id"] == "req_safe123"
+    for forbidden in ("traceback", "__cause__", "__context__", "authorization", "api_key"):
+        assert forbidden not in serialized.casefold()
+
+
+def test_unknown_decision_exception_stays_sanitized_through_stage6a_execution_mapping() -> None:
+    secret = "API_KEY=should-never-appear"
+    result = _stage6a_result_from_decision_error(lambda: RuntimeError(secret))
+    serialized = json.dumps(result.model_dump(mode="json"))
+
+    assert result.status is LeadAcquisitionStatus.PARTIAL_PROVIDER_STOP
+    assert result.provider_diagnostic is None
+    assert secret not in serialized
+    assert "traceback" not in serialized.casefold()
+    assert "__cause__" not in serialized
+    assert "__context__" not in serialized
 
 
 def test_transport_error_has_detached_safe_diagnostic() -> None:

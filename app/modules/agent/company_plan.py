@@ -253,11 +253,18 @@ def _decision_call[T](
     operation: Callable[[], T],
     substage: AgentCompanyPlanFailureSubstage,
 ) -> T:
+    from app.providers.openai_decision.exceptions import OpenAIDecisionError
+
     translated: AgentCompanyPlanError | None = None
     value: T | None = None
     try:
         value = operation()
     except AgentCompanyPlanDecisionError as exc:
+        translated = AgentCompanyPlanDecisionError(
+            _DECISION_FAILED,
+            diagnostic=exc.diagnostic,
+        )
+    except OpenAIDecisionError as exc:
         translated = AgentCompanyPlanDecisionError(
             _DECISION_FAILED,
             diagnostic=exc.diagnostic,
