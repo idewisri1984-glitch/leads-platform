@@ -60,6 +60,23 @@ from app.modules.email_draft.execution import (
     OpenAIEmailGeneratorFactory as _OpenAIGeneratorFactory,
 )
 from app.modules.email_draft.provider_interfaces import EmailDraftGenerator
+from app.modules.email_draft.recipient_rebinding import (
+    PersonRecipientRebindingAlreadySentError,
+    PersonRecipientRebindingConfirmationRequiredError,
+    PersonRecipientRebindingConflictError,
+    PersonRecipientRebindingError,
+    PersonRecipientRebindingInternalError,
+    PersonRecipientRebindingInvalidDataError,
+    PersonRecipientRebindingNotEligibleError,
+    PersonRecipientRebindingNotFoundError,
+    PersonRecipientRebindingPersistenceError,
+    PersonRecipientRebindingService,
+    PersonRecipientRebindingStaleContextError,
+)
+from app.modules.email_draft.recipient_rebinding_schemas import (
+    PersonRecipientRebindingInput,
+    PersonRecipientRebindingResult,
+)
 from app.modules.email_draft.repository import EmailDraftRepository
 from app.modules.email_draft.schemas import (
     EmailDraftGenerationInput,
@@ -99,6 +116,8 @@ _SEND_CONFIRMATION = "Email delivery requires --confirm."
 _MANUAL_SEND_CONFIRMATION = "Manual sent recording requires --confirm."
 _INTERNAL = "Email draft operation failed."
 _DELIVERY_INTERNAL = "Email delivery failed."
+_REBIND_CONFIRMATION = "Person recipient rebinding requires --confirm."
+_REBIND_INTERNAL = "Person recipient rebinding failed."
 _OPTIONS = (
     "--project-id",
     "--company-id",
@@ -116,6 +135,15 @@ _OPTIONS = (
     "--yes",
     "--confirm",
     "--output",
+    "--recipient-email",
+    "--expected-content-hash",
+    "--first-name",
+    "--last-name",
+    "--job-title",
+    "--country",
+    "--city",
+    "--person-source-url",
+    "--location-source-url",
 )
 _DELIVERY_ERROR_CODES: tuple[tuple[type[EmailDeliveryServiceError], int], ...] = (
     (EmailDeliveryInvalidCommandError, 2),
@@ -158,6 +186,17 @@ _MANUAL_ERROR_CODES: tuple[tuple[type[ManualOutreachError], int], ...] = (
     (ManualOutreachAutomaticAttemptError, 15),
     (ManualOutreachPersistenceError, 20),
     (ManualOutreachTransactionBoundaryError, 21),
+)
+_REBIND_ERROR_CODES: tuple[tuple[type[PersonRecipientRebindingError], int], ...] = (
+    (PersonRecipientRebindingInvalidDataError, 2),
+    (PersonRecipientRebindingConfirmationRequiredError, 3),
+    (PersonRecipientRebindingNotFoundError, 4),
+    (PersonRecipientRebindingNotEligibleError, 7),
+    (PersonRecipientRebindingConflictError, 11),
+    (PersonRecipientRebindingStaleContextError, 14),
+    (PersonRecipientRebindingAlreadySentError, 15),
+    (PersonRecipientRebindingPersistenceError, 20),
+    (PersonRecipientRebindingInternalError, 1),
 )
 
 
@@ -334,6 +373,22 @@ def render_manual_email_copy_package(result: ManualEmailCopyPackage, output: str
     )
 
 
+def render_person_recipient_rebinding(result: PersonRecipientRebindingResult, output: str) -> str:
+    if type(result) is not PersonRecipientRebindingResult or output not in {"text", "json"}:
+        raise PersonRecipientRebindingInternalError(_REBIND_INTERNAL)
+    try:
+        validated = PersonRecipientRebindingResult(**result.model_dump())
+        values = validated.model_dump(mode="json")
+    except (ValidationError, TypeError, ValueError):
+        raise PersonRecipientRebindingInternalError(_REBIND_INTERNAL) from None
+    if output == "json":
+        return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "\n".join(
+        f"{field}={json.dumps(values[field], ensure_ascii=False, separators=(',', ':'))}"
+        for field in PersonRecipientRebindingResult.model_fields
+    )
+
+
 def _cleanup(operation: Callable[[], object]) -> None:
     with suppress(BaseException):
         operation()
@@ -360,6 +415,16 @@ def execute_generate(
         before_commit=prepare_result,
     )
     return rendered[0]
+
+
+def execute_rebind_person_recipient(
+    data: PersonRecipientRebindingInput,
+    output: str,
+    *,
+    session_factory: _SessionFactory = SessionLocal,
+) -> str:
+    result = PersonRecipientRebindingService(session_factory).rebind(data)
+    return render_person_recipient_rebinding(result, output)
 
 
 def execute_generate_missing(
@@ -659,6 +724,68 @@ def _output(value: str) -> str:
     return value
 
 
+def _handle_rebinding_error(error: BaseException) -> Never:
+    for error_type, code in _REBIND_ERROR_CODES:
+        if isinstance(error, error_type):
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code) from None
+    typer.echo(_REBIND_INTERNAL, err=True)
+    raise typer.Exit(1) from None
+
+
+@app.command("rebind-person-recipient", cls=_EmailDraftCommand)
+def rebind_person_recipient(
+    project_id: Annotated[str, typer.Option("--project-id")],
+    company_id: Annotated[str, typer.Option("--company-id")],
+    lead_id: Annotated[str, typer.Option("--lead-id")],
+    task_id: Annotated[str, typer.Option("--task-id")],
+    email_draft_id: Annotated[str, typer.Option("--email-draft-id")],
+    recipient_email: Annotated[str, typer.Option("--recipient-email")],
+    expected_content_hash: Annotated[str, typer.Option("--expected-content-hash")],
+    first_name: Annotated[str, typer.Option("--first-name")],
+    last_name: Annotated[str, typer.Option("--last-name")],
+    job_title: Annotated[str, typer.Option("--job-title")],
+    country: Annotated[str, typer.Option("--country")],
+    city: Annotated[str, typer.Option("--city")],
+    person_source_url: Annotated[str, typer.Option("--person-source-url")],
+    location_source_url: Annotated[str, typer.Option("--location-source-url")],
+    confirm: Annotated[bool, typer.Option("--confirm")] = False,
+    output: Annotated[str, typer.Option("--output")] = "text",
+) -> None:
+    if not confirm:
+        _handle_rebinding_error(
+            PersonRecipientRebindingConfirmationRequiredError(_REBIND_CONFIRMATION)
+        )
+    try:
+        rendered = execute_rebind_person_recipient(
+            PersonRecipientRebindingInput(
+                project_id=_positive(project_id),
+                company_id=_positive(company_id),
+                lead_id=_positive(lead_id),
+                task_id=_positive(task_id),
+                email_draft_id=_positive(email_draft_id),
+                recipient_email=recipient_email,
+                expected_content_hash=expected_content_hash,
+                first_name=first_name,
+                last_name=last_name,
+                job_title=job_title,
+                country=country,
+                city=city,
+                person_source_url=person_source_url,
+                location_source_url=location_source_url,
+                confirmed=True,
+            ),
+            _output(output),
+        )
+    except (ValidationError, TypeError, ValueError) as error:
+        if isinstance(error, PersonRecipientRebindingError):
+            _handle_rebinding_error(error)
+        _handle_rebinding_error(PersonRecipientRebindingInvalidDataError(_INVALID))
+    except BaseException as error:
+        _handle_rebinding_error(error)
+    typer.echo(rendered)
+
+
 @app.command("generate", cls=_EmailDraftCommand)
 def generate(
     project_id: Annotated[str, typer.Option("--project-id")],
@@ -907,10 +1034,12 @@ __all__ = [
     "execute_manual_export",
     "execute_manual_mark_sent",
     "execute_record_external_manual_send",
+    "execute_rebind_person_recipient",
     "execute_review",
     "execute_send",
     "execute_show",
     "render_email_delivery",
     "render_email_draft",
     "render_manual_email_copy_package",
+    "render_person_recipient_rebinding",
 ]

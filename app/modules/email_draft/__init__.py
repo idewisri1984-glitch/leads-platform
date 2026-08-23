@@ -6,6 +6,11 @@ if TYPE_CHECKING:
     from .fake_provider import FakeEmailDraftGenerator
     from .models import EmailDraft, EmailDraftStatus
     from .provider_interfaces import EmailDraftGenerator
+    from .recipient_rebinding import PersonRecipientRebindingService
+    from .recipient_rebinding_schemas import (
+        PersonRecipientRebindingInput,
+        PersonRecipientRebindingResult,
+    )
     from .repository import EmailDraftRepository
     from .schemas import (
         EmailDraftGenerationInput,
@@ -35,6 +40,9 @@ _EXPORT_MODULES = {
     "EmailPersonalizationContext": ".schemas",
     "EmailTone": ".schemas",
     "FakeEmailDraftGenerator": ".fake_provider",
+    "PersonRecipientRebindingInput": ".recipient_rebinding_schemas",
+    "PersonRecipientRebindingResult": ".recipient_rebinding_schemas",
+    "PersonRecipientRebindingService": ".recipient_rebinding",
     "build_email_personalization_context": ".context",
 }
 
@@ -54,6 +62,9 @@ __all__ = [
     "EmailPersonalizationContext",
     "EmailTone",
     "FakeEmailDraftGenerator",
+    "PersonRecipientRebindingInput",
+    "PersonRecipientRebindingResult",
+    "PersonRecipientRebindingService",
     "build_email_personalization_context",
 ]
 
