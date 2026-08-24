@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database.base import Base
@@ -15,7 +16,12 @@ from app.modules.company_enrichment.models import CompanyEnrichment
 from app.modules.contact.models import Contact
 from app.modules.email_delivery.manual_models import ManualEmailSendRecord
 from app.modules.email_delivery.models import EmailDeliveryAttempt
-from app.modules.email_draft.context import build_content_hash
+from app.modules.email_draft.context import (
+    EmailDraftSourceRecords,
+    build_content_hash,
+    build_context_fingerprint,
+    build_email_personalization_context,
+)
 from app.modules.email_draft.models import EmailDraft, EmailDraftStatus
 from app.modules.email_draft.recipient_rebinding import (
     PersonRecipientRebindingAlreadySentError,
@@ -27,6 +33,7 @@ from app.modules.email_draft.recipient_rebinding import (
     PersonRecipientRebindingStaleContextError,
 )
 from app.modules.email_draft.recipient_rebinding_schemas import PersonRecipientRebindingInput
+from app.modules.email_draft.schemas import EmailDraftGenerationInput, EmailLanguage, EmailTone
 from app.modules.lead.models import Lead
 from app.modules.project.models import Project
 from app.modules.task.models import Task
@@ -47,11 +54,22 @@ def factory(tmp_path: Path) -> Iterator[sessionmaker[Session]]:
     engine.dispose()
 
 
-def seed(factory: sessionmaker[Session]) -> dict[str, int | str]:
+def seed(
+    factory: sessionmaker[Session], *, differing_company_id: bool = False
+) -> dict[str, int | str]:
     with factory() as session:
         project = Project(name="Bohemia Bali")
         session.add(project)
         session.flush()
+        if differing_company_id:
+            session.add(
+                Company(
+                    project_id=project.id,
+                    name="Decoy Studio",
+                    website="https://decoy.example",
+                )
+            )
+            session.flush()
         company = Company(
             project_id=project.id, name="Example Studio", website="https://example.com"
         )
@@ -188,6 +206,253 @@ def test_existing_matching_contact_is_reused(factory: sessionmaker[Session]) -> 
         assert session.scalar(select(func.count()).select_from(Contact)) == 1
         contact = session.get(Contact, contact_id)
         assert contact is not None and contact.job_title == "Interior Designer"
+
+
+class TrackingSession(Session):
+    commit_calls = 0
+    rollback_calls = 0
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+        super().commit()
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+        super().rollback()
+
+
+class FlushIntegritySession(TrackingSession):
+    def flush(self, objects: Sequence[object] | None = None) -> None:
+        if self.new:
+            raise IntegrityError(
+                "INSERT INTO contacts VALUES (SECRET_VALUE)",
+                {"recipient": "SECRET_VALUE"},
+                RuntimeError("SECRET_VALUE"),
+            )
+        super().flush(objects)
+
+
+class CommitIntegritySession(TrackingSession):
+    def commit(self) -> None:
+        self.commit_calls += 1
+        raise IntegrityError(
+            "UPDATE email_drafts SET request_fingerprint=SECRET_VALUE",
+            {"fingerprint": "SECRET_VALUE"},
+            RuntimeError("SECRET_VALUE"),
+        )
+
+
+def capturing_factory(
+    factory: sessionmaker[Session], session_type: type[TrackingSession]
+) -> tuple[object, list[TrackingSession]]:
+    sessions: list[TrackingSession] = []
+
+    def create() -> Session:
+        session = session_type(bind=factory.kw["bind"], expire_on_commit=False)
+        sessions.append(session)
+        return session
+
+    return create, sessions
+
+
+def test_rebinding_uses_project_id_for_project_scope_when_company_id_differs(
+    factory: sessionmaker[Session],
+) -> None:
+    ids = seed(factory, differing_company_id=True)
+    service_factory, sessions = capturing_factory(factory, TrackingSession)
+    result = PersonRecipientRebindingService(service_factory).rebind(command(ids))
+    assert ids["project"] == 1 and ids["company"] == 2
+    assert result.company_id == 2 and result.contact_created is True
+    assert len(sessions) == 1 and sessions[0].commit_calls == 1
+    with factory() as session:
+        company = session.get(Company, ids["company"])
+        lead = session.get(Lead, ids["lead"])
+        draft = session.get(EmailDraft, ids["draft"])
+        assert company is not None and company.project_id == ids["project"]
+        assert lead is not None and lead.contact_id == result.contact_id
+        assert draft is not None and draft.contact_id == result.contact_id
+        assert session.scalar(select(func.count()).select_from(Contact)) == 1
+        assert session.scalar(select(func.count()).select_from(ManualEmailSendRecord)) == 0
+        assert session.scalar(select(func.count()).select_from(EmailDeliveryAttempt)) == 0
+
+
+def test_flush_integrity_error_maps_to_conflict_and_rolls_back(
+    factory: sessionmaker[Session],
+) -> None:
+    ids = seed(factory)
+    service_factory, sessions = capturing_factory(factory, FlushIntegritySession)
+    with pytest.raises(PersonRecipientRebindingConflictError):
+        PersonRecipientRebindingService(service_factory).rebind(command(ids))
+    assert len(sessions) == 1 and sessions[0].rollback_calls == 1
+    assert_company_chain_unchanged(factory, ids, contact_count=0)
+
+
+def test_commit_integrity_error_maps_to_conflict_and_rolls_back(
+    factory: sessionmaker[Session],
+) -> None:
+    ids = seed(factory)
+    service_factory, sessions = capturing_factory(factory, CommitIntegritySession)
+    with pytest.raises(PersonRecipientRebindingConflictError):
+        PersonRecipientRebindingService(service_factory).rebind(command(ids))
+    assert len(sessions) == 1
+    assert sessions[0].commit_calls == 1 and sessions[0].rollback_calls == 1
+    assert_company_chain_unchanged(factory, ids, contact_count=0)
+
+
+def test_real_manual_send_record_blocks_rebinding_without_mutation(
+    factory: sessionmaker[Session],
+) -> None:
+    ids = seed(factory)
+    with factory() as session:
+        session.add(
+            ManualEmailSendRecord(
+                project_id=ids["project"],
+                company_id=ids["company"],
+                contact_id=None,
+                email_draft_id=ids["draft"],
+                recipient_email=EMAIL,
+                sent_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
+    with pytest.raises(PersonRecipientRebindingAlreadySentError):
+        PersonRecipientRebindingService(factory).rebind(command(ids))
+    assert_company_chain_unchanged(factory, ids, contact_count=0)
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(ManualEmailSendRecord)) == 1
+
+
+def test_real_email_delivery_attempt_blocks_rebinding_without_mutation(
+    factory: sessionmaker[Session],
+) -> None:
+    ids = seed(factory)
+    with factory() as session:
+        session.add(
+            EmailDeliveryAttempt(
+                email_draft_id=ids["draft"],
+                attempt_key="c" * 64,
+                outcome="RESERVED",
+                recipient_email=EMAIL,
+                envelope_from="sender@example.com",
+                header_from_email="sender@example.com",
+                header_from_name="Alex",
+                reply_to=None,
+                message_id="<rebinding-test@example.com>",
+                content_hash=ids["hash"],
+                transport_name="fake",
+                security_mode="PLAINTEXT_LOCAL_TEST_ONLY",
+            )
+        )
+        session.commit()
+    with pytest.raises(PersonRecipientRebindingAlreadySentError):
+        PersonRecipientRebindingService(factory).rebind(command(ids))
+    assert_company_chain_unchanged(factory, ids, contact_count=0)
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(EmailDeliveryAttempt)) == 1
+
+
+def test_final_request_fingerprint_collision_raises_conflict_and_rolls_back(
+    factory: sessionmaker[Session],
+) -> None:
+    ids = seed(factory)
+    with factory() as session:
+        project = session.get(Project, ids["project"])
+        company = session.get(Company, ids["company"])
+        enrichment = session.scalar(select(CompanyEnrichment))
+        lead = session.get(Lead, ids["lead"])
+        task = session.get(Task, ids["task"])
+        target = session.get(EmailDraft, ids["draft"])
+        assert all(
+            record is not None for record in (project, company, enrichment, lead, task, target)
+        )
+        assert project is not None and company is not None and enrichment is not None
+        assert lead is not None and task is not None and target is not None
+        contact = Contact(
+            company_id=company.id,
+            first_name="Yasmin",
+            last_name="Alsdais",
+            job_title="Interior Designer",
+            email=EMAIL,
+            country="Saudi Arabia",
+            city="Riyadh",
+            source="OFFICIAL_WEBSITE",
+            status="NEW",
+        )
+        session.add(contact)
+        session.flush()
+        company.country = "Saudi Arabia"
+        company.city = "Riyadh"
+        lead.contact_id = contact.id
+        generation = EmailDraftGenerationInput(
+            project_id=project.id,
+            company_id=company.id,
+            contact_id=contact.id,
+            lead_id=lead.id,
+            task_id=task.id,
+            sender_name=target.sender_name,
+            sender_company=target.sender_company,
+            language=EmailLanguage(target.language),
+            tone=EmailTone(target.generation_tone),
+            purpose=target.generation_purpose,
+            value_proposition=target.generation_value_proposition,
+            prompt_version=target.prompt_version,
+        )
+        context = build_email_personalization_context(
+            EmailDraftSourceRecords(
+                project=project,
+                company=company,
+                contact=contact,
+                lead=lead,
+                task=task,
+                company_email=enrichment.email,
+            )
+        )
+        fingerprint = build_context_fingerprint(context, generation)
+        company.country = None
+        company.city = None
+        lead.contact_id = None
+        collision_subject = "Existing person-scoped draft"
+        collision_body = "A separate persisted draft that owns the final request fingerprint."
+        collision_hash = build_content_hash(
+            recipient_email=EMAIL,
+            subject=collision_subject,
+            text_body=collision_body,
+            prompt_version=PROMPT,
+        )
+        collision = EmailDraft(
+            project_id=project.id,
+            company_id=company.id,
+            contact_id=contact.id,
+            lead_id=lead.id,
+            task_id=task.id,
+            recipient_email=EMAIL,
+            recipient_name="Yasmin Alsdais",
+            recipient_role="Interior Designer",
+            sender_name="Alex",
+            sender_company="Bohemia Bali",
+            generation_tone="warm",
+            generation_purpose="Explore collaboration",
+            generation_value_proposition="Handcrafted furniture",
+            subject=collision_subject,
+            text_body=collision_body,
+            language="en",
+            prompt_version=PROMPT,
+            provider="fake",
+            model="fake",
+            context_fingerprint=fingerprint,
+            request_fingerprint=fingerprint,
+            content_hash=collision_hash,
+            status=EmailDraftStatus.DRAFT.value,
+        )
+        session.add(collision)
+        session.commit()
+        collision_id = collision.id
+    with pytest.raises(PersonRecipientRebindingConflictError):
+        PersonRecipientRebindingService(factory).rebind(command(ids))
+    assert_company_chain_unchanged(factory, ids, contact_count=1)
+    with factory() as session:
+        collision = session.get(EmailDraft, collision_id)
+        assert collision is not None and collision.request_fingerprint == fingerprint
 
 
 def test_conflicting_contact_identity_rolls_back(factory: sessionmaker[Session]) -> None:

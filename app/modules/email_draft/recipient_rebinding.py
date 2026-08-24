@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 from sqlalchemy import func, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.database.base import Base
@@ -109,6 +109,8 @@ class PersonRecipientRebindingService:
             try:
                 session.commit()
                 committed = True
+            except IntegrityError:
+                raise PersonRecipientRebindingConflictError(_CONFLICT) from None
             except Exception:
                 raise PersonRecipientRebindingPersistenceError(_PERSISTENCE) from None
             return result
@@ -116,6 +118,10 @@ class PersonRecipientRebindingService:
             if not committed:
                 self._cleanup(session.rollback)
             raise
+        except IntegrityError:
+            if not committed:
+                self._cleanup(session.rollback)
+            raise PersonRecipientRebindingConflictError(_CONFLICT) from None
         except SQLAlchemyError:
             if not committed:
                 self._cleanup(session.rollback)
@@ -133,7 +139,7 @@ class PersonRecipientRebindingService:
         self, session: Session, data: PersonRecipientRebindingInput
     ) -> PersonRecipientRebindingResult:
         try:
-            CompanyRepository(session).acquire_promotion_scope(data.company_id)
+            CompanyRepository(session).acquire_promotion_scope(data.project_id)
         except ValueError:
             raise PersonRecipientRebindingNotFoundError(_NOT_FOUND) from None
 

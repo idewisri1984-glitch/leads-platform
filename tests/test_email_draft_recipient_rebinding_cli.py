@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from typer.testing import CliRunner
 
@@ -199,3 +200,35 @@ def test_cli_unknown_exception_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.exit_code == 1
     assert result.stderr == "Person recipient rebinding failed.\n"
     assert "SECRET_DATABASE_VALUE" not in result.output
+
+
+def test_cli_commit_integrity_conflict_returns_exit_code_11(
+    factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ids, content_hash = seed(factory)
+
+    class CommitIntegritySession(Session):
+        def commit(self) -> None:
+            raise IntegrityError(
+                "UPDATE email_drafts SET request_fingerprint=SECRET_VALUE",
+                {"fingerprint": "SECRET_VALUE"},
+                RuntimeError("SECRET_VALUE"),
+            )
+
+    failing_factory = sessionmaker(
+        bind=factory.kw["bind"], class_=CommitIntegritySession, expire_on_commit=False
+    )
+    original = cli.execute_rebind_person_recipient
+    monkeypatch.setattr(
+        cli,
+        "execute_rebind_person_recipient",
+        lambda data, output: original(data, output, session_factory=failing_factory),
+    )
+    result = runner.invoke(app, arguments(ids, content_hash))
+    assert result.exit_code == 11
+    assert result.stderr == "Person recipient rebinding conflicts with persisted data.\n"
+    assert "SECRET_VALUE" not in result.output
+    assert "UPDATE email_drafts" not in result.output
+    assert "Traceback" not in result.output
+    with factory() as session:
+        assert session.scalar(select(Contact)) is None
