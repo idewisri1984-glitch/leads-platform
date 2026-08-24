@@ -31,6 +31,7 @@ commands = [
     ['agent', 'email-draft', 'show', '--help'],
     ['agent', 'email-draft', 'approve', '--help'],
     ['agent', 'email-draft', 'reject', '--help'],
+    ['agent', 'email-draft', 'rebind-person-recipient', '--help'],
     ['agent', 'email-draft', 'show', '--unknown'],
     [
         'agent', 'email-draft', 'approve', '--project-id', '1', '--company-id', '2',
@@ -38,6 +39,17 @@ commands = [
     ],
 ]
 results = [runner.invoke(app, command) for command in commands]
+from app.modules.email_draft import (
+    PersonRecipientRebindingInput, PersonRecipientRebindingResult,
+    PersonRecipientRebindingService,
+)
+assert all(
+    (
+        PersonRecipientRebindingInput,
+        PersonRecipientRebindingResult,
+        PersonRecipientRebindingService,
+    )
+)
 forbidden = [
     'app.core.config.settings', 'app.core.database.engine', 'app.core.database.session',
     'app.providers.openai_email.client', 'openai', 'smtplib'
@@ -48,4 +60,4 @@ print(','.join(loaded))
 """
     result = run(proof)
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["0,0,0,0,0,0,2,3", ""]
+    assert result.stdout.splitlines() == ["0,0,0,0,0,0,0,2,3", ""]
