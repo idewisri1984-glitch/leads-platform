@@ -402,6 +402,50 @@ class CRMExcelExportService:
         dataset = self.load(session, project_id=project_id, company_id=company_id)
         return self._export_dataset(dataset, destination, overwrite=overwrite)
 
+    def export_drafts(
+        self,
+        session: Session,
+        *,
+        project_id: int,
+        email_draft_ids: tuple[int, ...],
+        output_file: Path,
+        overwrite: bool,
+    ) -> CRMExcelExportResult:
+        destination = self.normalize_output_file(output_file)
+        if destination.exists() and not overwrite:
+            raise CRMExcelExportError(f"Destination already exists: {destination}")
+        dataset = self.load(session, project_id=project_id, company_id=None)
+        selected = self._select_drafts(dataset, email_draft_ids)
+        return self._export_dataset(selected, destination, overwrite=overwrite)
+
+    @staticmethod
+    def _select_drafts(
+        dataset: CRMExcelDataset,
+        email_draft_ids: tuple[int, ...],
+    ) -> CRMExcelDataset:
+        selected_ids = set(email_draft_ids)
+        outreach = tuple(row for row in dataset.outreach if row.draft_id in selected_ids)
+        if {row.draft_id for row in outreach} != selected_ids:
+            raise CRMExcelExportError("One or more selected EmailDraft rows are unavailable.")
+        sales_leads = tuple(row for row in dataset.sales_leads if row.draft_id in selected_ids)
+        company_ids = {row.company_id for row in sales_leads}
+        lead_ids = {row.lead_id for row in sales_leads if row.lead_id is not None}
+        task_ids = {row.draft_task_id for row in outreach}
+        companies = tuple(row for row in dataset.companies if row.id in company_ids)
+        contacts = tuple(row for row in dataset.contacts if row.company_id in company_ids)
+        tasks = tuple(row for row in dataset.tasks if row.id in task_ids)
+        leads = tuple(row for row in dataset.leads if row.draft_id in selected_ids)
+        return CRMExcelDataset(
+            sales_leads,
+            leads,
+            {key: value for key, value in dataset.lead_project_ids.items() if key in lead_ids},
+            {key: value for key, value in dataset.task_due_dates.items() if key in task_ids},
+            companies,
+            contacts,
+            tasks,
+            outreach,
+        )
+
     def _export_dataset(
         self,
         dataset: CRMExcelDataset,
