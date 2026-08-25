@@ -13,6 +13,7 @@ from rich.text import Text
 if TYPE_CHECKING:
     from app.modules.crm import CRMOverviewRow
     from app.modules.crm.excel_export import CRMExcelExportResult
+    from app.modules.crm.outreach_batch import OutreachBatchResult
 
 app = typer.Typer(help="Show a read-only CRM overview.")
 
@@ -62,6 +63,24 @@ def _export_excel(
         output_file=output_file,
         overwrite=overwrite,
         session_factory=SessionLocal,
+    )
+
+
+def _export_outreach_batch(
+    project_id: int,
+    email_draft_ids: tuple[int, ...],
+    output_file: Path,
+    *,
+    confirmed: bool,
+) -> OutreachBatchResult:
+    from app.core.database.session import SessionLocal
+    from app.modules.crm.outreach_batch import OutreachBatchWorkflow
+
+    return OutreachBatchWorkflow(SessionLocal).execute(
+        project_id=project_id,
+        email_draft_ids=email_draft_ids,
+        output_file=output_file,
+        confirmed=confirmed,
     )
 
 
@@ -159,3 +178,59 @@ def export_excel(
     typer.echo(f"CRM Excel export created: {result.output_file}")
     for sheet_name, count in result.counts.items():
         typer.echo(f"{sheet_name}: {count}")
+
+
+@app.command("export-outreach-batch")
+def export_outreach_batch(
+    project_id: Annotated[int, typer.Option(help="Project ID for every selected Draft.")],
+    email_draft_id: Annotated[
+        list[int], typer.Option("--email-draft-id", help="Repeat for each EmailDraft ID.")
+    ],
+    output_file: Annotated[Path, typer.Option(help="Destination .xlsx file.")],
+    confirm: Annotated[
+        bool, typer.Option(help="Record the entire batch as manually sent.")
+    ] = False,
+    output: Annotated[str, typer.Option(help="Output format: text or json.")] = "text",
+) -> None:
+    """Export selected Drafts and record one confirmed manual-send batch."""
+    if project_id <= 0:
+        raise typer.BadParameter("Project ID must be positive.", param_hint="--project-id")
+    if not email_draft_id or any(value <= 0 for value in email_draft_id):
+        raise typer.BadParameter(
+            "At least one positive EmailDraft ID is required.",
+            param_hint="--email-draft-id",
+        )
+    normalized_output = output.strip().casefold()
+    if normalized_output not in {"json", "text"}:
+        raise typer.BadParameter("Output must be text or json.", param_hint="--output")
+    try:
+        result = _export_outreach_batch(
+            project_id,
+            tuple(email_draft_id),
+            output_file,
+            confirmed=confirm,
+        )
+    except Exception:
+        typer.echo("Outreach batch workflow failed.", err=True)
+        raise typer.Exit(1) from None
+    payload = result.as_dict()
+    if normalized_output == "json":
+        typer.echo(json.dumps(payload, ensure_ascii=True))
+    else:
+        typer.echo(f"Status: {payload['status']}")
+        typer.echo(f"Project ID: {project_id}")
+        typer.echo(f"EmailDraft IDs: {', '.join(map(str, email_draft_id))}")
+        typer.echo(f"Output file: {payload['output_file']}")
+        typer.echo(f"Batch size: {len(result.items)}")
+        if not confirm:
+            for item in result.items:
+                typer.echo(f"Draft {item.email_draft_id}")
+                typer.echo(f"  Company: {item.company_name}")
+                typer.echo(f"  Recipient: {item.recipient_email}")
+                typer.echo(f"  Recipient type: {item.recipient_type}")
+                typer.echo(f"  Current outreach: {item.outreach_status}")
+                typer.echo("  Action: RECORD_MANUAL_SEND")
+        if payload["message"]:
+            typer.echo(str(payload["message"]))
+    if result.status.value not in {"COMPLETE", "CONFIRMATION_REQUIRED"}:
+        raise typer.Exit(1)

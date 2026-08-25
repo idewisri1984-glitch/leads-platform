@@ -19,12 +19,14 @@ from app.modules.task.models import Task, TaskLifecycleStatus
 from .manual_models import ManualEmailSendRecord
 from .manual_repository import ManualEmailSendRecordRepository
 from .manual_schemas import (
+    ConfirmedExternalManualEmailSendBatchCommand,
     ConfirmedExternalManualEmailSendCommand,
     ConfirmedManualEmailSendCommand,
     ExternalManualEmailDraftScope,
     ManualEmailCopyPackage,
     ManualEmailDraftScope,
     ManualEmailSendRecordCreate,
+    ManualOutreachBatchReason,
     ManualOutreachStatus,
     ManualRecipientType,
 )
@@ -84,6 +86,18 @@ class ManualOutreachTransactionBoundaryError(ManualOutreachError):
 
 class ManualOutreachPersistenceError(ManualOutreachError):
     pass
+
+
+class ManualOutreachBatchValidationError(ManualOutreachError):
+    def __init__(
+        self,
+        reason: ManualOutreachBatchReason,
+        email_draft_id: int,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.email_draft_id = email_draft_id
 
 
 class ManualOutreachService:
@@ -177,30 +191,7 @@ class ManualOutreachService:
                 return self._package(draft, company, existing)
 
             recorded_at = self._utc(self.clock())
-            if not claim_email_delivery_mode(
-                self.session,
-                email_draft_id=draft.id,
-                mode=EmailDeliveryMode.MANUAL,
-            ):
-                self.session.expire_all()
-                if self.attempt_repository.get_by_email_draft_id(draft.id) is not None:
-                    raise ManualOutreachAutomaticAttemptError(_ALREADY_AUTOMATIC)
-                existing = self.repository.get_by_email_draft_id(draft.id)
-                if existing is not None:
-                    return self._package(draft, company, existing)
-                raise ManualOutreachAlreadySentError(_ALREADY_MANUAL)
-
-            record = self.repository.create(
-                ManualEmailSendRecordCreate(
-                    project_id=draft.project_id,
-                    company_id=draft.company_id,
-                    contact_id=draft.contact_id,
-                    email_draft_id=draft.id,
-                    recipient_email=draft.recipient_email,
-                    sent_at=recorded_at,
-                )
-            )
-            return self._package(draft, company, record)
+            return self._record_external_prevalidated(draft, company, recorded_at)
         except ManualOutreachError:
             self.session.rollback()
             raise
@@ -210,6 +201,168 @@ class ManualOutreachService:
         except (SQLAlchemyError, ValueError):
             self.session.rollback()
             raise ManualOutreachPersistenceError(_PERSISTENCE) from None
+
+    def preview_external_manual_send_batch(
+        self,
+        command: ConfirmedExternalManualEmailSendBatchCommand,
+    ) -> tuple[ManualEmailCopyPackage, ...]:
+        data = self._validated_batch_command(command)
+        if self.session.in_transaction():
+            raise ManualOutreachTransactionBoundaryError(_TRANSACTION)
+        try:
+            prepared = self._prevalidate_external_batch(data)
+            packages = tuple(self._package(draft, company, None) for draft, company in prepared)
+            self.session.rollback()
+            return packages
+        except ManualOutreachError:
+            self.session.rollback()
+            raise
+        except (SQLAlchemyError, ValueError):
+            self.session.rollback()
+            raise ManualOutreachPersistenceError(_PERSISTENCE) from None
+
+    def record_external_manual_send_batch(
+        self,
+        command: ConfirmedExternalManualEmailSendBatchCommand,
+    ) -> tuple[ManualEmailCopyPackage, ...]:
+        data = self._validated_batch_command(command)
+        if not data.confirmed:
+            raise ManualOutreachConfirmationRequiredError(_CONFIRMATION)
+        if self.session.in_transaction():
+            raise ManualOutreachTransactionBoundaryError(_TRANSACTION)
+        try:
+            prepared = self._prevalidate_external_batch(data)
+            recorded_at = self._utc(self.clock())
+            packages: list[ManualEmailCopyPackage] = []
+            for draft, company in prepared:
+                try:
+                    packages.append(self._record_external_prevalidated(draft, company, recorded_at))
+                except ManualOutreachAutomaticAttemptError:
+                    raise ManualOutreachBatchValidationError(
+                        ManualOutreachBatchReason.DELIVERY_ATTEMPT_EXISTS,
+                        draft.id,
+                        _ALREADY_AUTOMATIC,
+                    ) from None
+                except ManualOutreachAlreadySentError:
+                    raise ManualOutreachBatchValidationError(
+                        ManualOutreachBatchReason.ALREADY_MANUALLY_SENT,
+                        draft.id,
+                        _ALREADY_MANUAL,
+                    ) from None
+            return tuple(packages)
+        except ManualOutreachError:
+            self.session.rollback()
+            raise
+        except IntegrityError:
+            self.session.rollback()
+            raise ManualOutreachPersistenceError(_PERSISTENCE) from None
+        except (SQLAlchemyError, ValueError):
+            self.session.rollback()
+            raise ManualOutreachPersistenceError(_PERSISTENCE) from None
+
+    @staticmethod
+    def _validated_batch_command(
+        command: object,
+    ) -> ConfirmedExternalManualEmailSendBatchCommand:
+        if type(command) is not ConfirmedExternalManualEmailSendBatchCommand:
+            raise ManualOutreachInvalidCommandError(_INVALID)
+        try:
+            return ConfirmedExternalManualEmailSendBatchCommand(**command.model_dump())
+        except (ValidationError, TypeError, ValueError):
+            raise ManualOutreachInvalidCommandError(_INVALID) from None
+
+    def _prevalidate_external_batch(
+        self,
+        data: ConfirmedExternalManualEmailSendBatchCommand,
+    ) -> tuple[tuple[EmailDraft, Company], ...]:
+        seen: set[int] = set()
+        prepared: list[tuple[EmailDraft, Company]] = []
+        for email_draft_id in data.email_draft_ids:
+            if email_draft_id <= 0 or email_draft_id in seen:
+                raise ManualOutreachBatchValidationError(
+                    ManualOutreachBatchReason.INVALID_DRAFT,
+                    email_draft_id,
+                    "Batch contains an invalid or duplicate EmailDraft ID.",
+                )
+            seen.add(email_draft_id)
+            draft = self.session.get(EmailDraft, email_draft_id, populate_existing=True)
+            if draft is None or draft.project_id != data.project_id:
+                raise ManualOutreachBatchValidationError(
+                    ManualOutreachBatchReason.INVALID_DRAFT,
+                    email_draft_id,
+                    _NOT_FOUND,
+                )
+            try:
+                draft, company = self._load_external_draft(
+                    ExternalManualEmailDraftScope(
+                        project_id=data.project_id,
+                        company_id=draft.company_id,
+                        email_draft_id=draft.id,
+                    )
+                )
+            except ManualOutreachError as error:
+                raise ManualOutreachBatchValidationError(
+                    ManualOutreachBatchReason.INVALID_DRAFT,
+                    email_draft_id,
+                    str(error),
+                ) from None
+            if draft.status != EmailDraftStatus.DRAFT.value:
+                raise ManualOutreachBatchValidationError(
+                    ManualOutreachBatchReason.INVALID_DRAFT,
+                    email_draft_id,
+                    "Email draft must have DRAFT status.",
+                )
+            attempt = self.attempt_repository.get_by_email_draft_id(draft.id)
+            if attempt is not None or draft.delivery_mode == EmailDeliveryMode.AUTOMATIC.value:
+                raise ManualOutreachBatchValidationError(
+                    ManualOutreachBatchReason.DELIVERY_ATTEMPT_EXISTS,
+                    email_draft_id,
+                    _ALREADY_AUTOMATIC,
+                )
+            record = self.repository.get_by_email_draft_id(draft.id)
+            if record is not None or draft.delivery_mode == EmailDeliveryMode.MANUAL.value:
+                raise ManualOutreachBatchValidationError(
+                    ManualOutreachBatchReason.ALREADY_MANUALLY_SENT,
+                    email_draft_id,
+                    _ALREADY_MANUAL,
+                )
+            if draft.delivery_mode is not None:
+                raise ManualOutreachBatchValidationError(
+                    ManualOutreachBatchReason.INVALID_DRAFT,
+                    email_draft_id,
+                    "Email draft delivery mode is invalid.",
+                )
+            prepared.append((draft, company))
+        return tuple(prepared)
+
+    def _record_external_prevalidated(
+        self,
+        draft: EmailDraft,
+        company: Company,
+        recorded_at: datetime,
+    ) -> ManualEmailCopyPackage:
+        if not claim_email_delivery_mode(
+            self.session,
+            email_draft_id=draft.id,
+            mode=EmailDeliveryMode.MANUAL,
+        ):
+            self.session.expire_all()
+            if self.attempt_repository.get_by_email_draft_id(draft.id) is not None:
+                raise ManualOutreachAutomaticAttemptError(_ALREADY_AUTOMATIC)
+            if self.repository.get_by_email_draft_id(draft.id) is not None:
+                raise ManualOutreachAlreadySentError(_ALREADY_MANUAL)
+            raise ManualOutreachAlreadySentError(_ALREADY_MANUAL)
+        record = self.repository.create(
+            ManualEmailSendRecordCreate(
+                project_id=draft.project_id,
+                company_id=draft.company_id,
+                contact_id=draft.contact_id,
+                email_draft_id=draft.id,
+                recipient_email=draft.recipient_email,
+                sent_at=recorded_at,
+            )
+        )
+        return self._package(draft, company, record)
 
     @staticmethod
     def _validated_scope(scope: object) -> ManualEmailDraftScope:

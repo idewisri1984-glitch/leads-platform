@@ -402,6 +402,91 @@ class CRMExcelExportService:
         dataset = self.load(session, project_id=project_id, company_id=company_id)
         return self._export_dataset(dataset, destination, overwrite=overwrite)
 
+    def export_drafts(
+        self,
+        session: Session,
+        *,
+        project_id: int,
+        email_draft_ids: tuple[int, ...],
+        output_file: Path,
+        overwrite: bool,
+    ) -> CRMExcelExportResult:
+        destination = self.normalize_output_file(output_file)
+        if destination.exists() and not overwrite:
+            raise CRMExcelExportError(f"Destination already exists: {destination}")
+        dataset = self.load(session, project_id=project_id, company_id=None)
+        selected = self._select_drafts(dataset, email_draft_ids)
+        return self._export_dataset(selected, destination, overwrite=overwrite)
+
+    @staticmethod
+    def _select_drafts(
+        dataset: CRMExcelDataset,
+        email_draft_ids: tuple[int, ...],
+    ) -> CRMExcelDataset:
+        selected_ids = set(email_draft_ids)
+        outreach = tuple(row for row in dataset.outreach if row.draft_id in selected_ids)
+        if {row.draft_id for row in outreach} != selected_ids:
+            raise CRMExcelExportError("One or more selected EmailDraft rows are unavailable.")
+        rows_by_draft: dict[int, list[CRMOverviewRow]] = {}
+        for row in dataset.leads:
+            if row.draft_id in selected_ids:
+                rows_by_draft.setdefault(row.draft_id, []).append(row)
+        if any(len(rows_by_draft.get(draft_id, ())) != 1 for draft_id in selected_ids):
+            raise CRMExcelExportError("One or more selected CRM rows are unavailable.")
+        selected_rows = tuple(rows_by_draft[draft_id][0] for draft_id in email_draft_ids)
+        company_ids = {row.company_id for row in selected_rows}
+        lead_ids = {row.lead_id for row in selected_rows if row.lead_id is not None}
+        task_ids = {row.draft_task_id for row in outreach}
+        companies = tuple(row for row in dataset.companies if row.id in company_ids)
+        company_by_id = {row.id: row for row in companies}
+        if set(company_by_id) != company_ids:
+            raise CRMExcelExportError("One or more selected Company rows are unavailable.")
+        contacts = tuple(row for row in dataset.contacts if row.company_id in company_ids)
+        contact_by_id = {row.id: row for row in contacts}
+        tasks = tuple(row for row in dataset.tasks if row.id in task_ids)
+        outreach_by_draft = {row.draft_id: row for row in outreach}
+        sales_leads: list[ExcelSalesLead] = []
+        for row in selected_rows:
+            company = company_by_id[row.company_id]
+            draft_id = row.draft_id
+            if draft_id is None:
+                raise CRMExcelExportError("Selected CRM row has no EmailDraft.")
+            selected_outreach = outreach_by_draft[draft_id]
+            selected_contact = (
+                contact_by_id.get(row.contact_id) if row.contact_id is not None else None
+            )
+            if row.contact_id is not None and (
+                selected_contact is None
+                or selected_contact.company_id != company.id
+                or selected_contact.email is None
+                or selected_contact.email.strip().casefold()
+                != selected_outreach.recipient_email.strip().casefold()
+                or selected_outreach.recipient_type != "PERSON"
+            ):
+                raise CRMExcelExportError("Selected PERSON recipient context is invalid.")
+            if row.contact_id is None and selected_outreach.recipient_type != "COMPANY":
+                raise CRMExcelExportError("Selected COMPANY recipient context is invalid.")
+            sales_leads.extend(
+                CRMExcelExportService()._build_sales_leads(
+                    (company,),
+                    tuple(contact for contact in contacts if contact.company_id == company.id),
+                    (row,),
+                    (selected_outreach,),
+                    selected_rows_by_company={company.id: row},
+                    selected_contacts_by_company={company.id: selected_contact},
+                )
+            )
+        return CRMExcelDataset(
+            tuple(sales_leads),
+            selected_rows,
+            {key: value for key, value in dataset.lead_project_ids.items() if key in lead_ids},
+            {key: value for key, value in dataset.task_due_dates.items() if key in task_ids},
+            companies,
+            contacts,
+            tasks,
+            outreach,
+        )
+
     def _export_dataset(
         self,
         dataset: CRMExcelDataset,
@@ -825,6 +910,9 @@ class CRMExcelExportService:
         contacts: tuple[ExcelContact, ...],
         rows: tuple[CRMOverviewRow, ...],
         outreach: tuple[ExcelOutreach, ...],
+        *,
+        selected_rows_by_company: dict[int, CRMOverviewRow] | None = None,
+        selected_contacts_by_company: dict[int, ExcelContact | None] | None = None,
     ) -> tuple[ExcelSalesLead, ...]:
         contacts_by_company: dict[int, list[ExcelContact]] = {}
         rows_by_company: dict[int, list[CRMOverviewRow]] = {}
@@ -835,9 +923,18 @@ class CRMExcelExportService:
             rows_by_company.setdefault(row.company_id, []).append(row)
         result: list[ExcelSalesLead] = []
         for company in companies:
-            primary = self._select_primary_contact(contacts_by_company.get(company.id, []))
+            primary = (
+                selected_contacts_by_company[company.id]
+                if selected_contacts_by_company is not None
+                and company.id in selected_contacts_by_company
+                else self._select_primary_contact(contacts_by_company.get(company.id, []))
+            )
             company_rows = rows_by_company.get(company.id, [])
-            selected_row = self._select_master_row(company_rows, primary)
+            selected_row = (
+                selected_rows_by_company.get(company.id)
+                if selected_rows_by_company is not None
+                else self._select_master_row(company_rows, primary)
+            )
             draft = (
                 outreach_by_draft.get(selected_row.draft_id)
                 if selected_row and selected_row.draft_id is not None
@@ -855,7 +952,26 @@ class CRMExcelExportService:
                 and draft is not None
                 else None
             )
-            if company_scoped_draft is not None:
+            person_scoped_draft = (
+                draft
+                if selected_row is not None
+                and selected_row.contact_id is not None
+                and draft is not None
+                and selected_contacts_by_company is not None
+                else None
+            )
+            if person_scoped_draft is not None:
+                draft_recipient = (
+                    person_scoped_draft.recipient_email
+                    if self._usable_email(person_scoped_draft.recipient_email)
+                    else None
+                )
+                recipient_type, recipient = (
+                    ("DECISION_MAKER", draft_recipient)
+                    if draft_recipient is not None
+                    else ("NO_EMAIL", None)
+                )
+            elif company_scoped_draft is not None:
                 draft_recipient = (
                     company_scoped_draft.recipient_email
                     if self._usable_email(company_scoped_draft.recipient_email)

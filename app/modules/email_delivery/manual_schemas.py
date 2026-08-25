@@ -39,6 +39,20 @@ class ConfirmedExternalManualEmailSendCommand(ExternalManualEmailDraftScope):
     confirmed: bool
 
 
+class ConfirmedExternalManualEmailSendBatchCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    project_id: int = Field(gt=0)
+    email_draft_ids: tuple[int, ...] = Field(min_length=1)
+    confirmed: bool
+
+
+class ManualOutreachBatchReason(StrEnum):
+    INVALID_DRAFT = "INVALID_DRAFT"
+    ALREADY_MANUALLY_SENT = "ALREADY_MANUALLY_SENT"
+    DELIVERY_ATTEMPT_EXISTS = "DELIVERY_ATTEMPT_EXISTS"
+
+
 class ManualEmailCopyPackage(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
