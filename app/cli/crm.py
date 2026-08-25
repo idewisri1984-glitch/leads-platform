@@ -221,6 +221,15 @@ def export_outreach_batch(
         typer.echo(f"Project ID: {project_id}")
         typer.echo(f"EmailDraft IDs: {', '.join(map(str, email_draft_id))}")
         typer.echo(f"Output file: {payload['output_file']}")
+        typer.echo(f"Batch size: {len(result.items)}")
+        if not confirm:
+            for item in result.items:
+                typer.echo(f"Draft {item.email_draft_id}")
+                typer.echo(f"  Company: {item.company_name}")
+                typer.echo(f"  Recipient: {item.recipient_email}")
+                typer.echo(f"  Recipient type: {item.recipient_type}")
+                typer.echo(f"  Current outreach: {item.outreach_status}")
+                typer.echo("  Action: RECORD_MANUAL_SEND")
         if payload["message"]:
             typer.echo(str(payload["message"]))
     if result.status.value not in {"COMPLETE", "CONFIRMATION_REQUIRED"}:

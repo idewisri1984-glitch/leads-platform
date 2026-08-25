@@ -133,17 +133,7 @@ class OutreachBatchWorkflow:
                 message=f"Destination already exists: {destination}",
             )
         try:
-            with tempfile.TemporaryDirectory(prefix="outreach-batch-") as temporary:
-                preflight = Path(temporary) / "preflight.xlsx"
-                with self.session_factory() as session:
-                    self.exporter.export_drafts(
-                        session,
-                        project_id=project_id,
-                        email_draft_ids=email_draft_ids,
-                        output_file=preflight,
-                        overwrite=False,
-                    )
-                self._verify_workbook(preflight, email_draft_ids, sent=False)
+            self._preflight_export(command, destination, preview)
         except Exception:
             return self._result(
                 OutreachBatchStatus.EXPORT_FAILED_BEFORE_MUTATION,
@@ -165,7 +155,7 @@ class OutreachBatchWorkflow:
                     output_file=destination,
                     overwrite=False,
                 )
-            self._verify_workbook(destination, email_draft_ids, sent=True)
+            self._verify_workbook(destination, recorded, sent=True)
         except Exception:
             return self._result(
                 OutreachBatchStatus.MANUAL_SEND_RECORDED_EXPORT_FAILED,
@@ -180,6 +170,36 @@ class OutreachBatchWorkflow:
             destination,
             recorded,
         )
+
+    def _preflight_export(
+        self,
+        command: ConfirmedExternalManualEmailSendBatchCommand,
+        destination: Path,
+        packages: tuple[ManualEmailCopyPackage, ...],
+    ) -> None:
+        preflight: Path | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent,
+                prefix=f".{destination.name}.preflight.",
+                suffix=".xlsx",
+                delete=False,
+            ) as handle:
+                preflight = Path(handle.name)
+            preflight.unlink()
+            with self.session_factory() as session:
+                self.exporter.export_drafts(
+                    session,
+                    project_id=command.project_id,
+                    email_draft_ids=command.email_draft_ids,
+                    output_file=preflight,
+                    overwrite=False,
+                )
+            self._verify_workbook(preflight, packages, sent=False)
+        finally:
+            if preflight is not None:
+                preflight.unlink(missing_ok=True)
 
     def _preview(
         self,
@@ -290,7 +310,7 @@ class OutreachBatchWorkflow:
     @staticmethod
     def _verify_workbook(
         output_file: Path,
-        email_draft_ids: tuple[int, ...],
+        packages: tuple[ManualEmailCopyPackage, ...],
         *,
         sent: bool,
     ) -> None:
@@ -301,21 +321,58 @@ class OutreachBatchWorkflow:
             required = {"Sales Leads", "Companies", "Contacts", "Tasks", "Outreach"}
             if set(workbook.sheetnames) != required:
                 raise CRMExcelExportError("Outreach batch workbook sheets are invalid.")
-            sheet = workbook["Outreach"]
-            headers = {cell.value: position for position, cell in enumerate(sheet[1])}
-            selected: dict[int, tuple[object, ...]] = {}
-            for row in sheet.iter_rows(min_row=2, values_only=True):
-                draft_id = row[headers["Draft ID"]]
-                if type(draft_id) is int and draft_id in email_draft_ids:
-                    selected[draft_id] = tuple(row)
-            if set(selected) != set(email_draft_ids):
-                raise CRMExcelExportError("Outreach batch workbook is incomplete.")
-            if sent:
-                for selected_row in selected.values():
-                    if selected_row[headers["Outreach Status"]] != "MANUALLY_SENT":
-                        raise CRMExcelExportError("Outreach status was not exported.")
-                    if selected_row[headers["Manual Sent At"]] is None:
-                        raise CRMExcelExportError("Manual sent timestamp was not exported.")
+
+            def read_sheet(
+                sheet_name: str,
+            ) -> tuple[dict[object, int], list[tuple[object, ...]]]:
+                sheet = workbook[sheet_name]
+                headers: dict[object, int] = {}
+                for position, cell in enumerate(sheet[1]):
+                    headers[cell.value] = position
+                rows: list[tuple[object, ...]] = []
+                for row in sheet.iter_rows(min_row=2, values_only=True):
+                    rows.append(tuple(row))
+                return headers, rows
+
+            outreach_headers, outreach_rows = read_sheet("Outreach")
+            company_headers, company_rows = read_sheet("Companies")
+            task_headers, task_rows = read_sheet("Tasks")
+            contact_headers, contact_rows = read_sheet("Contacts")
+            sales_headers, sales_rows = read_sheet("Sales Leads")
+            for package in packages:
+                selected_outreach = [
+                    row
+                    for row in outreach_rows
+                    if row[outreach_headers["Draft ID"]] == package.email_draft_id
+                ]
+                if len(selected_outreach) != 1:
+                    raise CRMExcelExportError("Selected Outreach row is missing or duplicated.")
+                outreach_row = selected_outreach[0]
+                expected_outreach_status = "MANUALLY_SENT" if sent else package.draft_status
+                if (
+                    outreach_row[outreach_headers["Company"]] != package.company_name
+                    or outreach_row[outreach_headers["Recipient Email"]] != package.recipient_email
+                    or outreach_row[outreach_headers["Outreach Status"]] != expected_outreach_status
+                ):
+                    raise CRMExcelExportError("Selected Outreach row is inconsistent.")
+                if sent and outreach_row[outreach_headers["Manual Sent At"]] is None:
+                    raise CRMExcelExportError("Manual sent timestamp was not exported.")
+                if not any(
+                    row[company_headers["Company ID"]] == package.company_id for row in company_rows
+                ):
+                    raise CRMExcelExportError("Selected Company row is missing.")
+                if not any(row[task_headers["Task ID"]] == package.task_id for row in task_rows):
+                    raise CRMExcelExportError("Selected Task row is missing.")
+                if not any(
+                    row[sales_headers["Draft ID"]] == package.email_draft_id
+                    and row[sales_headers["Company Name"]] == package.company_name
+                    for row in sales_rows
+                ):
+                    raise CRMExcelExportError("Selected Sales Leads row is inconsistent.")
+                if package.contact_id is not None and not any(
+                    row[contact_headers["Contact ID"]] == package.contact_id for row in contact_rows
+                ):
+                    raise CRMExcelExportError("Selected Contact row is missing.")
         finally:
             workbook.close()
 

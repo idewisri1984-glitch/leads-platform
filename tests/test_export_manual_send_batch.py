@@ -139,6 +139,23 @@ def _invoke(ids: dict[str, object], destination: Path, *, confirm: bool = True):
     return runner.invoke(app, args)
 
 
+def _draft_snapshot(draft: EmailDraft) -> tuple[object, ...]:
+    return (
+        draft.subject,
+        draft.text_body,
+        draft.recipient_email,
+        draft.contact_id,
+        "PERSON" if draft.contact_id is not None else "COMPANY",
+        draft.content_hash,
+        draft.context_fingerprint,
+        draft.request_fingerprint,
+        draft.provider,
+        draft.model,
+        draft.prompt_version,
+        draft.status,
+    )
+
+
 def test_batch_without_confirmation_is_preview_only(tmp_path: Path) -> None:
     ids = _batch(1)
     destination = tmp_path / "preview.xlsx"
@@ -157,6 +174,11 @@ def test_batch_without_confirmation_is_preview_only(tmp_path: Path) -> None:
 @pytest.mark.parametrize("count", [1, 5])
 def test_confirmed_batch_records_all_once_and_exports_sent(tmp_path: Path, count: int) -> None:
     ids = _batch(count, person_position=1)
+    with SessionLocal() as session:
+        snapshots = {
+            draft_id: _draft_snapshot(session.get_one(EmailDraft, draft_id))
+            for draft_id in ids["drafts"]
+        }
     destination = tmp_path / f"batch-{count}.xlsx"
     result = _invoke(ids, destination)
     assert result.exit_code == 0, result.output
@@ -176,6 +198,7 @@ def test_confirmed_batch_records_all_once_and_exports_sent(tmp_path: Path, count
             task = session.get(Task, task_id)
             assert draft is not None and draft.status == "DRAFT"
             assert draft.delivery_mode == "MANUAL"
+            assert _draft_snapshot(draft) == snapshots[draft_id]
             assert lead is not None and lead.status == "NEW"
             assert task is not None and task.status == "TODO"
     workbook = load_workbook(destination, read_only=True)
@@ -185,6 +208,163 @@ def test_confirmed_batch_records_all_once_and_exports_sent(tmp_path: Path, count
     assert {row[headers["Outreach Status"]] for row in rows} == {"MANUALLY_SENT"}
     assert all(row[headers["Manual Sent At"]] is not None for row in rows)
     workbook.close()
+
+
+def test_destination_preflight_failure_does_not_record_batch(tmp_path: Path) -> None:
+    ids = _batch(1)
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("block", encoding="utf-8")
+    destination = blocked_parent / "batch.xlsx"
+    result = _invoke(ids, destination)
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "EXPORT_FAILED_BEFORE_MUTATION"
+    assert not destination.exists()
+    with SessionLocal() as session:
+        assert session.scalar(select(func.count()).select_from(ManualEmailSendRecord)) == 0
+        draft = session.get_one(EmailDraft, ids["drafts"][0])
+        assert draft.delivery_mode is None
+
+
+def test_text_preview_lists_every_planned_manual_send(tmp_path: Path) -> None:
+    ids = _batch(2, person_position=1)
+    args = ["crm", "export-outreach-batch", "--project-id", str(ids["project"])]
+    for draft_id in ids["drafts"]:
+        args.extend(("--email-draft-id", str(draft_id)))
+    args.extend(("--output-file", str(tmp_path / "preview.xlsx")))
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert "Status: CONFIRMATION_REQUIRED" in result.stdout
+    assert f"Project ID: {ids['project']}" in result.stdout
+    assert "Batch size: 2" in result.stdout
+    assert result.stdout.count("Action: RECORD_MANUAL_SEND") == 2
+    assert "Recipient type: PERSON" in result.stdout
+    assert "Recipient type: COMPANY" in result.stdout
+    assert "Current outreach: READY_FOR_MANUAL_SEND" in result.stdout
+    for draft_id in ids["drafts"]:
+        assert f"Draft {draft_id}" in result.stdout
+    assert "recipient-1@example.test" in result.stdout
+    assert "recipient-2@example.test" in result.stdout
+
+
+def test_non_master_selected_draft_exports_complete_relationships(tmp_path: Path) -> None:
+    ids = _batch(1)
+    first_draft_id = ids["drafts"][0]
+    with SessionLocal() as session:
+        first = session.get_one(EmailDraft, first_draft_id)
+        second_lead = Lead(
+            company_id=first.company_id,
+            contact_id=None,
+            status="NEW",
+            source="COMPANY_SCOPED_OUTREACH",
+        )
+        session.add(second_lead)
+        session.flush()
+        second_task = Task(lead_id=second_lead.id, title="Newer outreach", status="TODO")
+        session.add(second_task)
+        session.flush()
+        second_subject = "Newer subject"
+        second_body = "Newer body"
+        second = EmailDraft(
+            project_id=first.project_id,
+            company_id=first.company_id,
+            contact_id=None,
+            lead_id=second_lead.id,
+            task_id=second_task.id,
+            recipient_email=first.recipient_email,
+            recipient_name=first.recipient_name,
+            recipient_role=None,
+            sender_name=first.sender_name,
+            sender_company=first.sender_company,
+            generation_tone=first.generation_tone,
+            generation_purpose=first.generation_purpose,
+            generation_value_proposition=None,
+            subject=second_subject,
+            text_body=second_body,
+            language=first.language,
+            prompt_version=first.prompt_version,
+            provider=first.provider,
+            model=first.model,
+            context_fingerprint="e" * 64,
+            request_fingerprint="f" * 64,
+            content_hash=build_content_hash(
+                recipient_email=first.recipient_email,
+                subject=second_subject,
+                text_body=second_body,
+                prompt_version=first.prompt_version,
+            ),
+            status="DRAFT",
+        )
+        session.add(second)
+        session.commit()
+        assert second.id > first_draft_id
+
+    destination = tmp_path / "selected-older.xlsx"
+    result = _invoke(ids, destination)
+    assert result.exit_code == 0, result.output
+    workbook = load_workbook(destination, read_only=True)
+    try:
+        expected = {
+            "Sales Leads": ("Draft ID", first_draft_id),
+            "Companies": ("Company ID", session_company_id(ids)),
+            "Tasks": ("Task ID", ids["tasks"][0]),
+            "Outreach": ("Draft ID", first_draft_id),
+        }
+        for sheet_name, (header, value) in expected.items():
+            sheet = workbook[sheet_name]
+            headers = {cell.value: index for index, cell in enumerate(sheet[1])}
+            rows = list(sheet.iter_rows(min_row=2, values_only=True))
+            assert [row[headers[header]] for row in rows] == [value]
+        assert workbook["Contacts"].max_row == 1
+    finally:
+        workbook.close()
+
+
+def session_company_id(ids: dict[str, object]) -> int:
+    with SessionLocal() as session:
+        draft = session.get_one(EmailDraft, ids["drafts"][0])
+        return draft.company_id
+
+
+def test_person_and_company_scope_are_preserved_exactly(tmp_path: Path) -> None:
+    ids = _batch(2, person_position=1)
+    with SessionLocal() as session:
+        before = {
+            draft_id: _draft_snapshot(session.get_one(EmailDraft, draft_id))
+            for draft_id in ids["drafts"]
+        }
+    result = _invoke(ids, tmp_path / "scopes.xlsx")
+    assert result.exit_code == 0, result.output
+    with SessionLocal() as session:
+        after = {
+            draft_id: _draft_snapshot(session.get_one(EmailDraft, draft_id))
+            for draft_id in ids["drafts"]
+        }
+        assert after == before
+        person = session.get_one(EmailDraft, ids["drafts"][0])
+        company = session.get_one(EmailDraft, ids["drafts"][1])
+        assert person.contact_id == ids["contacts"][0]
+        assert company.contact_id is None
+        assert person.delivery_mode == company.delivery_mode == "MANUAL"
+
+
+def test_ordinary_crm_export_remains_read_only(tmp_path: Path) -> None:
+    ids = _batch(1)
+    result = runner.invoke(
+        app,
+        [
+            "crm",
+            "export-excel",
+            "--project-id",
+            str(ids["project"]),
+            "--output-file",
+            str(tmp_path / "ordinary.xlsx"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    with SessionLocal() as session:
+        assert session.scalar(select(func.count()).select_from(ManualEmailSendRecord)) == 0
+        assert session.get_one(EmailDraft, ids["drafts"][0]).delivery_mode is None
 
 
 def test_batch_conflict_rejects_every_draft_before_mutation(tmp_path: Path) -> None:
