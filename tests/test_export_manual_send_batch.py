@@ -315,6 +315,17 @@ def test_non_master_selected_draft_exports_complete_relationships(tmp_path: Path
             headers = {cell.value: index for index, cell in enumerate(sheet[1])}
             rows = list(sheet.iter_rows(min_row=2, values_only=True))
             assert [row[headers[header]] for row in rows] == [value]
+        sales = workbook["Sales Leads"]
+        sales_headers = {cell.value: index for index, cell in enumerate(sales[1])}
+        sales_row = next(sales.iter_rows(min_row=2, values_only=True))
+        assert sales_row[sales_headers["Recipient Email"]] == "recipient-1@example.test"
+        assert sales_row[sales_headers["Recipient Type"]] == "COMPANY"
+        assert sales_row[sales_headers["Decision Maker Contact ID"]] is None
+        outreach = workbook["Outreach"]
+        outreach_headers = {cell.value: index for index, cell in enumerate(outreach[1])}
+        outreach_row = next(outreach.iter_rows(min_row=2, values_only=True))
+        assert outreach_row[outreach_headers["Recipient Email"]] == "recipient-1@example.test"
+        assert outreach_row[outreach_headers["Recipient Type"]] == "COMPANY"
         assert workbook["Contacts"].max_row == 1
     finally:
         workbook.close()
@@ -333,7 +344,8 @@ def test_person_and_company_scope_are_preserved_exactly(tmp_path: Path) -> None:
             draft_id: _draft_snapshot(session.get_one(EmailDraft, draft_id))
             for draft_id in ids["drafts"]
         }
-    result = _invoke(ids, tmp_path / "scopes.xlsx")
+    destination = tmp_path / "scopes.xlsx"
+    result = _invoke(ids, destination)
     assert result.exit_code == 0, result.output
     with SessionLocal() as session:
         after = {
@@ -346,6 +358,111 @@ def test_person_and_company_scope_are_preserved_exactly(tmp_path: Path) -> None:
         assert person.contact_id == ids["contacts"][0]
         assert company.contact_id is None
         assert person.delivery_mode == company.delivery_mode == "MANUAL"
+    workbook = load_workbook(destination, read_only=True)
+    try:
+        sales = workbook["Sales Leads"]
+        headers = {cell.value: index for index, cell in enumerate(sales[1])}
+        rows = {
+            row[headers["Draft ID"]]: row for row in sales.iter_rows(min_row=2, values_only=True)
+        }
+        person_row = rows[ids["drafts"][0]]
+        company_row = rows[ids["drafts"][1]]
+        assert person_row[headers["Recipient Email"]] == "recipient-1@example.test"
+        assert person_row[headers["Recipient Type"]] == "PERSON"
+        assert person_row[headers["Decision Maker Contact ID"]] == ids["contacts"][0]
+        assert company_row[headers["Recipient Email"]] == "recipient-2@example.test"
+        assert company_row[headers["Recipient Type"]] == "COMPANY"
+        assert company_row[headers["Decision Maker Contact ID"]] is None
+    finally:
+        workbook.close()
+
+
+def test_selected_person_contact_overrides_global_primary_only_for_batch(
+    tmp_path: Path,
+) -> None:
+    ids = _batch(1, person_position=1)
+    with SessionLocal() as session:
+        selected = session.get_one(Contact, ids["contacts"][0])
+        global_primary = Contact(
+            company_id=selected.company_id,
+            first_name="Founder",
+            job_title="Founder",
+            email="founder@example.test",
+            source="MANUAL_VERIFIED",
+        )
+        session.add(global_primary)
+        session.commit()
+        selected_id = selected.id
+        global_primary_id = global_primary.id
+
+    ordinary_destination = tmp_path / "ordinary-primary.xlsx"
+    ordinary = runner.invoke(
+        app,
+        [
+            "crm",
+            "export-excel",
+            "--project-id",
+            str(ids["project"]),
+            "--output-file",
+            str(ordinary_destination),
+        ],
+    )
+    assert ordinary.exit_code == 0, ordinary.output
+    ordinary_workbook = load_workbook(ordinary_destination, read_only=True)
+    try:
+        sheet = ordinary_workbook["Sales Leads"]
+        headers = {cell.value: index for index, cell in enumerate(sheet[1])}
+        row = next(sheet.iter_rows(min_row=2, values_only=True))
+        assert row[headers["Decision Maker Contact ID"]] == global_primary_id
+    finally:
+        ordinary_workbook.close()
+
+    destination = tmp_path / "selected-person.xlsx"
+    result = _invoke(ids, destination)
+    assert result.exit_code == 0, result.output
+    workbook = load_workbook(destination, read_only=True)
+    try:
+        sales = workbook["Sales Leads"]
+        sales_headers = {cell.value: index for index, cell in enumerate(sales[1])}
+        sales_row = next(sales.iter_rows(min_row=2, values_only=True))
+        assert sales_row[sales_headers["Recipient Email"]] == "recipient-1@example.test"
+        assert sales_row[sales_headers["Recipient Type"]] == "PERSON"
+        assert sales_row[sales_headers["Decision Maker Contact ID"]] == selected_id
+        outreach = workbook["Outreach"]
+        outreach_headers = {cell.value: index for index, cell in enumerate(outreach[1])}
+        outreach_row = next(outreach.iter_rows(min_row=2, values_only=True))
+        assert outreach_row[outreach_headers["Recipient Email"]] == "recipient-1@example.test"
+        assert outreach_row[outreach_headers["Recipient Type"]] == "PERSON"
+    finally:
+        workbook.close()
+
+
+def test_workbook_verifier_rejects_sales_leads_recipient_mismatch(tmp_path: Path) -> None:
+    ids = _batch(1, person_position=1)
+
+    class TamperingExporter(CRMExcelExportService):
+        def export_drafts(self, *args, **kwargs):
+            result = super().export_drafts(*args, **kwargs)
+            workbook = load_workbook(result.output_file)
+            try:
+                sheet = workbook["Sales Leads"]
+                headers = {cell.value: index for index, cell in enumerate(sheet[1], start=1)}
+                sheet.cell(2, headers["Recipient Email"], "wrong@example.test")
+                workbook.save(result.output_file)
+            finally:
+                workbook.close()
+            return result
+
+    result = OutreachBatchWorkflow(SessionLocal, exporter=TamperingExporter()).execute(
+        project_id=ids["project"],
+        email_draft_ids=ids["drafts"],
+        output_file=tmp_path / "mismatch.xlsx",
+        confirmed=True,
+    )
+    assert result.status is OutreachBatchStatus.EXPORT_FAILED_BEFORE_MUTATION
+    with SessionLocal() as session:
+        assert session.scalar(select(func.count()).select_from(ManualEmailSendRecord)) == 0
+        assert session.get_one(EmailDraft, ids["drafts"][0]).delivery_mode is None
 
 
 def test_ordinary_crm_export_remains_read_only(tmp_path: Path) -> None:

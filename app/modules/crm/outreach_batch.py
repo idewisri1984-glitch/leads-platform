@@ -352,6 +352,8 @@ class OutreachBatchWorkflow:
                 if (
                     outreach_row[outreach_headers["Company"]] != package.company_name
                     or outreach_row[outreach_headers["Recipient Email"]] != package.recipient_email
+                    or outreach_row[outreach_headers["Recipient Type"]]
+                    != package.recipient_type.value
                     or outreach_row[outreach_headers["Outreach Status"]] != expected_outreach_status
                 ):
                     raise CRMExcelExportError("Selected Outreach row is inconsistent.")
@@ -363,10 +365,20 @@ class OutreachBatchWorkflow:
                     raise CRMExcelExportError("Selected Company row is missing.")
                 if not any(row[task_headers["Task ID"]] == package.task_id for row in task_rows):
                     raise CRMExcelExportError("Selected Task row is missing.")
-                if not any(
-                    row[sales_headers["Draft ID"]] == package.email_draft_id
-                    and row[sales_headers["Company Name"]] == package.company_name
+                selected_sales = [
+                    row
                     for row in sales_rows
+                    if row[sales_headers["Draft ID"]] == package.email_draft_id
+                ]
+                if len(selected_sales) != 1:
+                    raise CRMExcelExportError("Selected Sales Leads row is missing or duplicated.")
+                sales_row = selected_sales[0]
+                if (
+                    sales_row[sales_headers["Company ID"]] != package.company_id
+                    or sales_row[sales_headers["Company Name"]] != package.company_name
+                    or sales_row[sales_headers["Recipient Email"]] != package.recipient_email
+                    or sales_row[sales_headers["Recipient Type"]] != package.recipient_type.value
+                    or sales_row[sales_headers["Decision Maker Contact ID"]] != package.contact_id
                 ):
                     raise CRMExcelExportError("Selected Sales Leads row is inconsistent.")
                 if package.contact_id is not None and not any(
